@@ -7413,12 +7413,16 @@ def mm_run(conn, markets, balance_cents, portfolio_value, adaptive_weights=None,
     # The generic /markets endpoint returns newest-first (mostly parlays).
     # Targeted fetching ensures we see actual high-activity markets.
     MM_TARGET_SERIES = [
-        "KXBTC", "KXETH", "KXINX", "KXGDP", "KXCPI", "KXJOB", "KXUNRATE",
+        # KXBTC/KXETH removed: blocklisted (50%+ adverse selection from crypto bots)
+        "KXINX", "KXGDP", "KXCPI", "KXJOB", "KXUNRATE",
         "KXFED", "KXGAS",
-        # Weather: actual Kalshi series (KXHIGHNY, KXHIGHLAX, etc. not KXTEMP/KXWEATHER)
-        "KXHIGHNY", "KXHIGHCHI", "KXHIGHLAX", "KXHIGHAUS", "KXHIGHMIA",
-        "KXHIGHHOU", "KXHIGHPHX", "KXHIGHDEN", "KXHIGHSF",
-        "KXHMONTHRANGE", "KXHURR",
+        # Weather — ALL REMOVED 2026-04-16: $375 of $400 total losses (94%).
+        # Counterparties have real-time METAR/NWS and reprice faster than our 2-min cycle.
+        # Even with bracket width fix + METAR gating, structural adverse selection persists.
+        # Also blocklisted in bot/market_maker/selection.py as defense-in-depth.
+        # "KXHIGHNY", "KXHIGHCHI", "KXHIGHLAX", "KXHIGHAUS", "KXHIGHMIA",
+        # "KXHIGHHOU", "KXHIGHPHX", "KXHIGHDEN", "KXHIGHSF",
+        # "KXHMONTHRANGE", "KXHURR",
         # Sports — DISABLED: odds source never matches Kalshi titles in practice.
         # Re-enable when Odds API integration is fixed with proper game/team matching.
         # "KXNBA", "KXNFL", "KXMLB", "KXNHL", "KXMMA", "KXSOCCER", "KXNCAA",
@@ -7517,6 +7521,12 @@ def mm_run(conn, markets, balance_cents, portfolio_value, adaptive_weights=None,
             stats["skipped_no_data"] += 1
             reason = "no data source" if n_sources < 1 else "LLM-only (no real data)"
             print(f"  {ticker}: SKIP — {reason} [{cat}]")
+            log_opportunity(conn, ticker, "mm", "skip", side="both",
+                            ensemble_prob=indep_prob,
+                            market_prob=mid / 100.0 if mid else None,
+                            source_count=n_sources,
+                            sources_json=src_desc,
+                            skip_reason=reason)
             continue
         else:
             fair_value_cents = max(2, min(98, int(indep_prob * 100)))
@@ -7525,6 +7535,12 @@ def mm_run(conn, markets, balance_cents, portfolio_value, adaptive_weights=None,
                 print(f"  {ticker}: SKIP — extreme fair value {fair_value_cents}¢ (prob={indep_prob:.3f})")
                 stats.setdefault("skipped_extreme_fv", 0)
                 stats["skipped_extreme_fv"] += 1
+                log_opportunity(conn, ticker, "mm", "skip", side="both",
+                                ensemble_prob=indep_prob,
+                                market_prob=mid / 100.0 if mid else None,
+                                source_count=n_sources,
+                                sources_json=src_desc,
+                                skip_reason=f"extreme_fv_{fair_value_cents}c")
                 continue
             print(f"  {ticker}: fair={fair_value_cents}¢ mid={mid}¢ spread={spread}¢ "
                   f"inv={inventory:+d} [{cat}] ({n_sources} sources)")
@@ -7536,6 +7552,18 @@ def mm_run(conn, markets, balance_cents, portfolio_value, adaptive_weights=None,
         total_capital_used += capital
         if posted > 0:
             stats["markets_quoted"] += 1
+
+        # Log with full ensemble data — the critical fix for opportunity_log having
+        # NULL ensemble_prob on all 47K+ rows. The old "candidate" log at selection
+        # time didn't have ensemble data because it's computed here in the quoting phase.
+        log_opportunity(conn, ticker, "mm",
+                        "quoted" if posted > 0 else "skip_capital",
+                        side="both",
+                        ensemble_prob=indep_prob,
+                        market_prob=mid / 100.0 if mid else None,
+                        edge=abs(indep_prob - (mid / 100.0)) if mid and indep_prob else None,
+                        source_count=n_sources,
+                        sources_json=src_desc)
 
     stats["capital_deployed"] = total_capital_used
 

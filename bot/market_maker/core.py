@@ -33,6 +33,27 @@ from bot.config import (
 )
 
 
+def _log_opportunity(conn, ticker, strategy, action, side=None,
+                     ensemble_prob=None, market_prob=None, edge=None,
+                     source_count=None, sources_json=None, skip_reason=None):
+    """Log a market candidate to the opportunity_log decision journal.
+
+    Local copy of trade.py's log_opportunity to avoid circular imports.
+    Records every MM candidate -- quoted or skipped -- with full ensemble
+    data so the learning system and backtest have non-NULL data to work with.
+    """
+    try:
+        conn.execute(
+            """INSERT INTO opportunity_log
+            (ticker, strategy, action, side, ensemble_prob, market_prob,
+             edge, source_count, sources_json, skip_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ticker, strategy, action, side, ensemble_prob, market_prob,
+             edge, source_count, sources_json, skip_reason))
+    except Exception:
+        pass  # Never let logging break the trading loop
+
+
 def _compute_adverse_selection_signals(conn):
     """Compute and cache fill rate, one-sided fill, and postmortem risk signals.
 
@@ -304,6 +325,12 @@ def mm_run(conn, markets, balance_cents, portfolio_value,
             stats["skipped_no_data"] += 1
             reason = "no data source" if n_sources < 1 else "LLM-only (no real data)"
             print(f"  {ticker}: SKIP \u2014 {reason} [{cat}]")
+            _log_opportunity(conn, ticker, "mm", "skip", side="both",
+                             ensemble_prob=indep_prob,
+                             market_prob=mid / 100.0 if mid else None,
+                             source_count=n_sources,
+                             sources_json=src_desc,
+                             skip_reason=reason)
             continue
         else:
             fair_value_cents = max(2, min(98, int(indep_prob * 100)))
@@ -312,6 +339,12 @@ def mm_run(conn, markets, balance_cents, portfolio_value,
                 print(f"  {ticker}: SKIP \u2014 extreme fair value {fair_value_cents}\u00a2 (prob={indep_prob:.3f})")
                 stats.setdefault("skipped_extreme_fv", 0)
                 stats["skipped_extreme_fv"] += 1
+                _log_opportunity(conn, ticker, "mm", "skip", side="both",
+                                 ensemble_prob=indep_prob,
+                                 market_prob=mid / 100.0 if mid else None,
+                                 source_count=n_sources,
+                                 sources_json=src_desc,
+                                 skip_reason=f"extreme fair value {fair_value_cents}c")
                 continue
             print(f"  {ticker}: fair={fair_value_cents}\u00a2 mid={mid}\u00a2 spread={spread}\u00a2 "
                   f"inv={inventory:+d} [{cat}] ({n_sources} sources)")
@@ -323,6 +356,20 @@ def mm_run(conn, markets, balance_cents, portfolio_value,
         total_capital_used += capital
         if posted > 0:
             stats["markets_quoted"] += 1
+
+        # Log opportunity with full ensemble data -- this is the critical fix:
+        # previously ensemble_prob and sources_json were always NULL in opportunity_log
+        # because the only log_opportunity call was in mm_select_markets (trade.py ~6821)
+        # BEFORE the ensemble estimate was computed here.
+        _log_opportunity(conn, ticker, "mm",
+                         "quoted" if posted > 0 else "skip_capital",
+                         side="both",
+                         ensemble_prob=indep_prob,
+                         market_prob=mid / 100.0 if mid else None,
+                         edge=abs(indep_prob - (mid / 100.0)) if mid and indep_prob else None,
+                         source_count=n_sources,
+                         sources_json=src_desc,
+                         skip_reason="capital limit" if posted == 0 else None)
 
     stats["capital_deployed"] = total_capital_used
 
