@@ -88,6 +88,10 @@ from bot.learning.alpha_log import (
     market_snapshot_from_dict as _alpha_market_snapshot,
 )
 from bot.learning.populate_from_alpha import populate_all as _alpha_populate_all
+from bot.learning.directional_shadow import (
+    ShadowOutcome as _ShadowOutcome,
+    evaluate as _eval_directional_shadow,
+)
 from bot.learning.calibration import (
     apply_calibration as _apply_calibration,
     apply_calibration_correction,
@@ -6606,11 +6610,33 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             # Kelly with independent estimate
             prob_for_kelly = indep_prob if indep_prob else (1 - price_cents/100)
             contracts = kelly_contracts(prob_for_kelly, price_cents, current_balance)
-            if contracts <= 0:
-                print(f"  \u2192 {ticker}: Kelly skip (no edge)")
-                log_opportunity(conn, ticker, strategy, "skip_kelly", side=side,
+
+            # ── Directional shadow evaluator (step 7) ────────────────
+            # Pure gate: block-list → kelly_zero → below_edge → shadow_pass.
+            # `indep_prob` here is already P(our_side) (see score_market
+            # construction), so pass-through. Market mid stays YES-side.
+            _mkt_snap = _alpha_market_snapshot(m)
+            _mid = None
+            if _mkt_snap.yes_bid_cents is not None and _mkt_snap.yes_ask_cents is not None:
+                _mid = (_mkt_snap.yes_bid_cents + _mkt_snap.yes_ask_cents) // 2
+            elif _mkt_snap.yes_last_cents is not None:
+                _mid = _mkt_snap.yes_last_cents
+            shadow_dec = _eval_directional_shadow(
+                ticker=ticker, side=side,
+                indep_prob=float(indep_prob) if indep_prob is not None else 0.5,
+                contracts=int(contracts),
+                price_cents=int(price_cents),
+                market_mid_cents=_mid,
+                min_edge=MIN_EDGE,
+            )
+            if shadow_dec.outcome != _ShadowOutcome.SHADOW_PASS:
+                print(f"  → {ticker}: shadow={shadow_dec.outcome} "
+                      f"({shadow_dec.skip_reason})")
+                log_opportunity(conn, ticker, strategy,
+                                f"skip_{shadow_dec.outcome}", side=side,
                                 ensemble_prob=indep_prob, market_prob=mkt_prob,
-                                edge=edge, source_count=sc, skip_reason="kelly_zero")
+                                edge=edge, source_count=sc,
+                                skip_reason=shadow_dec.skip_reason)
                 if indep_prob is not None:
                     _alpha_log_decision(
                         conn, ticker=ticker,
@@ -6619,10 +6645,10 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                         ensemble=_AlphaEnsemble(
                             p_yes=float(indep_prob), source_count=sc,
                         ),
-                        market=_alpha_market_snapshot(m),
+                        market=_mkt_snap,
                         side=side, price_cents=int(price_cents),
-                        skip_reason="kelly_zero",
-                        notes=f"strategy={strategy}",
+                        skip_reason=shadow_dec.skip_reason,
+                        notes=f"strategy={strategy};shadow={shadow_dec.outcome}",
                     )
                 continue
 
@@ -6666,6 +6692,11 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                 # DRY_RUN is forced True at module import (see phase config), so
                 # every "trade" here is a shadow — log as SHADOW_ONLY. When the
                 # directional gate is re-enabled this flips to LIVE + POSTED.
+                _evm = shadow_dec.edge_vs_mid
+                _notes = (
+                    f"strategy={strategy};shadow=shadow_pass"
+                    + (f";edge_vs_mid={_evm:+.3f}" if _evm is not None else "")
+                )
                 _alpha_log_decision(
                     conn, ticker=ticker,
                     decision_type=_AlphaType.DIRECTIONAL_SHADOW,
@@ -6673,10 +6704,10 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                     ensemble=_AlphaEnsemble(
                         p_yes=float(indep_prob), source_count=sc,
                     ),
-                    market=_alpha_market_snapshot(m),
+                    market=_mkt_snap,
                     side=side, price_cents=int(price_cents),
                     contracts=int(contracts),
-                    notes=f"strategy={strategy}",
+                    notes=_notes,
                 )
             print(f"  → {ticker} {side} @ {price_cents}¢ x{contracts}  "
                   f"edge={edge:.1%}  [{strategy}]")

@@ -50,6 +50,19 @@ MM_DRY_RUN = os.environ.get("MM_DRY_RUN", "true").lower() in ("true", "1", "yes"
 # Phase 1 shadow-to-live gate for weather MM. Default false — shadow mode only.
 # Flipped to true only once the step-9 shadow backtest proves out.
 WEATHER_MM_LIVE = os.environ.get("WEATHER_MM_LIVE", "false").lower() in ("true", "1", "yes")
+
+# Directional families hard-blocked from trading regardless of
+# per-family shadow-to-live flags. Anti-calibrated in Phase 0 backtests:
+# KXBTC / KXETH (Brier 0.76–0.94) and KXHIGHDEN (0.316 vs 0.244 baseline).
+# Env override: DIRECTIONAL_BLOCKLIST="KXBTC,KXETH,KXHIGHDEN,KXFOO" (comma-sep).
+_DEFAULT_DIRECTIONAL_BLOCKLIST = "KXBTC,KXETH,KXHIGHDEN"
+DIRECTIONAL_BLOCKED_FAMILIES: frozenset[str] = frozenset(
+    f.strip().upper()
+    for f in os.environ.get(
+        "DIRECTIONAL_BLOCKLIST", _DEFAULT_DIRECTIONAL_BLOCKLIST
+    ).split(",")
+    if f.strip()
+)
 MM_MIN_SPREAD = int(os.environ.get("MM_MIN_SPREAD_CENTS", "4"))
 MM_HALF_SPREAD = int(os.environ.get("MM_HALF_SPREAD_CENTS", "2"))
 MM_MAX_INVENTORY = int(os.environ.get("MM_MAX_INVENTORY", "50"))
