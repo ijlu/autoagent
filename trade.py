@@ -6543,6 +6543,7 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
 
         # ── Correlation limits: max positions per risk category ───────
         category_counts = {}
+        existing_pos = []
         try:
             resp = api_get("/portfolio/positions?limit=100")
             existing_pos = resp.get("market_positions", resp.get("positions", []))
@@ -6555,6 +6556,22 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             print(f"[correlation] Existing positions by category: {dict(category_counts)}")
         except Exception as e:
             print(f"[correlation] Could not fetch positions: {e}")
+
+        # ── Per-family exposure cap (correlated-basket risk) ──────────
+        # Kelly-by-market assumes independence; KXFED-26MAY / 26JUN / 26JUL
+        # are one bet on Fed rate path, not three. Without this cap the
+        # Apr 17 book ran 95% KXFED. Tracked in cents across the cycle,
+        # including within-cycle accumulation from accepted candidates.
+        from bot.core.exposure import (
+            compute_family_exposures,
+            size_trade_against_family_cap,
+        )
+        from bot.config import MAX_FAMILY_EXPOSURE_RATIO
+        family_exposures = compute_family_exposures(existing_pos)
+        total_equity_cents = initial_balance + portfolio_value
+        if family_exposures:
+            print(f"[family_cap] Existing exposure by family (cents): "
+                  f"{dict(sorted(family_exposures.items(), key=lambda kv: -kv[1])[:5])}")
 
         filtered_candidates = []
         for c in candidates:
@@ -6723,6 +6740,35 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                 contracts = max(1, min(MAX_CONTRACTS, int(headroom / price_cents)))
                 order_cost_cents = contracts * price_cents
                 print(f"  → {ticker}: reduced to {contracts} contracts for exposure limit")
+
+            # Per-family exposure cap: bounds aggregate correlated bets
+            # (KXFED-26MAY + KXFED-26JUN + KXFED-26JUL are one rate-path
+            # thesis, not three). Runs after the global cap so it's the
+            # tighter of the two constraints that binds.
+            _fam_contracts, _fam_skip = size_trade_against_family_cap(
+                ticker=ticker,
+                proposed_contracts=contracts,
+                price_cents=price_cents,
+                family_exposures=family_exposures,
+                total_equity_cents=total_equity_cents,
+                max_family_ratio=MAX_FAMILY_EXPOSURE_RATIO,
+            )
+            if _fam_skip is not None:
+                print(f"  → {ticker}: SKIP — {_fam_skip} "
+                      f"(cap={MAX_FAMILY_EXPOSURE_RATIO:.0%} of equity)")
+                continue
+            if _fam_contracts < contracts:
+                print(f"  → {ticker}: family cap reduced {contracts}→{_fam_contracts}")
+                contracts = _fam_contracts
+                order_cost_cents = contracts * price_cents
+            # Update running family accumulator so the next candidate in this
+            # cycle sees what we just committed to.
+            from bot.core.exposure import family_from_ticker as _fam_of
+            _fam_key = _fam_of(ticker)
+            if _fam_key:
+                family_exposures[_fam_key] = (
+                    family_exposures.get(_fam_key, 0) + order_cost_cents
+                )
 
             opp = {"ticker":ticker, "side":side, "strategy":strategy,
                    "score":round(score,3), "detail":detail, "price_cents":price_cents,

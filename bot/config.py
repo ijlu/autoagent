@@ -89,6 +89,13 @@ SC_DRY_RUN = os.environ.get("SC_DRY_RUN", "true").lower() in ("true", "1", "yes"
 # ══════════════════════════════════════════════════════════════════════════════
 MAX_PORTFOLIO_EXPOSURE_RATIO = float(os.environ.get("MAX_PORTFOLIO_EXPOSURE_RATIO", "0.50"))
 
+# Per-family cap as a fraction of total equity. Kalshi families (KXFED-26MAY,
+# KXFED-26AUG, KXFED-26SEP) are correlated bets on the same underlying —
+# Kelly-by-market treats them as independent, which is how the Apr 17 book
+# ended up 95% KXFED. This cap limits aggregate correlated exposure without
+# touching per-market Kelly sizing on uncorrelated bets.
+MAX_FAMILY_EXPOSURE_RATIO = float(os.environ.get("MAX_FAMILY_EXPOSURE_RATIO", "0.25"))
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Source horizon compatibility (max forecast horizon in days per source)
 # ══════════════════════════════════════════════════════════════════════════════
