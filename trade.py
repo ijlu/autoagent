@@ -91,7 +91,11 @@ from bot.learning.populate_from_alpha import populate_all as _alpha_populate_all
 from bot.learning.directional_shadow import (
     ShadowOutcome as _ShadowOutcome,
     evaluate as _eval_directional_shadow,
+    get_kelly_multiplier as _get_kelly_multiplier,
+    get_live_state as _get_live_state,
+    LiveState as _LiveState,
 )
+from bot.learning.alpha_log import family_from_ticker as _family_from_ticker
 from bot.learning.calibration import (
     apply_calibration as _apply_calibration,
     apply_calibration_correction,
@@ -6611,6 +6615,20 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             prob_for_kelly = indep_prob if indep_prob else (1 - price_cents/100)
             contracts = kelly_contracts(prob_for_kelly, price_cents, current_balance)
 
+            # ── Per-family graduated sizing (step 9) ────────────────
+            # Scale Kelly contracts by the family's live-state multiplier:
+            # shadow=0 (logged only), canary=0.5 (half size), full=1.0.
+            # Default for unseen families is shadow — safe-by-default.
+            _family = _family_from_ticker(ticker).upper()
+            _live_flag = _get_live_state(conn, _family)
+            _kelly_mult = _get_kelly_multiplier(conn, _family)
+            if _kelly_mult < 1.0 and _kelly_mult > 0.0:
+                _full_contracts = contracts
+                contracts = max(1, int(round(contracts * _kelly_mult)))
+                if contracts != _full_contracts:
+                    print(f"  → {ticker}: {_live_flag.state} sizing "
+                          f"{_full_contracts}→{contracts} (mult={_kelly_mult})")
+
             # ── Directional shadow evaluator (step 7) ────────────────
             # Pure gate: block-list → kelly_zero → below_edge → shadow_pass.
             # `indep_prob` here is already P(our_side) (see score_market
@@ -6688,19 +6706,27 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             log_opportunity(conn, ticker, strategy, "trade", side=side,
                             ensemble_prob=indep_prob, market_prob=mkt_prob,
                             edge=edge, source_count=sc)
+            # Per-family live state routes decision outcome + order posting:
+            # shadow families stay DRY_RUN + SHADOW_ONLY; canary/full families
+            # post real orders and log POSTED (picked up by the kill-switch
+            # sweep). Global DRY_RUN remains an outer kill-switch — even a
+            # canary/full family skips the order post if DRY_RUN is true.
+            _is_live_family = _live_flag.state != _LiveState.SHADOW
             if indep_prob is not None:
-                # DRY_RUN is forced True at module import (see phase config), so
-                # every "trade" here is a shadow — log as SHADOW_ONLY. When the
-                # directional gate is re-enabled this flips to LIVE + POSTED.
                 _evm = shadow_dec.edge_vs_mid
+                _outcome = (
+                    _AlphaOutcome.POSTED if _is_live_family
+                    else _AlphaOutcome.SHADOW_ONLY
+                )
                 _notes = (
-                    f"strategy={strategy};shadow=shadow_pass"
+                    f"strategy={strategy};shadow=shadow_pass;"
+                    f"state={_live_flag.state};mult={_kelly_mult:.2f}"
                     + (f";edge_vs_mid={_evm:+.3f}" if _evm is not None else "")
                 )
                 _alpha_log_decision(
                     conn, ticker=ticker,
                     decision_type=_AlphaType.DIRECTIONAL_SHADOW,
-                    decision_outcome=_AlphaOutcome.SHADOW_ONLY,
+                    decision_outcome=_outcome,
                     ensemble=_AlphaEnsemble(
                         p_yes=float(indep_prob), source_count=sc,
                     ),
@@ -6710,10 +6736,10 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                     notes=_notes,
                 )
             print(f"  → {ticker} {side} @ {price_cents}¢ x{contracts}  "
-                  f"edge={edge:.1%}  [{strategy}]")
+                  f"edge={edge:.1%}  [{strategy}/{_live_flag.state}]")
 
             order_id = error = None
-            if not DRY_RUN and ticker:
+            if not DRY_RUN and _is_live_family and ticker:
                 order_body = {"ticker":ticker, "side":side, "type":"limit",
                     "count":contracts,
                     ("yes_price" if side=="yes" else "no_price"): price_cents,

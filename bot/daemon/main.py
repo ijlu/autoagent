@@ -39,6 +39,7 @@ from bot.daemon.scheduler import Scheduler
 from bot.daemon.weather_handler import WeatherChangeHandler
 from bot.daemon.weather_quoter import WeatherQuoter
 from bot.db import init_db, kv_cleanup
+from bot.learning.shadow_promotion import run_promotion_sweep
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,10 @@ KV_CLEANUP_INTERVAL_S = 3600
 HEALTH_LOG_INTERVAL_S = 300
 METAR_POLL_INTERVAL_S = 30
 FORECAST_REFRESH_TASK_INTERVAL_S = FORECAST_REFRESH_INTERVAL_S
+# Promotion sweep runs daily. A per-family kv flag change is never urgent —
+# a day's lag between meeting the gate and flipping live is fine, and daily
+# avoids recomputing the same settled-row stats on every cycle.
+PROMOTION_SWEEP_INTERVAL_S = 24 * 3600
 
 
 def _configure_logging() -> None:
@@ -63,6 +68,50 @@ def _configure_logging() -> None:
         stream=sys.stdout,
         force=True,
     )
+
+
+def _latest_equity_dollars(conn) -> float:
+    """Best-effort current equity for the promotion sweep.
+
+    Reads the most recent `sessions` row — populated each cycle by trade.py
+    with balance_cents + portfolio_cents. Defaults to $1000 when no session
+    has run yet (first-boot case — conservative under-estimate keeps the
+    kill-switch trigger floors reasonable).
+    """
+    try:
+        row = conn.execute(
+            "SELECT balance_cents, portfolio_cents FROM sessions "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            balance = int(row[0] or 0)
+            portfolio = int(row[1] or 0)
+            return max(100.0, (balance + portfolio) / 100.0)
+    except Exception:
+        pass
+    return 1000.0
+
+
+def _run_promotion_sweep(conn) -> None:
+    """Daily promotion+demotion sweep. Lightweight wrapper that pulls the
+    current equity snapshot and delegates to shadow_promotion."""
+    equity = _latest_equity_dollars(conn)
+    summary = run_promotion_sweep(conn, equity_dollars=equity)
+    if summary["promoted"] or summary["graduated"] or summary["demoted"]:
+        logger.info(
+            "[promotion] checked=%d promoted=%d graduated=%d demoted=%d",
+            summary["checked"], len(summary["promoted"]),
+            len(summary["graduated"]), len(summary["demoted"]),
+        )
+        for entry in summary["promoted"] + summary["graduated"]:
+            logger.info("[promotion]   ↑ %s", entry)
+        for entry in summary["demoted"]:
+            logger.warning("[promotion]   ↓ %s", entry)
+    else:
+        logger.info(
+            "[promotion] checked=%d unchanged=%d",
+            summary["checked"], len(summary["unchanged"]),
+        )
 
 
 def _log_health(pollers: list[Poller], cycle_runner: CycleRunner,
@@ -152,6 +201,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         forecast_cache.refresh,
         interval_s=FORECAST_REFRESH_TASK_INTERVAL_S,
         initial_delay_s=2.0,  # prime cache early so first METAR events have data
+    )
+    scheduler.register(
+        "promotion_sweep",
+        lambda: _run_promotion_sweep(conn),
+        interval_s=PROMOTION_SWEEP_INTERVAL_S,
+        initial_delay_s=600.0,  # give the cycle a chance to write a sessions row first
     )
     scheduler.register(
         "health_log",

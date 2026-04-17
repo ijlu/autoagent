@@ -187,49 +187,166 @@ def evaluate(
     )
 
 
-# ── Runtime per-family live flag ──────────────────────────────────────────
-# kv_cache schema: key="directional_live:<FAMILY>", value=True/False.
-# Default False when missing — safety-first: new families are shadow-only.
+# ── Runtime per-family live state (graduated promotion) ──────────────────
+# Three states per family, stored as a JSON blob in kv_cache under
+# `directional_live:<FAMILY>`:
+#
+#   shadow       — size 0, log-only (default for unseen families)
+#   live_canary  — 0.5× Kelly, used for the first 30 live settlements
+#   live_full    — 1.0× Kelly, reached after canary clears its own gate
+#
+# Symmetric auto-demotion: full → canary → shadow on kill-switch trip.
+# Once a family hits shadow via auto-demote, re-promotion is MANUAL
+# (operator-only `set_live_state`). Canary → full is the one auto
+# transition after demotion doesn't fire: prevents same-signal flip-flop.
+import json as _json
+import time as _time
+from dataclasses import asdict
+
 _KV_PREFIX = "directional_live:"
 _KV_TTL_S = 30 * 24 * 3600  # 30 days
+
+
+class LiveState:
+    SHADOW = "shadow"
+    LIVE_CANARY = "live_canary"
+    LIVE_FULL = "live_full"
+
+
+_ALL_STATES: frozenset[str] = frozenset({
+    LiveState.SHADOW, LiveState.LIVE_CANARY, LiveState.LIVE_FULL,
+})
+
+# Kelly size multiplier per state. Canary = half-Kelly matches the staged
+# canary-rollout convention from Option G discussion (2026-04-17).
+_KELLY_MULTIPLIER: dict[str, float] = {
+    LiveState.SHADOW: 0.0,
+    LiveState.LIVE_CANARY: 0.5,
+    LiveState.LIVE_FULL: 1.0,
+}
+
+
+@dataclass(frozen=True)
+class LiveFlag:
+    """Full state of a family's live flag.
+
+    `since_ts_unix` is the moment the family entered `state` — used by the
+    promotion job to count "settlements in current state" and drive the
+    30-settlement canary → full transition.
+
+    `manual` distinguishes operator-set flags from auto-promotions. A manual
+    flag is protected from the auto-demote ratchet during the 24h after set
+    (operator override window).
+    """
+    state: str
+    since_ts_unix: float
+    manual: bool = False
 
 
 def _kv_key(family: str) -> str:
     return f"{_KV_PREFIX}{family.upper()}"
 
 
-def should_trade_live(conn, family: str) -> bool:
-    """True if the per-family live flag has been flipped on in kv_cache.
+def _parse_live_flag(raw: object) -> Optional[LiveFlag]:
+    """Decode a kv_cache value into a LiveFlag. Tolerates legacy bool values.
 
-    Default: False. Hard-blocked families are never live regardless of kv.
+    Legacy rows written pre-graduation (`True`/`False`) are mapped to
+    `live_full`/`shadow` so an in-place upgrade doesn't reset state.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        state = LiveState.LIVE_FULL if raw else LiveState.SHADOW
+        return LiveFlag(state=state, since_ts_unix=_time.time(), manual=False)
+    if isinstance(raw, dict):
+        state = raw.get("state")
+        if state not in _ALL_STATES:
+            return None
+        return LiveFlag(
+            state=state,
+            since_ts_unix=float(raw.get("since_ts_unix") or _time.time()),
+            manual=bool(raw.get("manual", False)),
+        )
+    return None
+
+
+def get_live_state(conn, family: str) -> LiveFlag:
+    """Return the full live-flag state. Defaults to SHADOW for unseen families
+    and hard-blocked families (block list wins over any kv write).
     """
     family_u = family.upper()
     if family_u in DIRECTIONAL_BLOCKED_FAMILIES:
-        return False
+        return LiveFlag(state=LiveState.SHADOW, since_ts_unix=0.0, manual=False)
     try:
-        val = kv_get(conn, _kv_key(family_u))
+        raw = kv_get(conn, _kv_key(family_u))
     except Exception:
-        return False
-    return bool(val) if val is not None else False
+        return LiveFlag(state=LiveState.SHADOW, since_ts_unix=0.0, manual=False)
+    parsed = _parse_live_flag(raw)
+    return parsed or LiveFlag(state=LiveState.SHADOW, since_ts_unix=0.0,
+                              manual=False)
+
+
+def should_trade_live(conn, family: str) -> bool:
+    """True if the family is in any live state (canary or full).
+
+    Callers that need to size-scale should use `get_kelly_multiplier` rather
+    than this bool — a canary family "trades live" but at half size.
+    """
+    return get_live_state(conn, family).state != LiveState.SHADOW
+
+
+def get_kelly_multiplier(conn, family: str) -> float:
+    """Return the Kelly size multiplier for this family's current state.
+
+    0.0 = shadow (no order posted), 0.5 = canary, 1.0 = full.
+    """
+    flag = get_live_state(conn, family)
+    return _KELLY_MULTIPLIER.get(flag.state, 0.0)
+
+
+def set_live_state(
+    conn, family: str, state: str, *, manual: bool = False,
+) -> None:
+    """Persist a new live state. Used by the promotion job and operator tools.
+
+    `manual=True` marks the write as operator-sourced — only path to re-enter
+    live after an auto-demote to shadow (the ratchet in `should_go_live`
+    rejects auto re-promotion to keep a bled family from flip-flopping back).
+    """
+    if state not in _ALL_STATES:
+        raise ValueError(f"invalid live state {state!r}")
+    family_u = family.upper()
+    if family_u in DIRECTIONAL_BLOCKED_FAMILIES and state != LiveState.SHADOW:
+        raise ValueError(
+            f"family {family_u} is on the hard block list; cannot promote"
+        )
+    flag = LiveFlag(state=state, since_ts_unix=_time.time(), manual=manual)
+    try:
+        kv_set(conn, _kv_key(family_u), asdict(flag), _KV_TTL_S)
+    except Exception as exc:  # pragma: no cover — best-effort persistence
+        logger.warning("[directional-shadow] set_live_state(%s, %s) failed: %s",
+                       family_u, state, exc)
 
 
 def set_live_flag(conn, family: str, enabled: bool) -> None:
-    """Persist the per-family live flag. Used by step-9 promotion job and tests.
+    """Back-compat wrapper — bool write is equivalent to SHADOW / LIVE_FULL.
 
-    Writing a False is explicit — it shadows prior True values instead of
-    relying on TTL expiry.
+    New code should call `set_live_state` so the canary path is reachable.
     """
-    family_u = family.upper()
-    try:
-        kv_set(conn, _kv_key(family_u), bool(enabled), _KV_TTL_S)
-    except Exception as exc:  # pragma: no cover — best-effort persistence
-        logger.warning("[directional-shadow] set_live_flag(%s, %s) failed: %s",
-                       family_u, enabled, exc)
+    set_live_state(
+        conn, family,
+        LiveState.LIVE_FULL if enabled else LiveState.SHADOW,
+        manual=True,
+    )
 
 
-# ── Step-9 graduation stub (will be fleshed out in step 9) ────────────────
-DEFAULT_MIN_SETTLED = 50
-DEFAULT_MIN_EDGE_BEAT = 0.005  # 0.5 percentage points over baseline
+# ── Step-9 graduation thresholds ──────────────────────────────────────────
+# Tiered per strategy (option D): directional uses Brier + realized-P&L +
+# out-of-sample. Weather MM stays manual until Phase 2 ships a fill-model.
+DEFAULT_MIN_SETTLED = 50          # N floor for first promotion (shadow → canary)
+DEFAULT_MIN_CANARY_SETTLED = 30   # N floor for canary → full auto-promote
+DEFAULT_MIN_EDGE_BEAT = 0.005     # 0.5pp Brier beat over baseline (first gate)
+DEFAULT_RATCHETED_EDGE_BEAT = 0.010  # 1.0pp beat required after an auto-demote
 
 
 def should_go_live(
@@ -239,22 +356,11 @@ def should_go_live(
     min_settled: int = DEFAULT_MIN_SETTLED,
     min_edge_beat: float = DEFAULT_MIN_EDGE_BEAT,
 ) -> bool:
-    """Step-9 shadow-to-live gate — returns False until step 9 implements it.
+    """Thin convenience wrapper — returns True iff the family is currently in a
+    live state. The real promotion/demotion decisions live in
+    `bot.learning.shadow_promotion.run_promotion_sweep()` which reads
+    `alpha_backtest` + `settlements` and writes via `set_live_state`.
 
-    Contract:
-      * Must return False for hard-blocked families.
-      * Must return False when fewer than `min_settled` SHADOW_PASS rows
-        exist in alpha_backtest for this family.
-      * Otherwise compares realized shadow P&L vs baseline and flips to
-        True once calibration + directional alpha clears `min_edge_beat`.
-
-    Step 9 will read `alpha_backtest` + `calibration` to implement this.
-    Defined here so the call-sites in step-7 code (and the eventual step-9
-    cron) can stabilize now.
+    Kept here as a stable call-site for legacy code.
     """
-    family_u = family.upper()
-    if family_u in DIRECTIONAL_BLOCKED_FAMILIES:
-        return False
-    # Step 9 implements the SQL. For now, be paranoid: False unless the
-    # operator explicitly flipped the live flag by hand.
-    return False
+    return should_trade_live(conn, family)

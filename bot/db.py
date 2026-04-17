@@ -348,6 +348,32 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         "ON weather_mm_shadow(series, ts_unix)"
     )
 
+    # ── Phase 1 step 9: shadow-to-live promotion event log ──
+    # One row per state transition (shadow → canary → full and reverse).
+    # Used for post-mortems and to preserve the history that kv_cache loses
+    # on overwrite. `metrics_json` captures the decision-time stats
+    # (brier beat, realized P&L, N, OOS split) so we can reproduce why a
+    # family was promoted or demoted weeks later.
+    conn.execute("""CREATE TABLE IF NOT EXISTS promotion_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_unix REAL NOT NULL,
+        ts_iso TEXT NOT NULL,
+        family TEXT NOT NULL,
+        old_state TEXT NOT NULL,
+        new_state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        metrics_json TEXT,
+        manual INTEGER NOT NULL DEFAULT 0)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_promo_family_ts "
+        "ON promotion_events(family, ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_promo_trigger_ts "
+        "ON promotion_events(trigger, ts_unix)"
+    )
+
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
         ("trades", "action", "TEXT DEFAULT 'buy'"),

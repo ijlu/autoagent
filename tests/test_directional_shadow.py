@@ -6,11 +6,16 @@ import pytest
 from bot.db import init_db
 from bot.learning.directional_shadow import (
     DEFAULT_MIN_SETTLED,
+    LiveFlag,
+    LiveState,
     ShadowDecision,
     ShadowOutcome,
     _our_side_market_prob,
     evaluate,
+    get_kelly_multiplier,
+    get_live_state,
     set_live_flag,
+    set_live_state,
     should_go_live,
     should_trade_live,
 )
@@ -167,8 +172,10 @@ class TestShouldTradeLive:
         assert should_trade_live(conn, "KXHIGHNY") is False
 
     def test_blocked_family_never_live(self, conn):
-        # Even if someone writes True to the kv row, block list wins.
-        set_live_flag(conn, "KXBTC", True)
+        # Block list wins — set_live_flag must refuse to promote a blocked family.
+        with pytest.raises(ValueError, match="hard block list"):
+            set_live_flag(conn, "KXBTC", True)
+        # And reading always returns SHADOW even if someone bypasses the setter.
         assert should_trade_live(conn, "KXBTC") is False
 
     def test_set_flag_flips_live(self, conn):
@@ -186,6 +193,54 @@ class TestShouldTradeLive:
         set_live_flag(conn, "kxhighny", True)
         assert should_trade_live(conn, "KXHIGHNY") is True
         assert should_trade_live(conn, "kxhighny") is True
+
+
+class TestLiveStateGraduated:
+    def test_default_is_shadow(self, conn):
+        flag = get_live_state(conn, "KXHIGHNY")
+        assert flag.state == LiveState.SHADOW
+        assert flag.manual is False
+
+    def test_canary_promotion_sets_half_multiplier(self, conn):
+        set_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
+        assert get_kelly_multiplier(conn, "KXHIGHNY") == 0.5
+        assert should_trade_live(conn, "KXHIGHNY") is True
+
+    def test_full_promotion_sets_one_multiplier(self, conn):
+        set_live_state(conn, "KXHIGHNY", LiveState.LIVE_FULL)
+        assert get_kelly_multiplier(conn, "KXHIGHNY") == 1.0
+
+    def test_shadow_multiplier_is_zero(self, conn):
+        set_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
+        set_live_state(conn, "KXHIGHNY", LiveState.SHADOW)
+        assert get_kelly_multiplier(conn, "KXHIGHNY") == 0.0
+
+    def test_blocked_family_always_shadow_multiplier(self, conn):
+        assert get_kelly_multiplier(conn, "KXBTC") == 0.0
+        assert get_live_state(conn, "KXBTC").state == LiveState.SHADOW
+
+    def test_set_invalid_state_raises(self, conn):
+        with pytest.raises(ValueError):
+            set_live_state(conn, "KXHIGHNY", "bogus_state")
+
+    def test_set_live_state_on_blocked_raises(self, conn):
+        with pytest.raises(ValueError, match="hard block list"):
+            set_live_state(conn, "KXBTC", LiveState.LIVE_CANARY)
+        # Shadow-write to a blocked family is a no-op but allowed (idempotent).
+        set_live_state(conn, "KXBTC", LiveState.SHADOW)
+
+    def test_manual_flag_round_trips(self, conn):
+        set_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY, manual=True)
+        flag = get_live_state(conn, "KXHIGHNY")
+        assert flag.manual is True
+        assert flag.state == LiveState.LIVE_CANARY
+
+    def test_legacy_bool_kv_value_reads_as_full(self, conn):
+        # Simulate a pre-graduation row (bool) — upgrade path must not crash.
+        from bot.db import kv_set
+        kv_set(conn, "directional_live:KXFED", True, 30 * 24 * 3600)
+        flag = get_live_state(conn, "KXFED")
+        assert flag.state == LiveState.LIVE_FULL
 
 
 class TestShouldGoLive:
