@@ -243,6 +243,64 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         active_feedback TEXT,
         outcome TEXT)""")
 
+    # ── alpha_backtest (Phase 1 gate evaluation) ──
+    # Atomic decision-time log for the Phase 0 gate's "beat market-mid by ≥0.005"
+    # leg. Every decision (MM quote, directional shadow/live, weather shadow) writes
+    # one row with ensemble estimate + raw market snapshot + (later) settlement.
+    #
+    # Raw market fields (yes_bid/ask/last_cents, spread, age) are stored in addition
+    # to the canonical market_prob_yes so analysis can re-run the gate under multiple
+    # definitions without re-collecting data. See bot/learning/alpha_log.py for the
+    # resolution rules and market_prob_source tags.
+    conn.execute("""CREATE TABLE IF NOT EXISTS alpha_backtest (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_decision TEXT NOT NULL,
+        ts_decision_unix REAL NOT NULL,
+        ticker TEXT NOT NULL,
+        family TEXT,
+        decision_type TEXT NOT NULL,
+        decision_outcome TEXT NOT NULL,
+        side TEXT,
+        price_cents INTEGER,
+        contracts INTEGER,
+        skip_reason TEXT,
+        ensemble_p_yes REAL NOT NULL,
+        ensemble_confidence REAL,
+        source_count INTEGER,
+        sources_json TEXT,
+        source_estimates_json TEXT,
+        yes_bid_cents INTEGER,
+        yes_ask_cents INTEGER,
+        yes_last_cents INTEGER,
+        last_trade_age_s REAL,
+        spread_cents INTEGER,
+        volume_fp INTEGER,
+        market_prob_yes REAL,
+        market_prob_source TEXT,
+        ts_settle TEXT,
+        ts_settle_unix REAL,
+        settlement_result TEXT,
+        won_yes INTEGER,
+        realized_pnl_cents INTEGER,
+        cycle_id TEXT,
+        notes TEXT)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_ticker_ts "
+        "ON alpha_backtest(ticker, ts_decision_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_family_settle "
+        "ON alpha_backtest(family, ts_settle_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_type_outcome "
+        "ON alpha_backtest(decision_type, decision_outcome)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_pending_settle "
+        "ON alpha_backtest(ticker, side) WHERE ts_settle_unix IS NULL"
+    )
+
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
         ("trades", "action", "TEXT DEFAULT 'buy'"),

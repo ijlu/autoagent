@@ -79,6 +79,13 @@ MAX_PORTFOLIO_PCT  = float(os.environ.get("MAX_PORTFOLIO_PCT", "0.15"))   # max 
 # Old flat estimate ESTIMATED_FEE_PER_CONTRACT=0.03 was ~3-7x too high for maker orders.
 # Now we compute price-dependent fees: maker entry + taker exit per contract.
 from bot.core.money import fee_per_contract_cents as _fee_per_contract_cents
+from bot.learning.alpha_log import (
+    DecisionOutcome as _AlphaOutcome,
+    DecisionType as _AlphaType,
+    EnsembleSnapshot as _AlphaEnsemble,
+    log_decision as _alpha_log_decision,
+    market_snapshot_from_dict as _alpha_market_snapshot,
+)
 ESTIMATED_EXIT_SPREAD = float(os.environ.get("ESTIMATED_EXIT_SPREAD", "0.03"))  # 3¢ expected exit slippage
 
 def _round_trip_fee_dollars(price_dollars: float) -> float:
@@ -6604,6 +6611,19 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                 log_opportunity(conn, ticker, strategy, "skip_kelly", side=side,
                                 ensemble_prob=indep_prob, market_prob=mkt_prob,
                                 edge=edge, source_count=sc, skip_reason="kelly_zero")
+                if indep_prob is not None:
+                    _alpha_log_decision(
+                        conn, ticker=ticker,
+                        decision_type=_AlphaType.DIRECTIONAL_SHADOW,
+                        decision_outcome=_AlphaOutcome.DISCARDED,
+                        ensemble=_AlphaEnsemble(
+                            p_yes=float(indep_prob), source_count=sc,
+                        ),
+                        market=_alpha_market_snapshot(m),
+                        side=side, price_cents=int(price_cents),
+                        skip_reason="kelly_zero",
+                        notes=f"strategy={strategy}",
+                    )
                 continue
 
             # Order book depth check: cap contracts to what the book can absorb
@@ -6642,6 +6662,22 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             log_opportunity(conn, ticker, strategy, "trade", side=side,
                             ensemble_prob=indep_prob, market_prob=mkt_prob,
                             edge=edge, source_count=sc)
+            if indep_prob is not None:
+                # DRY_RUN is forced True at module import (see phase config), so
+                # every "trade" here is a shadow — log as SHADOW_ONLY. When the
+                # directional gate is re-enabled this flips to LIVE + POSTED.
+                _alpha_log_decision(
+                    conn, ticker=ticker,
+                    decision_type=_AlphaType.DIRECTIONAL_SHADOW,
+                    decision_outcome=_AlphaOutcome.SHADOW_ONLY,
+                    ensemble=_AlphaEnsemble(
+                        p_yes=float(indep_prob), source_count=sc,
+                    ),
+                    market=_alpha_market_snapshot(m),
+                    side=side, price_cents=int(price_cents),
+                    contracts=int(contracts),
+                    notes=f"strategy={strategy}",
+                )
             print(f"  → {ticker} {side} @ {price_cents}¢ x{contracts}  "
                   f"edge={edge:.1%}  [{strategy}]")
 

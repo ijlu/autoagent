@@ -36,6 +36,7 @@ class TestInitDb:
             "timing_patterns", "hyperparam_shadow",
             "mm_orders", "mm_inventory", "mm_sessions", "mm_processed_fills",
             "kv_cache", "learned_config", "opportunity_log", "decision_log",
+            "alpha_backtest",
         }
         missing = expected - tables
         assert not missing, f"Missing tables: {missing}"
