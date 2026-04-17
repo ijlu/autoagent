@@ -47,6 +47,9 @@ MAX_PORTFOLIO_PCT = float(os.environ.get("MAX_PORTFOLIO_PCT", "0.15"))
 # ══════════════════════════════════════════════════════════════════════════════
 MM_ENABLED = os.environ.get("MM_ENABLED", "true").lower() in ("true", "1", "yes")
 MM_DRY_RUN = os.environ.get("MM_DRY_RUN", "true").lower() in ("true", "1", "yes")
+# Phase 1 shadow-to-live gate for weather MM. Default false — shadow mode only.
+# Flipped to true only once the step-9 shadow backtest proves out.
+WEATHER_MM_LIVE = os.environ.get("WEATHER_MM_LIVE", "false").lower() in ("true", "1", "yes")
 MM_MIN_SPREAD = int(os.environ.get("MM_MIN_SPREAD_CENTS", "4"))
 MM_HALF_SPREAD = int(os.environ.get("MM_HALF_SPREAD_CENTS", "2"))
 MM_MAX_INVENTORY = int(os.environ.get("MM_MAX_INVENTORY", "50"))

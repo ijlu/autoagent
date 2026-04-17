@@ -771,3 +771,183 @@ class TestHelpers:
         """Extreme inputs should not raise OverflowError."""
         assert _logistic_cdf(-1000.0, 0.0, 0.1) == 0.0
         assert _logistic_cdf(1000.0, 0.0, 0.1) == 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Shadow path — never calls api_post/api_delete, writes weather_mm_shadow
+# ═══════════════════════════════════════════════════════════════════════════
+
+from bot.db import init_db
+from bot.daemon.weather_quoter import ShadowResult  # noqa: E402
+
+
+@pytest.fixture()
+def real_conn():
+    """Full schema so weather_mm_shadow exists."""
+    return init_db(":memory:")
+
+
+class TestComputeQuotePricesStatic:
+    """The extracted pricing math should match the live path byte-for-byte."""
+
+    @patch("bot.daemon.weather_quoter.MM_ORDER_SIZE", 10)
+    @patch("bot.daemon.weather_quoter.MM_SKEW_PER_10", 2)
+    def test_inventory_zero_symmetric_around_fv(self):
+        bid, ask, hs = WeatherQuoter.compute_quote_prices(50, 8, 0)
+        assert bid == 50 - hs
+        assert ask == 50 + hs
+        assert hs >= 8
+
+    @patch("bot.daemon.weather_quoter.MM_ORDER_SIZE", 10)
+    @patch("bot.daemon.weather_quoter.MM_SKEW_PER_10", 2)
+    def test_positive_inventory_shifts_down(self):
+        bid, ask, hs = WeatherQuoter.compute_quote_prices(50, 8, 20)
+        # skew = 20/10 * 2 = 4 -> both shifted down by 4
+        assert bid == 50 - hs - 4
+        assert ask == 50 + hs - 4
+
+    def test_fee_floor_raises_half_spread(self):
+        """Passing half_spread=1 at 50c must be raised to the fee floor."""
+        _, _, hs = WeatherQuoter.compute_quote_prices(50, 1, 0)
+        assert hs >= 2  # per _fee_floor_half_spread at 50c
+
+    def test_clamps_into_legal_range(self):
+        bid, ask, _ = WeatherQuoter.compute_quote_prices(97, 5, 0)
+        assert 1 <= bid <= 98
+        assert bid + 1 <= ask <= 99
+
+
+class TestShadowRequoteCity:
+    """Shadow path writes rows and returns ShadowResult; never calls the API."""
+
+    @patch("bot.daemon.weather_quoter.api_post")
+    @patch("bot.daemon.weather_quoter.api_delete")
+    @patch("bot.daemon.weather_quoter.WeatherQuoter._fetch_weather_markets")
+    def test_writes_row_per_market(
+        self, mock_fetch, mock_delete, mock_post, real_conn,
+    ):
+        mock_fetch.return_value = [
+            _make_bracket_market(ticker="KXHIGHNY-A", floor_val=70, cap_val=75),
+            _make_threshold_market(ticker="KXHIGHNY-T70", threshold=70, is_above=True),
+        ]
+        quoter = WeatherQuoter(real_conn)
+
+        results = quoter.shadow_requote_city(
+            series="KXHIGHNY", station="KJFK",
+            running_high_f=69.0, forecast_high_f=74.0, hours_left=8.0,
+            old_temp_f=67.0, new_temp_f=69.0,
+        )
+        assert len(results) == 2
+        for r in results:
+            assert isinstance(r, ShadowResult)
+            assert r.shadow_row_id is not None
+
+        mock_post.assert_not_called()
+        mock_delete.assert_not_called()
+
+        rows = real_conn.execute(
+            "SELECT ticker, series, station, old_temp_f, new_temp_f, live_mode, "
+            "fair_value_cents, proposed_bid_cents, proposed_ask_cents "
+            "FROM weather_mm_shadow ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 2
+        for r in rows:
+            assert r[1] == "KXHIGHNY"
+            assert r[2] == "KJFK"
+            assert r[3] == 67.0
+            assert r[4] == 69.0
+            assert r[5] == 0  # live_mode = False
+            assert 2 <= r[6] <= 98
+            assert 1 <= r[7] < r[8] <= 99
+
+    @patch("bot.daemon.weather_quoter.WeatherQuoter._fetch_weather_markets")
+    def test_smart_gate_rejection_still_writes_row(self, mock_fetch, real_conn):
+        """Even when the gate says don't quote, we persist the decision for
+        the step-9 gate — 'counterfactual we didn't quote' is a data point."""
+        mock_fetch.return_value = [
+            _make_bracket_market(ticker="KXHIGHNY-A", floor_val=70, cap_val=75),
+        ]
+        quoter = WeatherQuoter(real_conn)
+
+        def gate(*args, **kwargs):
+            return False, "time-of-day", 1.0
+
+        results = quoter.shadow_requote_city(
+            series="KXHIGHNY", station="KJFK",
+            running_high_f=69.0, forecast_high_f=74.0, hours_left=8.0,
+            smart_gates=gate,
+        )
+        assert len(results) == 1
+        assert results[0].gate_should_quote is False
+        assert "time-of-day" in (results[0].gate_reason or "")
+
+        row = real_conn.execute(
+            "SELECT gate_should_quote, gate_reason FROM weather_mm_shadow"
+        ).fetchone()
+        assert row[0] == 0
+        assert "time-of-day" in row[1]
+
+    @patch("bot.daemon.weather_quoter.WeatherQuoter._fetch_weather_markets")
+    def test_extreme_fair_value_is_flagged(self, mock_fetch, real_conn):
+        """FV at the rails (<=2 or >=98) is logged but marked skipped."""
+        # A bracket well past the running high -> FV ~2c
+        mock_fetch.return_value = [
+            _make_bracket_market(ticker="KXHIGHNY-HI", floor_val=120, cap_val=122),
+        ]
+        quoter = WeatherQuoter(real_conn)
+
+        results = quoter.shadow_requote_city(
+            series="KXHIGHNY", station="KJFK",
+            running_high_f=70.0, forecast_high_f=75.0, hours_left=10.0,
+        )
+        assert len(results) == 1
+        r = results[0]
+        assert r.fair_value_cents <= 2 or r.fair_value_cents >= 98
+        assert r.gate_should_quote is False
+        assert "extreme_fv" in (r.gate_reason or "")
+
+    @patch("bot.daemon.weather_quoter.WeatherQuoter._fetch_weather_markets")
+    def test_no_markets_returns_empty(self, mock_fetch, real_conn):
+        mock_fetch.return_value = []
+        quoter = WeatherQuoter(real_conn)
+        out = quoter.shadow_requote_city(
+            series="KXHIGHNY", station="KJFK",
+            running_high_f=70.0, forecast_high_f=75.0, hours_left=8.0,
+        )
+        assert out == []
+        row = real_conn.execute(
+            "SELECT COUNT(*) FROM weather_mm_shadow"
+        ).fetchone()
+        assert row[0] == 0
+
+    @patch("bot.daemon.weather_quoter.WeatherQuoter._fetch_weather_markets")
+    def test_market_mid_computed(self, mock_fetch, real_conn):
+        """market_mid is the average of yes_bid and yes_ask when both set."""
+        mock_fetch.return_value = [
+            _make_bracket_market(
+                ticker="KXHIGHNY-A", floor_val=70, cap_val=75,
+                yes_bid=30, yes_ask=40,
+            ),
+        ]
+        quoter = WeatherQuoter(real_conn)
+        quoter.shadow_requote_city(
+            series="KXHIGHNY", station="KJFK",
+            running_high_f=72.0, forecast_high_f=74.0, hours_left=5.0,
+        )
+        row = real_conn.execute(
+            "SELECT market_yes_bid, market_yes_ask, market_mid "
+            "FROM weather_mm_shadow"
+        ).fetchone()
+        assert row[0] == 30
+        assert row[1] == 40
+        assert row[2] == 35
+
+
+class TestQuoterLiveFlag:
+    def test_default_is_shadow(self, mock_conn):
+        q = WeatherQuoter(mock_conn)
+        assert q.live is False
+
+    def test_live_flag_sticks(self, mock_conn):
+        q = WeatherQuoter(mock_conn, live=True)
+        assert q.live is True

@@ -32,9 +32,12 @@ import time
 from typing import Optional
 
 from bot.daemon.cycle_runner import CycleRunner
+from bot.daemon.forecast_cache import ForecastCache, FORECAST_REFRESH_INTERVAL_S
 from bot.daemon.metar_poller import METARPoller
 from bot.daemon.poller_base import Poller
 from bot.daemon.scheduler import Scheduler
+from bot.daemon.weather_handler import WeatherChangeHandler
+from bot.daemon.weather_quoter import WeatherQuoter
 from bot.db import init_db, kv_cleanup
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,7 @@ CYCLE_INTERVAL_S = 60
 KV_CLEANUP_INTERVAL_S = 3600
 HEALTH_LOG_INTERVAL_S = 300
 METAR_POLL_INTERVAL_S = 30
+FORECAST_REFRESH_TASK_INTERVAL_S = FORECAST_REFRESH_INTERVAL_S
 
 
 def _configure_logging() -> None:
@@ -62,7 +66,8 @@ def _configure_logging() -> None:
 
 
 def _log_health(pollers: list[Poller], cycle_runner: CycleRunner,
-                scheduler: Scheduler) -> None:
+                scheduler: Scheduler,
+                weather_handler: Optional[WeatherChangeHandler] = None) -> None:
     """Periodic health summary. One line per subsystem."""
     for p in pollers:
         h = p.health()
@@ -84,6 +89,16 @@ def _log_health(pollers: list[Poller], cycle_runner: CycleRunner,
             name, stats["run_count"], stats["error_count"],
             stats["last_run_duration_s"],
         )
+    if weather_handler is not None:
+        s = weather_handler.stats
+        logger.info(
+            "[health] wx_handler mode=%s seen=%d throttled=%d dispatched=%d "
+            "shadowed=%d quoted=%d skipped=%d errors=%d",
+            "LIVE" if weather_handler.live else "SHADOW",
+            s["changes_seen"], s["changes_throttled"], s["requotes_dispatched"],
+            s["markets_shadowed"], s["markets_quoted"], s["markets_skipped"],
+            s["errors"],
+        )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -100,10 +115,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     conn = init_db()
     logger.info("[daemon] DB initialized (WAL mode, shared connection)")
 
+    # ── Weather MM event-driven path ───────────────────────────────────
+    # Forecast cache + quoter + handler are created before the poller so
+    # we can pass the handler in as METARPoller(on_result=...).
+    forecast_cache = ForecastCache()
+    weather_quoter = WeatherQuoter(conn)
+    weather_handler = WeatherChangeHandler(
+        quoter=weather_quoter,
+        forecast_cache=forecast_cache,
+    )
+    logger.info(
+        "[daemon] weather handler: mode=%s",
+        "LIVE" if weather_handler.live else "SHADOW",
+    )
+
     # ── Pollers ────────────────────────────────────────────────────────
-    # Phase 1 starts with METAR only. Phase 2 adds NWS, NBM, HRRR,
-    # MADIS, AFD. Phase 3 adds econ pollers.
-    metar_poller = METARPoller()  # on_result: None for now (requote handler lands Phase 2)
+    # Phase 1: METAR → WeatherChangeHandler (shadow by default).
+    # Phase 2 adds NWS, NBM, HRRR, MADIS, AFD. Phase 3 adds econ pollers.
+    metar_poller = METARPoller(on_result=weather_handler)
     metar_poller.interval_s = METAR_POLL_INTERVAL_S
     pollers: list[Poller] = [metar_poller]
 
@@ -119,8 +148,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                        interval_s=KV_CLEANUP_INTERVAL_S,
                        initial_delay_s=60.0)
     scheduler.register(
+        "forecast_refresh",
+        forecast_cache.refresh,
+        interval_s=FORECAST_REFRESH_TASK_INTERVAL_S,
+        initial_delay_s=2.0,  # prime cache early so first METAR events have data
+    )
+    scheduler.register(
         "health_log",
-        lambda: _log_health(pollers, cycle_runner, scheduler),
+        lambda: _log_health(pollers, cycle_runner, scheduler, weather_handler),
         interval_s=HEALTH_LOG_INTERVAL_S,
         initial_delay_s=30.0,
     )

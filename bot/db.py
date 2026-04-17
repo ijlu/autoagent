@@ -301,6 +301,53 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         "ON alpha_backtest(ticker, side) WHERE ts_settle_unix IS NULL"
     )
 
+    # ── Phase 1: weather MM shadow log ──
+    # Every quote the event-driven WeatherQuoter WOULD have posted (when
+    # WEATHER_MM_LIVE=false) is written here — with the FV, proposed bid/ask,
+    # the market snapshot at shadow time, the gate decision, and the METAR
+    # context that triggered the requote. The step-9 shadow-to-live gate joins
+    # this against `settlements` to compute counterfactual P&L: did the +4.7¢
+    # historical markout convert to realized P&L under the new cancel-replace
+    # path? Flip to live only if yes.
+    #
+    # All prices are stored as YES-equivalent cents (per-side normalization,
+    # CLAUDE.md bug pattern #13) so joins against `settlements` and
+    # `opportunity_log` don't need side-aware CASE expressions.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_mm_shadow (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_unix INTEGER NOT NULL,
+        ts_iso TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        series TEXT NOT NULL,
+        station TEXT NOT NULL,
+        old_temp_f REAL,
+        new_temp_f REAL,
+        running_high_f REAL,
+        forecast_high_f REAL,
+        hours_left REAL,
+        trajectory_f_per_hr REAL,
+        fair_value_cents INTEGER,
+        proposed_bid_cents INTEGER,
+        proposed_ask_cents INTEGER,
+        half_spread_cents INTEGER,
+        market_yes_bid INTEGER,
+        market_yes_ask INTEGER,
+        market_mid INTEGER,
+        inventory INTEGER,
+        gate_should_quote INTEGER,
+        gate_reason TEXT,
+        gate_spread_mult REAL,
+        latency_ms REAL,
+        live_mode INTEGER NOT NULL DEFAULT 0)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wx_shadow_ticker_ts "
+        "ON weather_mm_shadow(ticker, ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wx_shadow_series_ts "
+        "ON weather_mm_shadow(series, ts_unix)"
+    )
+
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
         ("trades", "action", "TEXT DEFAULT 'buy'"),

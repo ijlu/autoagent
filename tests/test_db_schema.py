@@ -36,10 +36,28 @@ class TestInitDb:
             "timing_patterns", "hyperparam_shadow",
             "mm_orders", "mm_inventory", "mm_sessions", "mm_processed_fills",
             "kv_cache", "learned_config", "opportunity_log", "decision_log",
-            "alpha_backtest",
+            "alpha_backtest", "weather_mm_shadow",
         }
         missing = expected - tables
         assert not missing, f"Missing tables: {missing}"
+
+    def test_weather_mm_shadow_columns(self):
+        """weather_mm_shadow must expose every field the step-9 gate needs."""
+        conn = init_db(":memory:")
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(weather_mm_shadow)"
+        ).fetchall()}
+        required = {
+            "ts_unix", "ts_iso", "ticker", "series", "station",
+            "old_temp_f", "new_temp_f", "running_high_f", "forecast_high_f",
+            "hours_left", "trajectory_f_per_hr",
+            "fair_value_cents", "proposed_bid_cents", "proposed_ask_cents",
+            "half_spread_cents", "market_yes_bid", "market_yes_ask", "market_mid",
+            "inventory", "gate_should_quote", "gate_reason", "gate_spread_mult",
+            "latency_ms", "live_mode",
+        }
+        missing = required - cols
+        assert not missing, f"weather_mm_shadow missing columns: {missing}"
 
     def test_idempotent(self):
         """Calling init_db twice on the same DB should not error."""

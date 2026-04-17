@@ -8,6 +8,11 @@ When METAR temperature changes, this module:
 5. Posts new two-sided quotes at fair_value +/- half_spread
 
 Target: complete full requote cycle in <5 seconds.
+
+Phase 1 shadow mode: `shadow_requote_city` / `shadow_requote_single` share
+the FV + smart-gate + bid/ask math with the live path but never call
+`api_post`/`api_delete`. Proposed quotes are written to the
+`weather_mm_shadow` table so the step-9 gate can measure counterfactual P&L.
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ from bot.config import (
     MM_SKEW_PER_10,
     MM_ORDER_TAG,
 )
+from bot.daemon.locks import DB_WRITE_LOCK
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,20 @@ class RequoteResult:
     skipped: bool
     skip_reason: Optional[str]
     latency_ms: float
+
+
+@dataclass
+class ShadowResult:
+    """Result of a shadow-mode requote — logged, not placed."""
+    ticker: str
+    fair_value_cents: int
+    proposed_bid_cents: int
+    proposed_ask_cents: int
+    half_spread_cents: int
+    gate_should_quote: bool
+    gate_reason: Optional[str]
+    latency_ms: float
+    shadow_row_id: Optional[int]
 
 
 # Type alias for the smart-gate callback.
@@ -157,12 +177,18 @@ class WeatherQuoter:
         )
     """
 
-    def __init__(self, conn):
+    def __init__(self, conn, live: bool = False):
         """
         Args:
             conn: SQLite connection for inventory lookups and opportunity logging.
+            live: When False (default), the shadow path is used — proposed
+                quotes are logged to `weather_mm_shadow` and no API calls are
+                made. When True, `requote_city` posts real orders subject to
+                `MM_DRY_RUN`. The CLAUDE.md-specified `WEATHER_MM_LIVE=false`
+                shadow-to-live gate reads this attribute via the caller.
         """
         self.conn = conn
+        self.live = bool(live)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -237,6 +263,206 @@ class WeatherQuoter:
                 ))
 
         return results
+
+    # ------------------------------------------------------------------
+    # Shadow path — compute FV + quote, write to weather_mm_shadow, no API
+    # ------------------------------------------------------------------
+
+    def shadow_requote_city(
+        self,
+        series: str,
+        station: str,
+        running_high_f: float,
+        forecast_high_f: float,
+        hours_left: float,
+        trajectory_f_per_hr: float = 0.0,
+        smart_gates: Optional[SmartGateFn] = None,
+        old_temp_f: Optional[float] = None,
+        new_temp_f: Optional[float] = None,
+    ) -> list["ShadowResult"]:
+        """Shadow sibling of ``requote_city``.
+
+        Computes fair value + proposed bid/ask + smart-gate decision for every
+        open market in the series, writes one ``weather_mm_shadow`` row per
+        market, and returns a list of ShadowResult. **Never calls api_post or
+        api_delete.** Used by the Phase 1 shadow-to-live gate: the same FV
+        and gate logic as live mode, but the only side-effect is the DB row.
+        """
+        out: list[ShadowResult] = []
+        try:
+            markets = self._fetch_weather_markets(series)
+        except Exception as exc:
+            logger.error("[wx-shadow] fetch markets failed for %s: %s", series, exc)
+            return out
+
+        if not markets:
+            logger.info("[wx-shadow] no open markets for %s", series)
+            return out
+
+        for market in markets:
+            try:
+                res = self._shadow_requote_single(
+                    market=market,
+                    station=station,
+                    running_high_f=running_high_f,
+                    forecast_high_f=forecast_high_f,
+                    hours_left=hours_left,
+                    trajectory_f_per_hr=trajectory_f_per_hr,
+                    smart_gates=smart_gates,
+                    old_temp_f=old_temp_f,
+                    new_temp_f=new_temp_f,
+                )
+                out.append(res)
+            except Exception as exc:
+                logger.error(
+                    "[wx-shadow] error shadow-quoting %s: %s", market.ticker, exc,
+                    exc_info=True,
+                )
+        return out
+
+    def _shadow_requote_single(
+        self,
+        market: WeatherMarket,
+        station: str,
+        running_high_f: float,
+        forecast_high_f: float,
+        hours_left: float,
+        trajectory_f_per_hr: float,
+        smart_gates: Optional[SmartGateFn],
+        old_temp_f: Optional[float],
+        new_temp_f: Optional[float],
+    ) -> "ShadowResult":
+        t0 = time.monotonic()
+        ticker = market.ticker
+
+        gate_should_quote = True
+        gate_reason: Optional[str] = None
+        spread_mult = 1.0
+        if smart_gates is not None:
+            gate_should_quote, gate_reason, spread_mult = smart_gates(
+                station,
+                market.bracket_floor,
+                market.bracket_cap,
+                running_high_f,
+                forecast_high_f,
+                hours_left,
+                trajectory_f_per_hr,
+            )
+
+        fair_value_cents = self._compute_fair_value(
+            market, running_high_f, forecast_high_f, hours_left,
+        )
+
+        base_hs = max(MM_HALF_SPREAD, 8)
+        effective_hs_req = max(1, int(round(base_hs * spread_mult)))
+        inventory = self._get_inventory(ticker)
+        bid, ask, effective_hs = self.compute_quote_prices(
+            fair_value_cents, effective_hs_req, inventory,
+        )
+
+        extreme_fv = fair_value_cents <= 2 or fair_value_cents >= 98
+        if extreme_fv:
+            # Log the row, but flag as skipped — step-9 gate treats these as
+            # "would-not-have-traded" regardless of fill model.
+            gate_should_quote = False
+            gate_reason = (gate_reason or "") + f";extreme_fv={fair_value_cents}c"
+
+        latency_ms = _ms_since(t0)
+        row_id = self._write_shadow_row(
+            ticker=ticker,
+            series=market.series,
+            station=station,
+            old_temp_f=old_temp_f,
+            new_temp_f=new_temp_f,
+            running_high_f=running_high_f,
+            forecast_high_f=forecast_high_f,
+            hours_left=hours_left,
+            trajectory_f_per_hr=trajectory_f_per_hr,
+            fair_value_cents=fair_value_cents,
+            bid_cents=bid,
+            ask_cents=ask,
+            half_spread_cents=effective_hs,
+            market_yes_bid=market.yes_bid,
+            market_yes_ask=market.yes_ask,
+            inventory=inventory,
+            gate_should_quote=gate_should_quote,
+            gate_reason=gate_reason,
+            gate_spread_mult=spread_mult,
+            latency_ms=latency_ms,
+            live_mode=False,
+        )
+
+        return ShadowResult(
+            ticker=ticker,
+            fair_value_cents=fair_value_cents,
+            proposed_bid_cents=bid,
+            proposed_ask_cents=ask,
+            half_spread_cents=effective_hs,
+            gate_should_quote=gate_should_quote,
+            gate_reason=gate_reason,
+            latency_ms=latency_ms,
+            shadow_row_id=row_id,
+        )
+
+    def _write_shadow_row(
+        self,
+        *,
+        ticker: str,
+        series: str,
+        station: str,
+        old_temp_f: Optional[float],
+        new_temp_f: Optional[float],
+        running_high_f: float,
+        forecast_high_f: float,
+        hours_left: float,
+        trajectory_f_per_hr: float,
+        fair_value_cents: int,
+        bid_cents: int,
+        ask_cents: int,
+        half_spread_cents: int,
+        market_yes_bid: int,
+        market_yes_ask: int,
+        inventory: int,
+        gate_should_quote: bool,
+        gate_reason: Optional[str],
+        gate_spread_mult: float,
+        latency_ms: float,
+        live_mode: bool,
+    ) -> Optional[int]:
+        """Insert one row into weather_mm_shadow. Returns rowid on success."""
+        now = time.time()
+        now_iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+        market_mid = (
+            (market_yes_bid + market_yes_ask) // 2
+            if market_yes_bid and market_yes_ask else None
+        )
+        try:
+            with DB_WRITE_LOCK:
+                cur = self.conn.execute(
+                    """INSERT INTO weather_mm_shadow
+                    (ts_unix, ts_iso, ticker, series, station,
+                     old_temp_f, new_temp_f, running_high_f, forecast_high_f,
+                     hours_left, trajectory_f_per_hr,
+                     fair_value_cents, proposed_bid_cents, proposed_ask_cents,
+                     half_spread_cents, market_yes_bid, market_yes_ask, market_mid,
+                     inventory, gate_should_quote, gate_reason, gate_spread_mult,
+                     latency_ms, live_mode)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        int(now), now_iso, ticker, series, station,
+                        old_temp_f, new_temp_f, running_high_f, forecast_high_f,
+                        hours_left, trajectory_f_per_hr,
+                        fair_value_cents, bid_cents, ask_cents,
+                        half_spread_cents, market_yes_bid, market_yes_ask, market_mid,
+                        inventory, 1 if gate_should_quote else 0, gate_reason,
+                        gate_spread_mult, latency_ms, 1 if live_mode else 0,
+                    ),
+                )
+                self.conn.commit()
+                return cur.lastrowid
+        except Exception as exc:
+            logger.error("[wx-shadow] failed to insert shadow row for %s: %s", ticker, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Internal: single-market requote
@@ -525,6 +751,27 @@ class WeatherQuoter:
     # Quote posting
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def compute_quote_prices(
+        fair_value_cents: int,
+        half_spread: int,
+        inventory: int,
+    ) -> tuple[int, int, int]:
+        """Pure pricing math — fee-floored half-spread, inventory skew, clamps.
+
+        Returns ``(bid, ask, effective_half_spread)`` as YES-equivalent cents.
+        Shared between the live `_post_quotes` path and the shadow path so
+        the two can never drift.
+        """
+        min_half = _fee_floor_half_spread(fair_value_cents)
+        effective_hs = max(half_spread, min_half)
+        skew = int(round(inventory * MM_SKEW_PER_10 / 10.0))
+        bid = fair_value_cents - effective_hs - skew
+        ask = fair_value_cents + effective_hs - skew
+        bid = max(1, min(98, bid))
+        ask = max(bid + 1, min(99, ask))
+        return bid, ask, effective_hs
+
     def _post_quotes(
         self,
         ticker: str,
@@ -536,20 +783,9 @@ class WeatherQuoter:
 
         Returns the number of orders successfully posted (0, 1, or 2).
         """
-        # -- Fee-aware spread floor --
-        # half_spread must be >= estimated per-side maker fee so that a
-        # round-trip (bid filled + ask filled) is profitable after fees.
-        min_half = _fee_floor_half_spread(fair_value_cents)
-        effective_hs = max(half_spread, min_half)
-
-        # -- Compute bid/ask with inventory skew --
-        skew = int(round(inventory * MM_SKEW_PER_10 / 10.0))
-        bid = fair_value_cents - effective_hs - skew
-        ask = fair_value_cents + effective_hs - skew
-
-        # -- Price clamping --
-        bid = max(1, min(98, bid))
-        ask = max(bid + 1, min(99, ask))
+        bid, ask, effective_hs = self.compute_quote_prices(
+            fair_value_cents, half_spread, inventory,
+        )
 
         orders_posted = 0
         ts = int(time.time())
