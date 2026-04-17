@@ -3445,6 +3445,20 @@ def record_settlements(conn):
             (now_str, settlement_id, ticker, side,
              pc, contracts, revenue, profit, won, None, None, strat))
 
+        # Back-fill position_health_log so the bandit can train on which
+        # health-band decisions held winning vs losing positions. Stamp every
+        # prior health log for this ticker with the final settlement outcome.
+        if result in ("yes", "no"):
+            try:
+                conn.execute(
+                    "UPDATE position_health_log "
+                    "SET settlement_result=?, settlement_pnl_cents=? "
+                    "WHERE ticker=? AND settlement_result IS NULL",
+                    (result, profit, ticker),
+                )
+            except Exception as e:
+                print(f"[health] position_health_log backfill failed for {ticker}: {e}")
+
         # Mark matching alpha_backtest shadow rows settled (both sides). Uses
         # counterfactual P&L per row — this is the Phase 1 gate input.
         if result in ("yes", "no"):
