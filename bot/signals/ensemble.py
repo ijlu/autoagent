@@ -15,6 +15,32 @@ from typing import Optional
 
 from bot.config import SOURCE_WEIGHTS, CORRELATED_GROUPS, OPENAI_API_KEY, SOURCE_MAX_HORIZON_DAYS
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Family-aware source priority
+# ══════════════════════════════════════════════════════════════════════════════
+# For some market families, certain sources are *authoritative* (they answer the
+# literal question the market asks) while others are heuristics. The symmetric
+# disagreement gate below would otherwise skip long-dated KXFED markets because
+# FRED (heuristic) and FedWatch (market-implied) diverge.
+#
+# Strategy: apply a priority multiplier to the source weight and swap the
+# disagreement gate from raw max-spread to weighted stddev. This means:
+#   - FedWatch (3.0x) and ZQ (2.0x) dominate the ensemble for KXFED markets.
+#   - FRED's 0.58 vs FedWatch's 0.98 no longer skips the trade — FedWatch wins.
+# Non-listed families fall through to the legacy max-spread gate unchanged.
+FAMILY_SOURCE_PRIORITY: dict[str, dict[str, float]] = {
+    "KXFED": {"fedwatch": 3.0, "zq_futures": 2.0, "fred": 1.0, "bls": 0.5},
+}
+
+
+def _get_family_priority(ticker: str) -> dict[str, float]:
+    """Return priority multipliers for ticker's family, or empty dict."""
+    for prefix, priorities in FAMILY_SOURCE_PRIORITY.items():
+        if ticker.startswith(prefix):
+            return priorities
+    return {}
+
 # Import all data sources
 from bot.signals.sources.prediction_markets import get_polymarket_estimate, get_metaculus_estimate
 from bot.signals.sources.crypto import get_crypto_estimate
@@ -32,37 +58,55 @@ from bot.signals.sources.momentum import get_price_momentum
 from bot.signals.sources.llm import get_llm_estimate
 from bot.signals.sources.metar_observations import get_metar_observation_estimate
 from bot.signals.sources.fedwatch import get_fedwatch_estimate
+from bot.signals.family_routers import route_family
+
+from bot.daemon.locks import PIPELINE_STATS_LOCK
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Pipeline health tracking
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# _PIPELINE_STATS is mutated from every source-call callsite (all source
+# functions go through _tracked_call in get_independent_estimate), and under
+# the daemon those source calls may happen on a poller thread in parallel with
+# the cycle-runner thread calling record_pipeline_health(). Protect with
+# PIPELINE_STATS_LOCK — all reads and writes live inside the lock.
 
 _PIPELINE_STATS: dict[str, dict] = {}
 
 
 def pipeline_track_attempt(source: str) -> None:
-    if source not in _PIPELINE_STATS:
-        _PIPELINE_STATS[source] = {"attempted": 0, "returned": 0, "errors": 0, "latencies": []}
-    _PIPELINE_STATS[source]["attempted"] += 1
+    with PIPELINE_STATS_LOCK:
+        if source not in _PIPELINE_STATS:
+            _PIPELINE_STATS[source] = {"attempted": 0, "returned": 0, "errors": 0, "latencies": []}
+        _PIPELINE_STATS[source]["attempted"] += 1
 
 
 def pipeline_track_result(source: str, success: bool, latency_ms: float = 0) -> None:
-    if source not in _PIPELINE_STATS:
-        _PIPELINE_STATS[source] = {"attempted": 0, "returned": 0, "errors": 0, "latencies": []}
-    if success:
-        _PIPELINE_STATS[source]["returned"] += 1
-    else:
-        _PIPELINE_STATS[source]["errors"] += 1
-    if latency_ms > 0:
-        _PIPELINE_STATS[source]["latencies"].append(latency_ms)
+    with PIPELINE_STATS_LOCK:
+        if source not in _PIPELINE_STATS:
+            _PIPELINE_STATS[source] = {"attempted": 0, "returned": 0, "errors": 0, "latencies": []}
+        if success:
+            _PIPELINE_STATS[source]["returned"] += 1
+        else:
+            _PIPELINE_STATS[source]["errors"] += 1
+        if latency_ms > 0:
+            _PIPELINE_STATS[source]["latencies"].append(latency_ms)
 
 
 def record_pipeline_health(conn) -> None:
     """Record this run's pipeline health stats and detect degradations."""
     now_str = datetime.now(timezone.utc).isoformat()
 
-    for source, stats in _PIPELINE_STATS.items():
+    # Snapshot under lock so concurrent pollers don't mutate during iteration.
+    with PIPELINE_STATS_LOCK:
+        stats_snapshot = {
+            source: dict(stats, latencies=list(stats["latencies"]))
+            for source, stats in _PIPELINE_STATS.items()
+        }
+
+    for source, stats in stats_snapshot.items():
         attempted = stats["attempted"]
         returned = stats["returned"]
         errors = stats["errors"]
@@ -100,7 +144,8 @@ def record_pipeline_health(conn) -> None:
             (now_str, source, status, attempted, returned, avg_latency, error_rate, detail))
 
     conn.commit()
-    _PIPELINE_STATS.clear()
+    with PIPELINE_STATS_LOCK:
+        _PIPELINE_STATS.clear()
 
     health_summary = conn.execute("""
         SELECT source, status, markets_returned
@@ -156,6 +201,37 @@ def get_independent_estimate(
     estimates = []
     _disabled = disabled_sources or set()
 
+    # ── Family router short-circuit ──
+    # KXHIGH / KXHMONTHRANGE / KXHURR → weather_ensemble (9-source Bayesian combiner)
+    # KXJOB → ADP lead indicator; KXGDP → GDPNow; KXCPI → commodity-basket model.
+    # The router output is purpose-built for the family — generic sources either
+    # duplicate what the router already combined (weather) or don't answer the
+    # market's literal question (ADP beats FRED/BLS for NFP prediction). Return
+    # it as a dominant single-source estimate and skip the generic sweep.
+    if ticker and not _disabled.intersection({"weather_ensemble", "adp_nfp", "gdpnow", "commodity"}):
+        try:
+            routed = route_family(ticker, market_data)
+        except Exception as e:
+            print(f"[ensemble] family_router raised {type(e).__name__}: {e}")
+            routed = None
+        if routed is not None:
+            rprob, rsrc = routed
+            if rprob is not None:
+                # Source key: first token of the tag before ':' so 'weather_ensemble:...' → weather_ensemble
+                src_key = (rsrc.split(":")[0].strip().lower() if rsrc else "weather_ensemble")
+                pipeline_track_attempt(src_key)
+                pipeline_track_result(src_key, True, 0.0)
+                # Calibration correction still applies to router output
+                final_prob = float(rprob)
+                if calibration_corrections:
+                    corrected = apply_calibration_correction(final_prob, calibration_corrections)
+                    if abs(corrected - final_prob) > 0.001:
+                        print(f"[calibration] Router {final_prob:.3f} -> {corrected:.3f}")
+                    final_prob = corrected
+                final_prob = max(0.02, min(0.98, final_prob))
+                print(f"[ensemble] family-routed {src_key} -> {final_prob:.3f} ({rsrc})")
+                return final_prob, rsrc or src_key, 1
+
     # ── Compute days to resolution for source horizon filtering ──
     _days_to_resolution = None
     if market_data:
@@ -183,7 +259,11 @@ def get_independent_estimate(
             if result is not None and result[0] is not None:
                 pipeline_track_result(source_name, True, latency)
             elif latency < 100:
-                _PIPELINE_STATS[source_name]["attempted"] -= 1
+                # "Source returned None fast" — treat as "never attempted" so
+                # we don't flag healthy-but-inapplicable sources as degraded.
+                with PIPELINE_STATS_LOCK:
+                    if source_name in _PIPELINE_STATS:
+                        _PIPELINE_STATS[source_name]["attempted"] -= 1
             else:
                 pipeline_track_result(source_name, False, latency)
             return result
@@ -314,15 +394,46 @@ def get_independent_estimate(
             return None, "high_vol_efficient", 0
         return None, None, 0
 
+    # ── Family-aware source priority ──
+    # For KXFED and other families with an authoritative source, re-weight
+    # before the disagreement gate so (e.g.) FedWatch dominates FRED heuristics.
+    family_priorities = _get_family_priority(ticker)
+    if family_priorities:
+        reweighted = []
+        for prob, weight, src in estimates:
+            src_key = src.split(":")[0].strip().lower()
+            if src_key not in family_priorities:
+                src_key = src_key.split("_")[0]
+            multiplier = family_priorities.get(src_key, 1.0)
+            reweighted.append((prob, weight * multiplier, src))
+        estimates = reweighted
+
     # ── Disagreement detection ──
+    # Family-priority tickers use weighted stddev (small values allow large
+    # FRED/FedWatch spread because FedWatch weight swamps FRED). All other
+    # tickers keep the legacy symmetric max-spread gate.
     if len(estimates) >= 2:
-        probs_only = [p for p, _, _ in estimates]
-        max_spread = max(probs_only) - min(probs_only)
-        if max_spread >= 0.20:
-            sources_str = ", ".join(f"{s}={p:.2f}" for p, _, s in estimates)
-            print(f"[ensemble] SKIP: source disagreement {max_spread:.2f} > 0.20 "
-                  f"({sources_str})")
-            return None, f"disagreement:{max_spread:.2f}", 0
+        if family_priorities:
+            total_w = sum(w for _, w, _ in estimates)
+            if total_w > 0:
+                w_mean = sum(p * w for p, w, _ in estimates) / total_w
+                w_var = sum(w * (p - w_mean) ** 2 for p, w, _ in estimates) / total_w
+                w_std = w_var ** 0.5
+                # Threshold 0.15 stddev is roughly equivalent to 0.20 spread for
+                # two equally weighted sources but ignores weight-dominated disagreement.
+                if w_std >= 0.15:
+                    sources_str = ", ".join(f"{s}={p:.2f}(w={w:.2f})" for p, w, s in estimates)
+                    print(f"[ensemble] SKIP: weighted stddev {w_std:.2f} > 0.15 "
+                          f"({sources_str})")
+                    return None, f"disagreement:wstd={w_std:.2f}", 0
+        else:
+            probs_only = [p for p, _, _ in estimates]
+            max_spread = max(probs_only) - min(probs_only)
+            if max_spread >= 0.20:
+                sources_str = ", ".join(f"{s}={p:.2f}" for p, _, s in estimates)
+                print(f"[ensemble] SKIP: source disagreement {max_spread:.2f} > 0.20 "
+                      f"({sources_str})")
+                return None, f"disagreement:{max_spread:.2f}", 0
 
     # ── Weighted ensemble average ──
     total_weight = sum(w for _, w, _ in estimates)

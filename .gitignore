@@ -6,13 +6,25 @@ __pycache__/
 # Virtual environments
 .venv
 
-# Secrets
+# Secrets — NEVER commit
 .env
+.env.*
+!.env.example
 .credentials.json
+*.pem
+*.key
+
+# OS / editor / tooling
+.DS_Store
+.claude/
+.vscode/
+.idea/
 
 # Runtime artifacts
 results.tsv
 run.log
+*.log
+logs/
 jobs/
 tasks/
 tasks-archived/
@@ -20,4 +32,38 @@ tasks-archived-sheets/
 tasks-sheets-verified/
 tasks-sheets/
 
-dev/
+# Databases (production + backtest + test)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Backup / scratch files
+*.bak
+*.bak.*
+*.backup
+*.backup.*
+trade_v*_backup.py
+trade.py.bak*
+trade.py.backup*
+
+# Local analysis dumps (kept out of repo — one-off audit artifacts)
+AUDIT_CONTEXT.md
+AUDIT_EXPORT*.md
+AUDIT_REPORT*.md
+BACKTEST_RESULTS.md
+BUG_AUDIT_REPORT.md
+DIAGNOSTIC_REPORT.md
+FILLS_LEDGER_SCOPE.md
+HANDOFF.md
+HEALTH_REPORT.md
+PERFORMANCE_REPORT.md
+REVIEW_DOCUMENT.md
+REVIEW_V*.md
+TRADING_BOT_CONTEXT.md
+Kalshi_Bot_*.docx
+
+# Backtest outputs
+backtest_results.json
+
+dev/.env.free-data

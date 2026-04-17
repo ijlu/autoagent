@@ -125,10 +125,13 @@ def analyze_calibration(conn) -> dict:
     """).fetchall()
 
     # Method 2: Use opportunity_log joined with settlements
-    # CRITICAL: won=1 means "we profited", NOT "YES happened".
+    # CRITICAL #1: won=1 means "we profited", NOT "YES happened".
     # Must use settlement side to convert: side=yes,won=1→YES; side=no,won=1→NO
+    # CRITICAL #2: opportunity_log.ensemble_prob is stored as P(our chosen side),
+    # NOT P(YES). For side='no' rows it's actually (1 - P(YES)). Normalize here.
     opp_rows = conn.execute("""
-        SELECT o.ensemble_prob, s.won, o.ticker, o.strategy, o.sources_json, s.side
+        SELECT CASE WHEN o.side='no' THEN 1.0 - o.ensemble_prob ELSE o.ensemble_prob END AS yes_prob,
+               s.won, o.ticker, o.strategy, o.sources_json, s.side
         FROM opportunity_log o
         JOIN settlements s ON o.ticker = s.ticker
         WHERE o.ensemble_prob IS NOT NULL
@@ -137,12 +140,19 @@ def analyze_calibration(conn) -> dict:
     """).fetchall()
 
     # Method 3: Use mm_orders fair_value_cents vs settlements
-    # Use s.side (net settlement side), NOT m.side (individual order side)
+    # CRITICAL: fair_value_cents is stored per ORDER SIDE (YES orders store YES-prob,
+    # NO orders store NO-prob = 100 - YES-prob). Naively averaging across sides
+    # inverts probability on tickers where we quoted both sides. Normalize to
+    # YES-probability BEFORE averaging: yes_fv = fv; no_fv → (100 - fv).
     mm_rows = conn.execute("""
-        SELECT m.ticker, AVG(m.fair_value_cents), s.side, s.won
+        SELECT m.ticker,
+               AVG(CASE WHEN m.side='yes' THEN m.fair_value_cents
+                        ELSE 100 - m.fair_value_cents END) AS avg_yes_fv,
+               s.side, s.won
         FROM mm_orders m
         JOIN settlements s ON m.ticker = s.ticker
         WHERE m.fair_value_cents > 0 AND m.fill_qty > 0
+          AND m.side IN ('yes', 'no')
         GROUP BY m.ticker
     """).fetchall()
 

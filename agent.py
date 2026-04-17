@@ -25,8 +25,22 @@ from harbor.models.agent.context import AgentContext
 # EDITABLE HARNESS — prompt, tools, agent construction
 # ============================================================================
 
-SYSTEM_PROMPT = "You are an agent that executes tasks"
-MODEL = "gpt-5"
+SYSTEM_PROMPT = """You are an autonomous trading agent. Act immediately and decisively. NEVER ask for confirmation or clarification.
+
+Your job:
+1. Read /task/instruction.md to understand the task
+2. Use run_shell to write and execute Python scripts
+3. Call the Kalshi demo API, scan markets, and write results to /task/trades.json
+4. Complete the task fully before stopping
+
+Rules:
+- Use run_shell for ALL execution (writing files, running python, etc)
+- Start immediately with: run_shell("cat /task/instruction.md")
+- Then write a python script to /task/trade.py and execute it
+- Always write /task/trades.json before finishing
+- If something fails, debug and retry — never give up
+"""
+MODEL = "gpt-4o-mini"
 MAX_TURNS = 30
 
 

@@ -8,17 +8,30 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 from bot.config import DB_PATH
+from bot.daemon.locks import DB_WRITE_LOCK
 
 
-# Global persistent connection (set by init_db, used by oneshot architecture)
+# Global persistent connection (set by init_db, used by oneshot + daemon).
+# Under the daemon, this single connection is shared by all threads.
+# SQLite 3.11+ is thread-safe for a shared connection when built with
+# threadsafe=1 (the default on macOS/Ubuntu). We additionally serialize
+# WRITES through DB_WRITE_LOCK so no two threads hit "database is locked".
 _PERSIST_CONN: Optional[sqlite3.Connection] = None
+
+_T = TypeVar("_T")
 
 
 def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Initialize database: create tables, run migrations, return connection.
+
+    Daemon-ready: sets WAL journal mode (lock-free concurrent readers),
+    synchronous=NORMAL (durable enough for our purposes, ~3x faster than FULL),
+    and busy_timeout=5000ms so writers retry rather than raising immediately
+    on lock contention. These pragmas persist for the lifetime of the DB file,
+    but re-running is harmless.
 
     Args:
         db_path: Override path (for testing). Defaults to config.DB_PATH.
@@ -28,7 +41,25 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     """
     global _PERSIST_CONN
     path = db_path or DB_PATH
-    conn = sqlite3.connect(path)
+    # check_same_thread=False because the daemon shares one connection across
+    # poller threads and the cycle-runner thread. Safety is preserved by
+    # serializing writes via DB_WRITE_LOCK (see db_write() helper below).
+    conn = sqlite3.connect(path, check_same_thread=False)
+
+    # ── Daemon pragmas ─────────────────────────────────────────────────
+    # WAL: lock-free concurrent readers, single-writer semantics. Survives
+    # across connections (PRAGMA is persistent on-disk).
+    conn.execute("PRAGMA journal_mode=WAL")
+    # NORMAL is durable against app crashes, sacrifices durability only
+    # against OS-level crashes. Acceptable for trading bot (we replay
+    # last-known state from Kalshi API on restart anyway).
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # 5-second busy_timeout: if another writer holds the lock, retry for
+    # this long before raising. Prevents transient sqlite3.OperationalError.
+    conn.execute("PRAGMA busy_timeout=5000")
+    # Foreign keys off by default in SQLite; we don't use them but make it
+    # explicit so future schema changes don't silently enable them.
+    conn.execute("PRAGMA foreign_keys=OFF")
 
     # ── Core trading tables ──
     conn.execute("""CREATE TABLE IF NOT EXISTS trades (
@@ -170,6 +201,33 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         skip_reason TEXT,
         outcome TEXT)""")
 
+    # ── Weather ensemble (Phase 2) ──
+    # Per-source weights for the weather sub-ensemble. Nightly calibration
+    # job updates these from strategy_journal settlements; defaults come
+    # from bot/signals/weather_ensemble.DEFAULT_WEATHER_PRIORS.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_source_weights (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        series TEXT NOT NULL,
+        source TEXT NOT NULL,
+        weight REAL NOT NULL,
+        updated_at TEXT,
+        n_samples INTEGER DEFAULT 0,
+        UNIQUE(series, source))""")
+
+    # Per-source component estimates logged per cycle for post-hoc
+    # calibration. Joined against settlements to compute per-source Brier
+    # and update weather_source_weights.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_forecast_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recorded_at TEXT NOT NULL,
+        series TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        source TEXT NOT NULL,
+        forecast_prob REAL,
+        forecast_high_f REAL,
+        sigma_f REAL,
+        hours_out INTEGER)""")
+
     # ── Decision log (full audit trail per decision) ──
     conn.execute("""CREATE TABLE IF NOT EXISTS decision_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,11 +315,48 @@ def get_connection() -> sqlite3.Connection:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Thread-safe write helper (daemon-era)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def db_write(fn: Callable[[sqlite3.Connection], _T], conn: Optional[sqlite3.Connection] = None) -> _T:
+    """Run a write transaction under DB_WRITE_LOCK.
+
+    Args:
+        fn: callable taking a connection and returning some result. The callable
+            is responsible for executing the write; this helper takes the lock,
+            invokes fn, then commits atomically. On exception the transaction
+            rolls back automatically (since COMMIT isn't reached).
+        conn: optional connection; defaults to the persistent _PERSIST_CONN.
+
+    WAL gives us lock-free READERS, so reads do NOT need to use this helper —
+    call conn.execute(SELECT …).fetchall() directly. Reserve db_write() for
+    INSERT/UPDATE/DELETE/DDL.
+
+    Example:
+        db_write(lambda c: c.execute("UPDATE x SET y=1 WHERE z=?", (z,)))
+    """
+    c = conn or _PERSIST_CONN
+    if c is None:
+        raise RuntimeError("Database not initialized — call init_db() first")
+    with DB_WRITE_LOCK:
+        try:
+            result = fn(c)
+            c.commit()
+            return result
+        except Exception:
+            c.rollback()
+            raise
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Key-value cache (persistent across oneshot runs)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def kv_get(conn: sqlite3.Connection, key: str) -> Any:
-    """Read from persistent kv_cache. Returns parsed JSON value or None if expired/missing."""
+    """Read from persistent kv_cache. Returns parsed JSON value or None if expired/missing.
+
+    Lock-free under WAL — readers don't need DB_WRITE_LOCK.
+    """
     try:
         row = conn.execute(
             "SELECT value, expires_at FROM kv_cache WHERE key=?", (key,)
@@ -274,21 +369,23 @@ def kv_get(conn: sqlite3.Connection, key: str) -> Any:
 
 
 def kv_set(conn: sqlite3.Connection, key: str, value: Any, ttl_seconds: int) -> None:
-    """Write to persistent kv_cache with TTL."""
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO kv_cache (key, value, expires_at) VALUES (?, ?, ?)",
-            (key, json.dumps(value), time.time() + ttl_seconds),
-        )
-        conn.commit()
-    except Exception as e:
-        print(f"[kv_cache] set({key!r}) failed: {e}")
+    """Write to persistent kv_cache with TTL. Takes DB_WRITE_LOCK."""
+    with DB_WRITE_LOCK:
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_cache (key, value, expires_at) VALUES (?, ?, ?)",
+                (key, json.dumps(value), time.time() + ttl_seconds),
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"[kv_cache] set({key!r}) failed: {e}")
 
 
 def kv_cleanup(conn: sqlite3.Connection) -> None:
-    """Remove expired entries from kv_cache."""
-    try:
-        conn.execute("DELETE FROM kv_cache WHERE expires_at < ?", (time.time(),))
-        conn.commit()
-    except Exception as e:
-        print(f"[kv_cache] cleanup failed: {e}")
+    """Remove expired entries from kv_cache. Takes DB_WRITE_LOCK."""
+    with DB_WRITE_LOCK:
+        try:
+            conn.execute("DELETE FROM kv_cache WHERE expires_at < ?", (time.time(),))
+            conn.commit()
+        except Exception as e:
+            print(f"[kv_cache] cleanup failed: {e}")

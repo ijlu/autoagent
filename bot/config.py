@@ -81,11 +81,20 @@ SOURCE_MAX_HORIZON_DAYS = {
     "tomorrow": 7,
     "noaa": 5,
     "metar": 1,           # real-time observations only
+    "nws_point": 7,       # NWS hourly forecast horizon
+    "nbm": 7,             # NBM blended forecast
+    "hrrr": 2,            # HRRR high-res 18-48h only
+    "madis": 1,           # mesonet observations today only
+    "afd": 2,             # Area Forecast Discussion ~48h
+    "weather_ensemble": 7,  # combined weather router
     "zq_futures": 365,    # futures curve extends ~1 year
     "fedwatch": 365,      # same underlying as ZQ
     "fred": 90,
     "bls": 90,
     "clevfed": 90,
+    "adp_nfp": 30,        # monthly NFP release cadence
+    "gdpnow": 90,         # quarterly GDP, nowcast spans ~3mo
+    "commodity": 60,      # CPI monthly release cadence
     "crypto": 30,
     "sports": 14,
     "odds": 14,
@@ -124,14 +133,33 @@ SOURCE_WEIGHTS = {
     "crypto": 0.65, "company_kpi": 0.65, "sensortower": 0.55,
     "bls": 0.50, "fred": 0.50, "finnhub": 0.30, "llm": 0.15,
     "momentum": 0.15,
+    # Phase 2 weather expansion
+    "nws_point": 0.78,         # NWS authoritative hourly
+    "nbm": 0.80,               # NOAA blended model
+    "hrrr": 0.85,              # high-res short-range (tightest sigma)
+    "madis": 0.60,             # mesonet/citizen stations, noisier
+    "afd": 0.50,               # forecaster discussion text
+    "weather_ensemble": 0.95,  # combined router output; dominates when present
+    # Phase 3 economics expansion
+    "adp_nfp": 0.80,           # ADP 2-day lead on BLS NFP
+    "gdpnow": 0.78,            # Atlanta Fed GDPNow nowcast
+    "commodity": 0.55,         # commodity futures → CPI transmission
 }
 
 # Correlated source groups (count as ~1 effective source, not N)
 CORRELATED_GROUPS = {
-    "weather": {"weather", "tomorrow", "metar"},
-    "cpi": {"fred", "bls"},
+    # All weather sources — when weather_ensemble fires it collapses the 9-source
+    # group into a single effective source. Keeps the edge-threshold scaling honest.
+    "weather": {
+        "weather", "tomorrow", "metar", "noaa",
+        "nws_point", "nbm", "hrrr", "madis", "afd",
+        "weather_ensemble",
+    },
+    "cpi": {"fred", "bls", "commodity"},
     "prediction_market": {"polymarket", "metaculus"},
     "fed": {"fred", "clevfed", "fedwatch", "zq_futures"},
+    "nfp": {"adp_nfp", "fred", "bls"},
+    "gdp": {"gdpnow", "fred"},
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

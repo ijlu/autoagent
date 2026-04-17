@@ -9,19 +9,13 @@ Directional loss categories (from trades table):
   - adverse_selection: price moved against us right after entry (informed traders on other side)
   - timing: direction was right but market hadn't converged yet (early entry)
   - fee_erosion: would have been profitable pre-fees but fees ate the edge
-
-MM loss categories (from mm_inventory / mm_orders):
-  - mm_adverse_selection: fills consistently on wrong side of fair value
-  - mm_inventory_decay: position aged out without paired exit
-  - mm_fee_erosion: spread capture eaten by fees
-  - mm_directional_loss: net inventory held to settlement on wrong side
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from bot.market_maker.selection import categorize_market
+from bot.core.categorization import categorize_market
 
 # Fee calculations — use exact Kalshi formulas
 from bot.core.money import fee_per_contract_cents as _fee_per_contract_cents
@@ -111,117 +105,6 @@ def run_loss_postmortems(conn):
         """).fetchall()
         print(f"[postmortem] Classified {classified} new losses. All-time breakdown:")
         for lt, count in summary:
-            print(f"  {lt}: {count}")
-
-    return classified
-
-
-def run_mm_postmortems(conn):
-    """Analyze MM-specific losses from mm_inventory realized P&L.
-
-    Unlike directional postmortems (which join settlements -> trades),
-    MM postmortems analyze mm_inventory tickers with negative realized P&L
-    using data from mm_orders and mm_processed_fills.
-
-    Classifies into:
-      - mm_adverse_selection: avg fill price was consistently on the wrong side
-        of fair value (taker-heavy fills)
-      - mm_inventory_decay: position aged out (high inventory age, low turnover)
-      - mm_fee_erosion: realized P&L would be positive without fees
-      - mm_directional_loss: net directional bet that went wrong
-    """
-    now_str = datetime.now(timezone.utc).isoformat()
-
-    # Find MM tickers with negative realized P&L not yet analyzed
-    losses = conn.execute("""
-        SELECT i.ticker, i.realized_pnl_cents, i.net_position,
-               i.avg_entry_cents, i.total_bought, i.total_sold
-        FROM mm_inventory i
-        WHERE i.realized_pnl_cents < -10
-          AND i.ticker NOT IN (
-              SELECT DISTINCT ticker FROM loss_postmortems
-              WHERE source_combo LIKE 'mm:%'
-          )
-    """).fetchall()
-
-    if not losses:
-        return 0
-
-    classified = 0
-    for (ticker, realized_pnl, net_pos, avg_entry, total_bought, total_sold) in losses:
-        loss_type = "mm_directional_loss"
-        detail = ""
-
-        # Get fill count and fee data for this ticker
-        fill_data = conn.execute("""
-            SELECT COUNT(*), COALESCE(SUM(fee_cents), 0)
-            FROM mm_processed_fills WHERE ticker = ?
-        """, (ticker,)).fetchone()
-        fill_count = fill_data[0] if fill_data else 0
-        total_fees = fill_data[1] if fill_data else 0
-
-        # Get fair value data from mm_orders
-        fv_data = conn.execute("""
-            SELECT AVG(fair_value_cents), COUNT(*)
-            FROM mm_orders WHERE ticker = ? AND fill_qty > 0
-        """, (ticker,)).fetchone()
-        avg_fair_value = fv_data[0] if fv_data and fv_data[0] else None
-        filled_orders = fv_data[1] if fv_data else 0
-
-        # Classify based on available data
-        turnover = total_bought + total_sold
-        if total_fees > 0 and realized_pnl + total_fees > 0:
-            # Would be profitable without fees
-            loss_type = "mm_fee_erosion"
-            detail = (f"Realized P&L={realized_pnl/100:.2f}$ but paid "
-                     f"{total_fees/100:.2f}$ in fees. "
-                     f"Pre-fee P&L would be +{(realized_pnl + total_fees)/100:.2f}$")
-        elif turnover > 0 and abs(net_pos) > turnover * 0.5:
-            # Most fills are still held (not turned over) — inventory decay
-            loss_type = "mm_inventory_decay"
-            detail = (f"Net position {net_pos} vs turnover {turnover}. "
-                     f"Inventory not actively managed — position aged out.")
-        elif avg_fair_value is not None and avg_entry > 0:
-            # Check if fills systematically got picked off
-            # For long YES: if avg_entry >> fair_value, adverse selection
-            # For short YES: if avg_entry << fair_value, adverse selection
-            fv_gap = abs(avg_entry - avg_fair_value)
-            if fv_gap > 5:  # >5¢ gap between entry and fair value
-                loss_type = "mm_adverse_selection"
-                detail = (f"Avg entry {avg_entry:.0f}¢ vs avg fair value "
-                         f"{avg_fair_value:.0f}¢ (gap={fv_gap:.0f}¢). "
-                         f"Fills were systematically on wrong side of fair value.")
-            else:
-                loss_type = "mm_directional_loss"
-                detail = (f"Net position {net_pos}, avg entry {avg_entry:.0f}¢, "
-                         f"fair value {avg_fair_value:.0f}¢. "
-                         f"Directional exposure on losing side.")
-        else:
-            detail = (f"Realized P&L={realized_pnl/100:.2f}$, "
-                     f"net={net_pos}, fills={fill_count}. "
-                     f"Insufficient data for detailed classification.")
-
-        cat = categorize_market(ticker, "")
-        conn.execute("""INSERT INTO loss_postmortems
-            (recorded_at, order_id, ticker, category, loss_type, source_combo,
-             estimated_prob, market_prob, edge_at_entry, price_at_settlement, detail)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_str, None, ticker, cat, loss_type, f"mm:{ticker}",
-             avg_fair_value / 100 if avg_fair_value else None,
-             avg_entry / 100 if avg_entry else None,
-             None, None, detail))
-        classified += 1
-
-    conn.commit()
-
-    if classified > 0:
-        mm_summary = conn.execute("""
-            SELECT loss_type, COUNT(*) FROM loss_postmortems
-            WHERE source_combo LIKE 'mm:%'
-            GROUP BY loss_type ORDER BY COUNT(*) DESC
-        """).fetchall()
-        print(f"[mm-postmortem] Classified {classified} new MM losses:")
-        for lt, count in mm_summary:
             print(f"  {lt}: {count}")
 
     return classified

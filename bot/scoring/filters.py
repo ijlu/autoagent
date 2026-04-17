@@ -1,70 +1,25 @@
-"""Market categorization and avoidance filters.
+"""Market avoidance filters (learned from settlement history).
 
-Extracted from trade.py:
-  - CATEGORY_KEYWORDS dict (~line 5255)
-  - _COMPANY_PREFIXES list (~line 5289)
-  - categorize_market() (~lines 5281-5301)
-  - compute_avoid_filters() (~lines 3237-3307)
+The `categorize_market` / `CATEGORY_KEYWORDS` / `_COMPANY_PREFIXES` exports
+used to live here and also in `bot.core.categorization`. After the MM deletion
+pivot (2026-04-16) the canonical home is `bot.core.categorization`; this module
+now re-exports them so existing callers keep working without touching their
+imports.
+
+Still owned here:
+  - compute_avoid_filters() — settlement-history-driven avoidance filters
 """
 
 from __future__ import annotations
 
 from bot.config import MIN_SAMPLE_SIZE, MIN_WIN_RATE
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Market category classification
-# ══════════════════════════════════════════════════════════════════════════════
-
-CATEGORY_KEYWORDS = {
-    "economics": ["cpi", "inflation", "unemployment", "gdp", "nonfarm", "payroll",
-                  "fed funds", "fomc", "interest rate", "jobs report",
-                  "federal funds", "fed rate", "kxfed", "kxcpi", "kxgdp", "kxjob", "kxunrate"],
-    "crypto":    ["btc", "bitcoin", "eth", "ether", "sol", "solana", "crypto", "coin"],
-    "weather":   ["temperature", "temp", "weather", "degrees", "\u00b0f", "\u00b0c", "heat", "cold", "freeze",
-                  "kxhigh", "kxhmonth", "kxhurr", "highest temperature", "nws"],
-    "sports":    ["nba", "nfl", "mlb", "nhl", "ncaa", "mls", "epl", "nascar", "championship",
-                  "playoff", "stanley cup", "finals", "world series"],
-    "company":   ["deliveries", "production", "subscribers", "revenue", "earnings",
-                  "daily active", "monthly active", "dau", "mau", "users",
-                  "headcount", "total orders", "total rides", "total payers",
-                  "total customers", "shipments", "bookings", "trips",
-                  "gold sub", "semi truck", "ipo",
-                  "tesla", "kxteslasemi", "boeing", "kxboeing",
-                  "netflix", "kxearningsmentionnflx",
-                  "meta", "kxmetaheadcount",
-                  "spotify", "kxspotifymau", "uber", "kxubertrips",
-                  "robinhood", "kxhood", "doordash", "kxdashorders",
-                  "lyft", "kxlyft", "match group", "kxmtch",
-                  "palantir", "kxpltr", "ferrari", "kxrace",
-                  "philip morris", "zyn", "kxpm",
-                  "airbnb", "kxabnb", "kxstripeipo", "kxismpmi",
-                  "apple", "google", "alphabet", "amazon", "microsoft", "nvidia"],
-}
-
-_COMPANY_PREFIXES = [
-    "kxboeing", "kxspotifymau", "kxubertrips", "kxmetaheadcount",
-    "kxhood", "kxdashorders", "kxlyft", "kxmtch", "kxpltr",
-    "kxrace", "kxpm", "kxabnb", "kxteslasemi", "kxismpmi",
-    "kxearningsmention", "kxearningmention", "kxstripeipo",
-]
-
-
-def categorize_market(ticker: str, title: str) -> str:
-    """Assign a market to a risk category based on ticker and title.
-    Company tickers get priority -- e.g. KXEARNINGSMENTIONNFLX-26APR16-MLB
-    should be 'company' not 'sports' despite containing 'mlb'."""
-    text = (ticker + " " + title).lower()
-    ticker_lower = ticker.lower()
-
-    # Priority check: company ticker prefixes always win
-    if any(ticker_lower.startswith(p) for p in _COMPANY_PREFIXES):
-        return "company"
-
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(kw in text for kw in keywords):
-            return category
-    return "other"
+# Re-exports (canonical home: bot.core.categorization)
+from bot.core.categorization import (  # noqa: F401
+    CATEGORY_KEYWORDS,
+    _COMPANY_PREFIXES,
+    categorize_market,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

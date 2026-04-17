@@ -1,0 +1,67 @@
+# Kalshi Unified Trading Daemon (Phase 1)
+#
+# Persistent process. Replaces:
+#   - kalshi-bot.service + kalshi-bot.timer (the 2-minute oneshot)
+#   - kalshi-weather-daemon.service (weather MM daemon)
+# Both of those should be STOPPED and DISABLED before this starts.
+#
+# Architecture:
+#   - Main thread: Scheduler running cycle (60s), kv_cleanup (1h), health_log (5m)
+#   - Poller threads: METARPoller (30s). Phase 2 adds NWS/NBM/HRRR/MADIS/AFD.
+#   - Shared SQLite connection in WAL mode; writes serialized by DB_WRITE_LOCK.
+#
+# Install:
+#   cp deploy/kalshi-daemon.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl disable --now kalshi-bot.timer
+#   systemctl disable --now kalshi-weather-daemon  # if present
+#   systemctl enable --now kalshi-daemon
+#
+# Logs: tail -f /home/kalshi/autoagent/daemon.log
+
+[Unit]
+Description=Kalshi Unified Trading Daemon
+After=network-online.target
+Wants=network-online.target
+
+# Belt-and-suspenders — fail to start if the old units are still active.
+# They should be disabled before enabling this unit.
+Conflicts=kalshi-bot.service kalshi-bot.timer kalshi-weather-daemon.service
+
+[Service]
+Type=simple
+User=kalshi
+Group=kalshi
+WorkingDirectory=/home/kalshi/autoagent
+ExecStart=/usr/bin/python3 -m bot.daemon.main
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Give the scheduler time to run its on_stop hooks on SIGTERM.
+TimeoutStopSec=30
+
+# Environment
+EnvironmentFile=/home/kalshi/autoagent/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=KALSHI_LOG_LEVEL=INFO
+
+# Logging to file (append, matches the oneshot pattern so dashboards
+# don't have to learn two file names).
+StandardOutput=append:/home/kalshi/autoagent/daemon.log
+StandardError=append:/home/kalshi/autoagent/daemon.log
+
+# Resource limits. 30 days × many threads needs more than the oneshot's
+# nothing-in-particular limit, but well under VPS capacity.
+MemoryMax=512M
+CPUQuota=50%
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/kalshi/autoagent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

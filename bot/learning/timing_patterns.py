@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from bot.learning.adaptive_weights import _parse_sources_from_strategy
-from bot.market_maker.selection import categorize_market
+from bot.core.categorization import categorize_market
 
 
 def record_timing_data(conn):
