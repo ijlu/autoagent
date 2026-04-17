@@ -1,0 +1,631 @@
+"""Weather data sources for prediction market estimation.
+
+Contains three weather sources:
+  1. get_weather_estimate()       — Open-Meteo (free, no auth)
+  2. get_tomorrow_weather_estimate() — Tomorrow.io (premium, 500 calls/day)
+  3. get_noaa_alerts_for_market() — NOAA severe weather alerts (free, no auth)
+"""
+
+from __future__ import annotations
+
+import math
+import re
+import time
+from datetime import datetime, timedelta, timezone
+
+from bot.api import cached_get
+from bot.config import TOMORROW_API_KEY
+from bot.db import get_connection, kv_get, kv_set
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Constants
+# ══════════════════════════════════════════════════════════════════════════════
+
+WEATHER_CITIES = {
+    "nyc":          {"lat": 40.71, "lon": -74.01, "tz": "America/New_York"},
+    "new york":     {"lat": 40.71, "lon": -74.01, "tz": "America/New_York"},
+    "chicago":      {"lat": 41.88, "lon": -87.63, "tz": "America/Chicago"},
+    "miami":        {"lat": 25.76, "lon": -80.19, "tz": "America/New_York"},
+    "austin":       {"lat": 30.27, "lon": -97.74, "tz": "America/Chicago"},
+    "los angeles":  {"lat": 34.05, "lon": -118.24, "tz": "America/Los_Angeles"},
+    "la":           {"lat": 34.05, "lon": -118.24, "tz": "America/Los_Angeles"},
+    "phoenix":      {"lat": 33.45, "lon": -112.07, "tz": "America/Phoenix"},
+    "houston":      {"lat": 29.76, "lon": -95.37, "tz": "America/Chicago"},
+    "dallas":       {"lat": 32.78, "lon": -96.80, "tz": "America/Chicago"},
+    "denver":       {"lat": 39.74, "lon": -104.99, "tz": "America/Denver"},
+    "atlanta":      {"lat": 33.75, "lon": -84.39, "tz": "America/New_York"},
+    "seattle":      {"lat": 47.61, "lon": -122.33, "tz": "America/Los_Angeles"},
+    "boston":        {"lat": 42.36, "lon": -71.06, "tz": "America/New_York"},
+    "san francisco":{"lat": 37.77, "lon": -122.42, "tz": "America/Los_Angeles"},
+    "sf":           {"lat": 37.77, "lon": -122.42, "tz": "America/Los_Angeles"},
+    "dc":           {"lat": 38.91, "lon": -77.04, "tz": "America/New_York"},
+    "washington":   {"lat": 38.91, "lon": -77.04, "tz": "America/New_York"},
+    "minneapolis":  {"lat": 44.98, "lon": -93.27, "tz": "America/Chicago"},
+    "detroit":      {"lat": 42.33, "lon": -83.05, "tz": "America/New_York"},
+    "las vegas":    {"lat": 36.17, "lon": -115.14, "tz": "America/Los_Angeles"},
+}
+
+# Ticker prefix -> city key mapping for Kalshi weather tickers
+_TICKER_CITY_MAP = {
+    "KXHIGHNY": "nyc", "KXHIGHLAX": "los angeles", "KXHIGHCHI": "chicago",
+    "KXHIGHMIA": "miami", "KXHIGHAUS": "austin", "KXHIGHHOU": "houston",
+    "KXHIGHPHX": "phoenix", "KXHIGHDEN": "denver", "KXHIGHSF": "san francisco",
+}
+
+# Tomorrow.io in-memory cache: {city_key: (data, timestamp)}
+_TOMORROW_CACHE: dict = {}
+_TOMORROW_TTL = 1800  # 30 minutes -- 9 cities x 48 fetches/day = 432 calls (under 500)
+
+# LST offsets for settlement-day computation (Kalshi weather markets settle
+# in Local Standard Time year-round, matching metar_observations.py).
+_CITY_LST_OFFSET: dict[str, int] = {
+    "nyc": -5, "new york": -5, "chicago": -6, "miami": -5,
+    "austin": -6, "los angeles": -8, "la": -8, "phoenix": -7,
+    "houston": -6, "dallas": -6, "denver": -7, "atlanta": -5,
+    "seattle": -8, "boston": -5, "san francisco": -8, "sf": -8,
+    "dc": -5, "washington": -5, "minneapolis": -6, "detroit": -5,
+    "las vegas": -8,
+}
+
+_WEATHER_KEYWORDS = [
+    "temperature", "temp", "\u00b0f", "\u00b0c", "degrees", "high", "low",
+    "weather", "heat", "cold", "freeze", "highest temperature",
+]
+
+# Reverse mapping: city key → METAR station ID.
+# Used to persist forecast highs into kv_cache so metar_observations.py
+# can compare observations against forecasts (Defense 4: weather conditional quoting).
+_CITY_STATION_MAP = {
+    "nyc": "KNYC", "new york": "KNYC",
+    "chicago": "KMDW",
+    "los angeles": "KLAX", "la": "KLAX",
+    "austin": "KAUS",
+    "miami": "KMIA",
+    "denver": "KDEN",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _logistic_cdf(x, mu, sigma):
+    """Standard logistic CDF used for temperature probability estimation."""
+    return 1 / (1 + math.exp(-(x - mu) / sigma))
+
+
+def _detect_city(ticker_upper: str, title: str):
+    """Return city_key by checking ticker prefix first, then title keywords."""
+    for prefix, city in _TICKER_CITY_MAP.items():
+        if prefix in ticker_upper:
+            return city
+    for key in WEATHER_CITIES:
+        if key in title:
+            return key
+    return None
+
+
+def _parse_threshold(ticker: str, title: str):
+    """Extract temperature threshold and direction from title/ticker.
+
+    Returns (threshold, is_above) or (None, None) on failure.
+    """
+    temp_match = re.search(
+        r'(at or above|at or below|above|below|over|under|at least|exceed)\s+(\d+\.?\d*)', title
+    )
+    if not temp_match:
+        tick_match = re.search(r'-[TB](-?\d+\.?\d*)', ticker)
+        if tick_match:
+            threshold = float(tick_match.group(1))
+            is_above = True  # KXHIGH markets are "will high be above X" by default
+            return threshold, is_above
+        # Range markets: title like "78-79\u00b0F" or "between 78 and 80"
+        range_match = re.search(r'(\d+\.?\d*)\s*[-\u2013]\s*(\d+\.?\d*)\s*\u00b0?[fF]?', title)
+        if range_match:
+            low_bound = float(range_match.group(1))
+            high_bound = float(range_match.group(2))
+            threshold = (low_bound + high_bound) / 2  # midpoint of range
+            is_above = True  # will check P(temp in range) below
+            return threshold, is_above
+        return None, None
+    else:
+        direction = temp_match.group(1)
+        threshold = float(temp_match.group(2))
+        is_above = direction in ("above", "over", "at least", "exceed", "at or above")
+        return threshold, is_above
+
+
+def _determine_day_index(title: str, market_data: dict | None = None,
+                         city_key: str | None = None) -> int | None:
+    """Determine which forecast day to use based on market expiry and title.
+
+    Uses LOCAL STANDARD TIME for date boundaries (matches Kalshi settlement
+    rules).  Tries market_data expiry first, then falls back to title heuristics.
+
+    Returns integer day index (0 = today, 1 = tomorrow, ...) or None if the
+    settlement date is beyond the 7-day forecast horizon.
+    """
+    # Compute "today" in the city's local standard time
+    offset = _CITY_LST_OFFSET.get(city_key or "", -5)
+    lst_tz = timezone(timedelta(hours=offset))
+    today_local = datetime.now(lst_tz).date()
+
+    # 1. Try market_data expiry date (most reliable)
+    if market_data:
+        for field in ("close_time", "expiration_time", "expected_expiration_time"):
+            val = market_data.get(field)
+            if val and isinstance(val, str):
+                try:
+                    expiry_dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                    expiry_local = expiry_dt.astimezone(lst_tz).date()
+                    delta = (expiry_local - today_local).days
+                    if 0 <= delta < 7:
+                        return delta
+                    print(f"[weather] Settlement {expiry_local} is {delta}d from "
+                          f"today ({today_local}) — outside 7-day forecast")
+                    return None
+                except (ValueError, TypeError):
+                    continue
+
+    # 2. Fall back to title-based heuristics
+    title_lower = title if title == title.lower() else title.lower()
+
+    if "day after tomorrow" in title_lower:
+        return 2
+    if "tomorrow" in title_lower:
+        return 1
+
+    # Day name matching
+    day_names = ["monday", "tuesday", "wednesday", "thursday",
+                 "friday", "saturday", "sunday"]
+    for i, day_name in enumerate(day_names):
+        if day_name in title_lower:
+            current_dow = today_local.weekday()  # 0=Monday
+            delta = (i - current_dow) % 7
+            # delta==0 means title mentions today's day name → use today
+            return delta
+
+    # Specific date patterns: "April 8", "apr 14"
+    date_match = re.search(
+        r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2})',
+        title_lower,
+    )
+    if date_match:
+        try:
+            month_abbr = date_match.group(1)[:3]
+            day_num = int(date_match.group(2))
+            month_map = {
+                "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+            }
+            target_month = month_map.get(month_abbr)
+            if target_month:
+                for yr in (today_local.year, today_local.year + 1):
+                    try:
+                        target = datetime(yr, target_month, day_num).date()
+                        delta = (target - today_local).days
+                        if 0 <= delta < 7:
+                            return delta
+                        if delta >= 0:
+                            print(f"[weather] Title date "
+                                  f"'{date_match.group(0)}' is {delta}d "
+                                  f"out — beyond 7-day forecast")
+                            return None
+                    except ValueError:
+                        continue
+        except Exception:
+            pass
+
+    return 0  # default: today (no date info in title)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. Open-Meteo (free, no auth)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_weather_forecast(city_key):
+    """Fetch 7-day forecast from Open-Meteo for the given city key."""
+    city = WEATHER_CITIES.get(city_key)
+    if not city:
+        return None
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={city['lat']}&longitude={city['lon']}"
+        f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        f"&temperature_unit=fahrenheit&timezone={city['tz']}&forecast_days=7"
+    )
+    return cached_get(f"weather_{city_key}", url, timeout=5)
+
+
+def get_weather_estimate(ticker, market_data):
+    """Open-Meteo weather source: estimate probability for weather markets.
+
+    Returns (probability, source_description) or (None, None).
+    """
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = ticker.upper() if ticker else ""
+
+    # Detect weather market -- require weather-related keywords + city name
+    is_weather = any(kw in title for kw in _WEATHER_KEYWORDS) or "KXHIGH" in ticker_upper
+    if not is_weather:
+        return None, None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None, None
+
+    # Extract temperature threshold from title
+    threshold, is_above = _parse_threshold(ticker, title)
+    if threshold is None:
+        return None, None
+
+    # Sanity check: reject obviously non-temperature values
+    if threshold < -40 or threshold > 140:
+        return None, None
+
+    # Determine which forecast day BEFORE fetching (avoids wasted API calls
+    # for markets beyond the 7-day horizon)
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None:
+        return None, None
+
+    forecast = get_weather_forecast(city_key)
+    if not forecast:
+        return None, None
+
+    daily = forecast.get("daily", {})
+    temps_max = daily.get("temperature_2m_max", [])
+    temps_min = daily.get("temperature_2m_min", [])
+    dates = daily.get("time", [])
+
+    if day_idx >= len(temps_max):
+        return None, None
+
+    forecast_high = temps_max[day_idx]
+    forecast_low = temps_min[day_idx]
+
+    # Defense 4: Persist today's forecast high to kv_cache for METAR comparison.
+    # metar_observations.py reads this via _get_forecast_high() to blend forecast
+    # with live observations. Also used by quotes.py weather conditional quoting.
+    if day_idx == 0:
+        _station = _CITY_STATION_MAP.get(city_key)
+        if _station:
+            try:
+                _conn = get_connection()
+                _offset = _CITY_LST_OFFSET.get(city_key, -5)
+                _lst_date = datetime.now(timezone(timedelta(hours=_offset))).strftime("%Y-%m-%d")
+                kv_set(_conn, f"metar_forecast_high_{_station}_{_lst_date}", forecast_high, 86400)
+            except Exception:
+                pass  # DB may not be initialized in test contexts
+
+    # Forecast error model: accuracy degrades with forecast horizon
+    # Day 0 (today): ~2F error, Day 1: ~3F, Day 3: ~4.5F, Day 7: ~6F
+    forecast_sigma = 2.0 + day_idx * 0.6  # linear increase in uncertainty
+
+    # Check if this is a bracket market (-B suffix) -- needs CDF(upper) - CDF(lower)
+    is_bracket = "-B" in ticker_upper if ticker_upper else False
+    if is_bracket:
+        # Extract bracket bounds. Priority:
+        # 1. API floor_strike / cap_strike (most reliable)
+        # 2. Title regex ("83 to 85", "83°F and 85°F", "83-85")
+        # 3. Default: ticker -B value as floor, +2°F as cap (Kalshi standard)
+        bracket_floor = threshold  # -B suffix value is typically the floor
+        bracket_cap = threshold + 2.0  # Kalshi weather brackets are 2°F wide
+
+        # Best: use API-provided strikes
+        _api_floor = market_data.get("floor_strike") if market_data else None
+        _api_cap = market_data.get("cap_strike") if market_data else None
+        if _api_floor is not None and _api_cap is not None:
+            try:
+                bracket_floor = float(_api_floor)
+                bracket_cap = float(_api_cap)
+            except (ValueError, TypeError):
+                pass
+        else:
+            # Fallback: parse from title — "83 to 85", "83-85", "83°F and 85°F"
+            range_match_b = re.search(
+                r'(\d+\.?\d*)\s*\u00b0?[fF]?\s*(?:to|and|[-\u2013])\s*(\d+\.?\d*)', title)
+            if range_match_b:
+                bracket_floor = float(range_match_b.group(1))
+                bracket_cap = float(range_match_b.group(2))
+
+        # CDF(cap) - CDF(floor): probability temp falls within bracket
+        cdf_upper = _logistic_cdf(bracket_cap, forecast_high, forecast_sigma)
+        cdf_lower = _logistic_cdf(bracket_floor, forecast_high, forecast_sigma)
+        prob_yes = cdf_upper - cdf_lower
+        prob_yes = max(0.02, min(0.98, prob_yes))
+        print(f"[info] Weather: {city_key} day={day_idx} forecast_high={forecast_high:.0f}\u00b0F "
+              f"bracket=[{bracket_floor:.1f},{bracket_cap:.1f}]\u00b0F "
+              f"sigma={forecast_sigma:.1f}\u00b0F \u2192 {prob_yes:.2f}")
+    elif is_above:
+        # "Will temp be above X?" -- compare forecast high to threshold
+        diff = forecast_high - threshold
+        prob_yes = 1 / (1 + math.exp(-diff / forecast_sigma))
+        prob_yes = max(0.02, min(0.98, prob_yes))
+        print(f"[info] Weather: {city_key} day={day_idx} forecast_high={forecast_high:.0f}\u00b0F "
+              f"threshold={threshold:.0f}\u00b0F (above) "
+              f"sigma={forecast_sigma:.1f}\u00b0F \u2192 {prob_yes:.2f}")
+    else:
+        # "Will high temp be below X?" -- P(high <= threshold)
+        # Use forecast_high (not forecast_low) -- the market is about the HIGH temp.
+        # P(high <= T) = logistic_cdf(T, forecast_high, sigma)
+        diff = threshold - forecast_high
+        prob_yes = 1 / (1 + math.exp(-diff / forecast_sigma))
+        prob_yes = max(0.02, min(0.98, prob_yes))
+        print(f"[info] Weather: {city_key} day={day_idx} forecast_high={forecast_high:.0f}\u00b0F "
+              f"threshold={threshold:.0f}\u00b0F (below) "
+              f"sigma={forecast_sigma:.1f}\u00b0F \u2192 {prob_yes:.2f}")
+
+    return prob_yes, f"weather:{city_key}_{dates[day_idx]}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Tomorrow.io (premium weather forecasts, 500 calls/day)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_tomorrow_forecast(city_key):
+    """Fetch forecast from Tomorrow.io (formerly Climacell). Returns dict with
+    daily highs/lows in Fahrenheit, or None on failure."""
+    if not TOMORROW_API_KEY:
+        return None
+    city = WEATHER_CITIES.get(city_key)
+    if not city:
+        return None
+    # Use dedicated long-TTL cache to stay within 500 calls/day
+    # Check in-memory first, then persistent SQLite cache
+    now = time.time()
+    if city_key in _TOMORROW_CACHE:
+        cached_data, cached_ts = _TOMORROW_CACHE[city_key]
+        if now - cached_ts < _TOMORROW_TTL:
+            return cached_data
+    # Check persistent cache (survives across oneshot runs)
+    try:
+        conn = get_connection()
+        db_cached = kv_get(conn, f"tomorrow_{city_key}")
+        if db_cached is not None:
+            _TOMORROW_CACHE[city_key] = (db_cached, now)
+            return db_cached
+    except RuntimeError:
+        conn = None  # DB not initialized yet
+    url = (
+        f"https://api.tomorrow.io/v4/weather/forecast?"
+        f"location={city['lat']},{city['lon']}"
+        f"&timesteps=1d"
+        f"&units=imperial"
+        f"&apikey={TOMORROW_API_KEY}"
+    )
+    data = cached_get(f"tomorrow_{city_key}", url, timeout=8)
+    if not data:
+        return None
+    try:
+        daily = data.get("timelines", {}).get("daily", [])
+        if not daily:
+            return None
+        # Normalize to same structure as Open-Meteo for reuse
+        result = {"daily": {
+            "temperature_2m_max": [],
+            "temperature_2m_min": [],
+            "time": [],
+        }}
+        for day in daily[:7]:
+            values = day.get("values", {})
+            high = values.get("temperatureMax")
+            low = values.get("temperatureMin")
+            date_str = day.get("time", "")[:10]
+            if high is not None and low is not None:
+                result["daily"]["temperature_2m_max"].append(high)
+                result["daily"]["temperature_2m_min"].append(low)
+                result["daily"]["time"].append(date_str)
+        parsed = result if result["daily"]["temperature_2m_max"] else None
+        _TOMORROW_CACHE[city_key] = (parsed, time.time())
+        # Persist to SQLite for cross-run caching
+        if conn is not None and parsed:
+            kv_set(conn, f"tomorrow_{city_key}", parsed, _TOMORROW_TTL)
+        return parsed
+    except Exception as e:
+        print(f"[tomorrow] Parse error for {city_key}: {e}")
+        return None
+
+
+def get_tomorrow_weather_estimate(ticker, market_data):
+    """Tomorrow.io weather source -- same logic as Open-Meteo but different data provider.
+    Acts as redundant backup + cross-validation for weather markets.
+
+    Returns (probability, source_description) or (None, None).
+    """
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = ticker.upper() if ticker else ""
+
+    is_weather = any(kw in title for kw in _WEATHER_KEYWORDS) or "KXHIGH" in ticker_upper
+    if not is_weather:
+        return None, None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None, None
+
+    # Extract threshold (same regex as Open-Meteo source)
+    temp_match = re.search(
+        r'(at or above|at or below|above|below|over|under|at least|exceed)\s+(\d+\.?\d*)', title
+    )
+    if not temp_match:
+        tick_match = re.search(r'-[TB](-?\d+\.?\d*)', ticker)
+        if tick_match:
+            threshold = float(tick_match.group(1))
+            is_above = True
+        else:
+            return None, None
+    else:
+        direction = temp_match.group(1)
+        threshold = float(temp_match.group(2))
+        is_above = direction in ("above", "over", "at least", "exceed", "at or above")
+
+    if threshold < -40 or threshold > 140:
+        return None, None
+
+    # Determine which forecast day BEFORE fetching (avoids wasted API calls)
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None:
+        return None, None
+
+    forecast = get_tomorrow_forecast(city_key)
+    if not forecast:
+        return None, None
+
+    daily = forecast.get("daily", {})
+    temps_max = daily.get("temperature_2m_max", [])
+    temps_min = daily.get("temperature_2m_min", [])
+    dates = daily.get("time", [])
+
+    if day_idx >= len(temps_max):
+        return None, None
+
+    forecast_high = temps_max[day_idx]
+    forecast_low = temps_min[day_idx]
+    forecast_sigma = 2.0 + day_idx * 0.6
+
+    # Defense 4: Persist today's forecast high for METAR comparison (same as Open-Meteo)
+    if day_idx == 0:
+        _station = _CITY_STATION_MAP.get(city_key)
+        if _station:
+            try:
+                _conn = get_connection()
+                _offset = _CITY_LST_OFFSET.get(city_key, -5)
+                _lst_date = datetime.now(timezone(timedelta(hours=_offset))).strftime("%Y-%m-%d")
+                kv_set(_conn, f"metar_forecast_high_{_station}_{_lst_date}", forecast_high, 86400)
+            except Exception:
+                pass
+
+    # Check if this is a bracket market (-B suffix) -- needs CDF(upper) - CDF(lower)
+    is_bracket = "-B" in ticker_upper if ticker_upper else False
+    if is_bracket:
+        # Extract bracket bounds (same logic as Open-Meteo path)
+        bracket_floor = threshold
+        bracket_cap = threshold + 2.0  # Kalshi weather brackets are 2°F wide
+
+        _api_floor = market_data.get("floor_strike") if market_data else None
+        _api_cap = market_data.get("cap_strike") if market_data else None
+        if _api_floor is not None and _api_cap is not None:
+            try:
+                bracket_floor = float(_api_floor)
+                bracket_cap = float(_api_cap)
+            except (ValueError, TypeError):
+                pass
+        else:
+            range_match_b = re.search(
+                r'(\d+\.?\d*)\s*\u00b0?[fF]?\s*(?:to|and|[-\u2013])\s*(\d+\.?\d*)', title)
+            if range_match_b:
+                bracket_floor = float(range_match_b.group(1))
+                bracket_cap = float(range_match_b.group(2))
+
+        cdf_upper = _logistic_cdf(bracket_cap, forecast_high, forecast_sigma)
+        cdf_lower = _logistic_cdf(bracket_floor, forecast_high, forecast_sigma)
+        prob_yes = cdf_upper - cdf_lower
+        prob_yes = max(0.02, min(0.98, prob_yes))
+        print(f"[tomorrow] Weather: {city_key} day={day_idx} forecast_high={forecast_high:.0f}\u00b0F "
+              f"bracket=[{bracket_floor:.1f},{bracket_cap:.1f}]\u00b0F "
+              f"sigma={forecast_sigma:.1f}\u00b0F \u2192 {prob_yes:.2f}")
+    elif is_above:
+        diff = forecast_high - threshold
+        prob_yes = 1 / (1 + math.exp(-diff / forecast_sigma))
+        prob_yes = max(0.02, min(0.98, prob_yes))
+        print(f"[tomorrow] Weather: {city_key} day={day_idx} high={forecast_high:.0f}\u00b0F "
+              f"threshold={threshold:.0f}\u00b0F (above) sigma={forecast_sigma:.1f}\u00b0F \u2192 {prob_yes:.2f}")
+    else:
+        # "Will high temp be below X?" -- P(high <= threshold)
+        # Use forecast_high (not forecast_low) -- the market is about the HIGH temp.
+        diff = threshold - forecast_high
+        prob_yes = 1 / (1 + math.exp(-diff / forecast_sigma))
+        prob_yes = max(0.02, min(0.98, prob_yes))
+        print(f"[tomorrow] Weather: {city_key} day={day_idx} high={forecast_high:.0f}\u00b0F "
+              f"threshold={threshold:.0f}\u00b0F (below) sigma={forecast_sigma:.1f}\u00b0F \u2192 {prob_yes:.2f}")
+
+    return prob_yes, f"tomorrow:{city_key}_{dates[day_idx] if day_idx < len(dates) else '?'}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. NOAA Weather Alerts (severe weather events, free, no auth)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_noaa_alerts_for_market(ticker, market_data):
+    """Check NOAA active alerts for weather-event markets.
+    Catches hurricane, tornado, heat wave, freeze, and extreme weather markets
+    that go beyond simple temperature forecasts.
+    Returns (adjusted_probability, source_desc) or (None, None)."""
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+
+    # Map alert-type keywords to NOAA alert event types
+    alert_keywords = {
+        "hurricane": ["Hurricane", "Tropical Storm"],
+        "tornado": ["Tornado"],
+        "heat wave": ["Excessive Heat", "Heat Advisory"],
+        "heat": ["Excessive Heat", "Heat Advisory"],
+        "freeze": ["Freeze Warning", "Frost Advisory", "Hard Freeze"],
+        "frost": ["Freeze Warning", "Frost Advisory"],
+        "blizzard": ["Blizzard", "Winter Storm"],
+        "snow": ["Winter Storm", "Winter Weather Advisory"],
+        "flood": ["Flood", "Flash Flood"],
+        "wildfire": ["Fire Weather", "Red Flag Warning"],
+    }
+
+    matched_events = None
+    for kw, events in alert_keywords.items():
+        if kw in title:
+            matched_events = events
+            break
+
+    if not matched_events:
+        return None, None
+
+    # Determine geographic scope -- check for state/region mentions
+    # NOAA alerts API supports area codes (state abbreviations)
+    state_map = {
+        "florida": "FL", "texas": "TX", "california": "CA", "new york": "NY",
+        "louisiana": "LA", "mississippi": "MS", "alabama": "AL", "georgia": "GA",
+        "north carolina": "NC", "south carolina": "SC", "virginia": "VA",
+        "oklahoma": "OK", "kansas": "KS", "nebraska": "NE", "iowa": "IA",
+        "colorado": "CO", "arizona": "AZ", "nevada": "NV", "oregon": "OR",
+        "washington": "WA", "illinois": "IL", "ohio": "OH", "michigan": "MI",
+        "pennsylvania": "PA", "new jersey": "NJ", "massachusetts": "MA",
+    }
+    area = None
+    for state_name, code in state_map.items():
+        if state_name in title:
+            area = code
+            break
+
+    # Fetch active alerts
+    cache_key = f"noaa_alerts_{area or 'US'}"
+    url = "https://api.weather.gov/alerts/active?status=actual&message_type=alert"
+    if area:
+        url += f"&area={area}"
+    else:
+        url += "&limit=50"
+
+    alerts_data = cached_get(cache_key, url, timeout=8)
+    if not alerts_data:
+        return None, None
+
+    features = alerts_data.get("features", [])
+    if not features:
+        # No active alerts -- return None so we don't pollute the ensemble with a guess
+        return None, None
+
+    # Count matching alerts
+    matching = 0
+    for feat in features:
+        props = feat.get("properties", {})
+        event = props.get("event", "")
+        if any(me.lower() in event.lower() for me in matched_events):
+            matching += 1
+
+    if matching > 0:
+        # Active alerts exist -> high probability (scaled by count)
+        prob = min(0.90, 0.60 + matching * 0.10)
+        print(f"[noaa] {matching} active '{matched_events[0]}' alerts "
+              f"{'in ' + area if area else 'nationwide'} \u2192 prob={prob:.2f}")
+        return prob, f"noaa:{matching}alerts:{matched_events[0][:20]}"
+    else:
+        # Active alerts exist but none match -- not informative, return None
+        return None, None
