@@ -88,6 +88,14 @@ from bot.learning.alpha_log import (
     market_snapshot_from_dict as _alpha_market_snapshot,
 )
 from bot.learning.populate_from_alpha import populate_all as _alpha_populate_all
+from bot.learning.calibration import (
+    apply_calibration as _apply_calibration,
+    apply_calibration_correction,
+    compute_calibration_correction,
+    fit_and_persist as _cal_fit_and_persist,
+    load_curve as _cal_load_curve,
+    reset_cache as _cal_reset_cache,
+)
 ESTIMATED_EXIT_SPREAD = float(os.environ.get("ESTIMATED_EXIT_SPREAD", "0.03"))  # 3¢ expected exit slippage
 
 def _round_trip_fee_dollars(price_dollars: float) -> float:
@@ -3291,7 +3299,9 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
     # Apply calibration correction if we have learned biases
     raw_prob = ensemble_prob
     if calibration_corrections:
-        ensemble_prob = apply_calibration_correction(ensemble_prob, calibration_corrections)
+        corrected = _apply_calibration(ensemble_prob, calibration_corrections, ticker=ticker)
+        if corrected is not None:
+            ensemble_prob = corrected
         if abs(ensemble_prob - raw_prob) > 0.001:
             print(f"[calibration] Corrected {raw_prob:.3f} → {ensemble_prob:.3f} "
                   f"(correction={ensemble_prob - raw_prob:+.3f})")
@@ -3573,7 +3583,8 @@ def compute_avoid_filters(conn):
 # what actually worked vs. what didn't.
 
 _LEARNED_WEIGHTS = None   # cached per run
-_CALIBRATION_CURVE = None # cached per run
+# _CALIBRATION_CURVE moved to bot.learning.calibration._CURVE_CACHE;
+# reset_cache() is called at the top of each cycle.
 _CATEGORY_EDGES = None    # cached per run
 
 def _parse_sources_from_strategy(strategy_str):
@@ -3661,59 +3672,8 @@ def compute_adaptive_weights(conn):
     _LEARNED_WEIGHTS = adjusted
     return adjusted
 
-def compute_calibration_correction(conn):
-    """Build a calibration curve that corrects systematic bias in our estimates.
-    If we estimate 70% but actual outcomes are 55%, we should adjust down.
-    Returns a dict of {bucket: correction_offset} to apply to ensemble output."""
-    global _CALIBRATION_CURVE
-    if _CALIBRATION_CURVE is not None:
-        return _CALIBRATION_CURVE
-
-    MIN_CAL_SAMPLES = 5  # per bucket
-
-    rows = conn.execute(
-        "SELECT bucket, estimated_prob, actual_outcome FROM calibration WHERE bucket IS NOT NULL"
-    ).fetchall()
-
-    if len(rows) < 20:
-        _CALIBRATION_CURVE = {}
-        return _CALIBRATION_CURVE
-
-    buckets = {}
-    for bucket, est, actual in rows:
-        buckets.setdefault(bucket, []).append((est, actual))
-
-    corrections = {}
-    for bucket, entries in sorted(buckets.items()):
-        if len(entries) < MIN_CAL_SAMPLES:
-            continue
-        avg_est = sum(e for e, _ in entries) / len(entries)
-        actual_rate = sum(a for _, a in entries) / len(entries)
-        bias = avg_est - actual_rate
-
-        # Only correct if bias is significant (>5%) and we have enough data
-        if abs(bias) > 0.05 and len(entries) >= MIN_CAL_SAMPLES:
-            # Apply partial correction (50% of observed bias) to be conservative
-            # Full correction would overfit to small samples
-            corrections[bucket] = -bias * 0.5
-            direction = "overconfident" if bias > 0 else "underconfident"
-            print(f"[calibration] {bucket}: {direction} by {abs(bias):.1%} "
-                  f"(est={avg_est:.2f} vs actual={actual_rate:.2f}, n={len(entries)}) "
-                  f"→ correction={corrections[bucket]:+.3f}")
-
-    _CALIBRATION_CURVE = corrections
-    return corrections
-
-def apply_calibration_correction(ensemble_prob, calibration_corrections):
-    """Apply learned calibration correction to an ensemble probability estimate."""
-    if not calibration_corrections or ensemble_prob is None:
-        return ensemble_prob
-    bucket = _prob_bucket(ensemble_prob)
-    correction = calibration_corrections.get(bucket, 0)
-    if correction == 0:
-        return ensemble_prob
-    corrected = max(0.02, min(0.98, ensemble_prob + correction))
-    return corrected
+# compute_calibration_correction + apply_calibration_correction moved to
+# bot.learning.calibration (unified Platt implementation). Imported at top.
 
 def compute_category_edge_thresholds(conn):
     """Learn per-category minimum edge thresholds from settlement data.
@@ -6378,16 +6338,35 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
 
     # ── Adaptive learning: compute updated weights, calibration, and edge thresholds
     # Reset per-run caches so we recompute from latest settlement data
-    global _LEARNED_WEIGHTS, _CALIBRATION_CURVE, _CATEGORY_EDGES
+    global _LEARNED_WEIGHTS, _CATEGORY_EDGES
     _LEARNED_WEIGHTS = None
-    _CALIBRATION_CURVE = None
+    _cal_reset_cache()
     _CATEGORY_EDGES = None
     adaptive_weights = compute_adaptive_weights(conn)
-    calibration_corrections = compute_calibration_correction(conn)
+    # Fit Platt curve once per cycle from the calibration table and persist to
+    # kv_cache (keyed "calibration_curve_v2", 1h TTL). The ensemble reads via
+    # the `calibration_corrections` parameter; see bot/learning/calibration.py.
+    try:
+        calibration_corrections = _cal_fit_and_persist(conn)
+    except Exception as e:
+        print(f"[calibration] fit_and_persist failed: {e}")
+        calibration_corrections = _cal_load_curve(conn) or {}
     category_edges = compute_category_edge_thresholds(conn)
     result["adaptive_weights"] = adaptive_weights
     result["calibration_corrections"] = calibration_corrections
     result["category_edges"] = category_edges
+    # Observability: surface fit diagnostics so the pipeline_health tail and
+    # daemon logs make the curve visible without spelunking kv_cache.
+    if isinstance(calibration_corrections, dict):
+        _cal_method = calibration_corrections.get("method", "identity")
+        _cal_n = calibration_corrections.get("n_samples", 0)
+        _cal_A = calibration_corrections.get("A", 1.0)
+        _cal_B = calibration_corrections.get("B", 0.0)
+        _cal_bb = calibration_corrections.get("brier_before", 0.0)
+        _cal_ba = calibration_corrections.get("brier_after", 0.0)
+        _cal_fams = len(calibration_corrections.get("families", {}) or {})
+        print(f"[calibration] method={_cal_method} n={_cal_n} A={_cal_A:.3f} "
+              f"B={_cal_B:+.3f} brier {_cal_bb:.4f}→{_cal_ba:.4f} families={_cal_fams}")
 
     # ── Advanced learning loops ─────────────────────────────────────────────
     # Loss post-mortems: classify why we lose (directional trades)

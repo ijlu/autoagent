@@ -163,19 +163,17 @@ def record_pipeline_health(conn) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # Calibration correction
 # ══════════════════════════════════════════════════════════════════════════════
+# Unified in bot.learning.calibration. Re-exported here so existing imports
+# (scoring.market_scorer, tests) keep working. The implementation is a Platt
+# scaling curve with optional per-family overrides; see that module for the
+# curve shape.
 
-def apply_calibration_correction(prob: float, corrections: dict) -> float:
-    """Apply learned calibration correction to an ensemble probability.
+from bot.learning.calibration import apply_calibration as _apply_calibration
 
-    corrections: dict of bucket -> {bias, n, avg_estimate, actual_rate}
-    """
-    if not corrections:
-        return prob
-    bucket = f"{int(prob * 10) / 10:.1f}-{int(prob * 10) / 10 + 0.1:.1f}"
-    if bucket in corrections:
-        bias = corrections[bucket].get("bias", 0)
-        return max(0.02, min(0.98, prob - bias))
-    return prob
+
+def apply_calibration_correction(prob, corrections, ticker=None):
+    """Legacy shim → delegates to bot.learning.calibration.apply_calibration."""
+    return _apply_calibration(prob, corrections, ticker=ticker)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -224,10 +222,12 @@ def get_independent_estimate(
                 # Calibration correction still applies to router output
                 final_prob = float(rprob)
                 if calibration_corrections:
-                    corrected = apply_calibration_correction(final_prob, calibration_corrections)
-                    if abs(corrected - final_prob) > 0.001:
+                    corrected = apply_calibration_correction(
+                        final_prob, calibration_corrections, ticker=ticker
+                    )
+                    if corrected is not None and abs(corrected - final_prob) > 0.001:
                         print(f"[calibration] Router {final_prob:.3f} -> {corrected:.3f}")
-                    final_prob = corrected
+                    final_prob = corrected if corrected is not None else final_prob
                 final_prob = max(0.02, min(0.98, final_prob))
                 print(f"[ensemble] family-routed {src_key} -> {final_prob:.3f} ({rsrc})")
                 return final_prob, rsrc or src_key, 1
@@ -463,7 +463,11 @@ def get_independent_estimate(
     # ── Calibration correction ──
     raw_prob = ensemble_prob
     if calibration_corrections:
-        ensemble_prob = apply_calibration_correction(ensemble_prob, calibration_corrections)
+        corrected = apply_calibration_correction(
+            ensemble_prob, calibration_corrections, ticker=ticker
+        )
+        if corrected is not None:
+            ensemble_prob = corrected
         if abs(ensemble_prob - raw_prob) > 0.001:
             print(f"[calibration] Corrected {raw_prob:.3f} -> {ensemble_prob:.3f} "
                   f"(correction={ensemble_prob - raw_prob:+.3f})")

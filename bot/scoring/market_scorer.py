@@ -33,10 +33,7 @@ from bot.config import (
     SOURCE_WEIGHTS,
 )
 from bot.scoring.filters import categorize_market
-from bot.signals.ensemble import (
-    apply_calibration_correction,
-    get_independent_estimate,
-)
+from bot.signals.ensemble import get_independent_estimate
 
 # These source functions are used by score_near_resolution and score_event_driven.
 # They are already extracted into bot.signals.sources submodules.

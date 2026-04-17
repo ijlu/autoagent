@@ -127,7 +127,7 @@ def test_router_applies_calibration_correction(monkeypatch):
                         lambda t, m: (0.70, "weather_ensemble:x"))
 
     # Fake calibration: always push prob down by 0.10
-    def fake_cal(prob, corrections):
+    def fake_cal(prob, corrections, ticker=None):
         return prob - 0.10
     monkeypatch.setattr(ensemble, "apply_calibration_correction", fake_cal)
 

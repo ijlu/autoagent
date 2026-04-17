@@ -45,7 +45,7 @@ from typing import Optional
 
 from bot.core.categorization import categorize_market
 from bot.daemon.locks import DB_WRITE_LOCK
-from bot.learning.calibration import _prob_bucket
+from bot.learning.calibration import _prob_bucket_label as _prob_bucket
 
 logger = logging.getLogger(__name__)
 
