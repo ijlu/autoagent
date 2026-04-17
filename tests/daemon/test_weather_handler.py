@@ -24,6 +24,9 @@ from bot.daemon.weather_handler import (
     WeatherChangeHandler,
     default_smart_gate,
 )
+from bot.db import init_db
+from bot.learning.directional_shadow import LiveState
+from bot.learning.mm_promotion import set_mm_live_state
 
 
 def _make_change(
@@ -90,23 +93,77 @@ class TestShadowMode:
 
 
 class TestLiveMode:
-    def test_live_routes_to_requote_city(self, quoter, fcache):
-        h = WeatherChangeHandler(quoter=quoter, forecast_cache=fcache, live=True)
+    """Per-series live state gates the handler; master env flag ``live=True``
+    is necessary but not sufficient. Tests flip the KXHIGHNY series to
+    LIVE_FULL to get onto the requote_city path."""
+
+    @pytest.fixture()
+    def live_conn(self):
+        c = init_db(":memory:")
+        set_mm_live_state(c, "KXHIGHNY", LiveState.LIVE_FULL)
+        yield c
+        c.close()
+
+    def test_live_routes_to_requote_city(self, quoter, fcache, live_conn):
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=True, conn=live_conn,
+        )
         h([_make_change()])
         quoter.requote_city.assert_called_once()
         quoter.shadow_requote_city.assert_not_called()
 
-    def test_live_does_not_pass_old_new_temps(self, quoter, fcache):
-        """`requote_city` signature has no old_temp_f/new_temp_f — the shadow
-        path is the only one that persists them (for markout analysis)."""
-        h = WeatherChangeHandler(quoter=quoter, forecast_cache=fcache, live=True)
+    def test_live_passes_old_new_temps_for_paired_shadow_row(
+        self, quoter, fcache, live_conn,
+    ):
+        """T.6 paired logging — the live path writes a weather_mm_shadow row
+        with the observed old/new temp so the shadow-fill model can be
+        compared to realized live fills at settlement."""
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=True, conn=live_conn,
+        )
         h([_make_change()])
         kwargs = quoter.requote_city.call_args.kwargs
-        assert "old_temp_f" not in kwargs
-        assert "new_temp_f" not in kwargs
+        assert kwargs["old_temp_f"] == 70.0
+        assert kwargs["new_temp_f"] == 72.0
+        assert kwargs["order_size_multiplier"] == 1.0  # LIVE_FULL
 
-    def test_live_counts_quoted_and_skipped(self, quoter, fcache):
-        h = WeatherChangeHandler(quoter=quoter, forecast_cache=fcache, live=True)
+    def test_canary_passes_half_multiplier(self, quoter, fcache):
+        c = init_db(":memory:")
+        set_mm_live_state(c, "KXHIGHNY", LiveState.LIVE_CANARY)
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=True, conn=c,
+        )
+        h([_make_change()])
+        kwargs = quoter.requote_city.call_args.kwargs
+        assert kwargs["order_size_multiplier"] == 0.5
+        c.close()
+
+    def test_env_off_forces_shadow_even_when_series_live(
+        self, quoter, fcache, live_conn,
+    ):
+        """Master env flag (``live=False``) overrides per-series kv state."""
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=False, conn=live_conn,
+        )
+        h([_make_change()])
+        quoter.shadow_requote_city.assert_called_once()
+        quoter.requote_city.assert_not_called()
+
+    def test_live_env_but_series_shadow_goes_shadow(self, quoter, fcache):
+        c = init_db(":memory:")
+        # Series never promoted → default SHADOW
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=True, conn=c,
+        )
+        h([_make_change()])
+        quoter.shadow_requote_city.assert_called_once()
+        quoter.requote_city.assert_not_called()
+        c.close()
+
+    def test_live_counts_quoted_and_skipped(self, quoter, fcache, live_conn):
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=True, conn=live_conn,
+        )
         h([_make_change()])
         assert h.stats["markets_quoted"] == 1
         assert h.stats["markets_skipped"] == 1

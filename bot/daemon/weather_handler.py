@@ -5,10 +5,13 @@
 cooldown dict, fetches the station forecast, runs smart gates, and invokes
 either the shadow or live path of :class:`WeatherQuoter`.
 
-The shadow-vs-live gate is the `WEATHER_MM_LIVE` env var (mirrored into
-`bot.config.WEATHER_MM_LIVE`). Shadow mode writes to `weather_mm_shadow` but
-never touches the Kalshi API — matching the Phase 1 plan of proving out
-event-driven quoting on counterfactual data before flipping to live.
+Per-series shadow-vs-live gate (Phase 1 step 10, option A.7):
+:func:`bot.learning.mm_promotion.is_mm_live` / ``get_mm_order_size_multiplier``
+decide per series whether to post real orders, at what fraction of
+``MM_ORDER_SIZE``. SHADOW=0.0 (log only), LIVE_CANARY=0.5, LIVE_FULL=1.0.
+The legacy env-wide ``WEATHER_MM_LIVE`` is the operator-override master
+switch: when false, every series is forced into shadow mode regardless of
+its kv state.
 """
 from __future__ import annotations
 
@@ -21,6 +24,10 @@ from bot.daemon.forecast_cache import ForecastCache
 from bot.daemon.metar_poller import TemperatureChange
 from bot.daemon.smart_gates import evaluate_all_gates
 from bot.daemon.weather_quoter import WeatherQuoter
+from bot.learning.mm_promotion import (
+    get_mm_order_size_multiplier,
+    is_mm_live,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +89,11 @@ class WeatherChangeHandler:
     :class:`ForecastCache`. Per-series cooldown lives on the instance so it
     survives across calls without relying on global state.
 
-    The handler is intentionally shadow-first: `WEATHER_MM_LIVE=false`
-    (default) routes every change through ``shadow_requote_city``. Flipping
-    the env var + restarting the daemon is the single switch that promotes
-    event-driven weather MM to live trading.
+    The handler is shadow-first *and* per-series: the global
+    ``WEATHER_MM_LIVE`` env flag is a master kill-switch. When it is on,
+    each series reads its own mm_live kv state and posts at the state's
+    order-size multiplier (canary=0.5, full=1.0). When it is off, every
+    series is forced through ``shadow_requote_city`` regardless of kv state.
     """
 
     def __init__(
@@ -96,12 +104,18 @@ class WeatherChangeHandler:
         smart_gate: Optional[_SmartGateFn] = None,
         cooldown_s: float = DEFAULT_COOLDOWN_S,
         live: Optional[bool] = None,
+        conn=None,
     ) -> None:
         self.quoter = quoter
         self.forecast_cache = forecast_cache
         self.smart_gate: _SmartGateFn = smart_gate or default_smart_gate
         self.cooldown_s = float(cooldown_s)
+        # ``self.live`` is now the *master* env-level switch. Per-series
+        # decisions happen inside ``_handle_one``.
         self.live = WEATHER_MM_LIVE if live is None else bool(live)
+        # Connection used for kv-state lookups. Falls back to quoter.conn
+        # (shared daemon connection) when not explicitly wired.
+        self.conn = conn if conn is not None else getattr(quoter, "conn", None)
         self._last_requote: dict[str, float] = {}
         self.stats: dict[str, int] = {
             "changes_seen": 0,
@@ -112,6 +126,23 @@ class WeatherChangeHandler:
             "markets_skipped": 0,
             "errors": 0,
         }
+
+    def _series_live_state(self, series: str) -> tuple[bool, float]:
+        """Resolve (live?, order_size_multiplier) for this series right now.
+
+        Master env flag wins — if WEATHER_MM_LIVE is false, everyone is
+        shadow. Otherwise look up the kv state.
+        """
+        if not self.live or self.conn is None:
+            return False, 0.0
+        try:
+            live = is_mm_live(self.conn, series)
+            mult = get_mm_order_size_multiplier(self.conn, series) if live else 0.0
+        except Exception as exc:  # pragma: no cover — kv read should not fail
+            logger.warning("[wx-handler] mm_live lookup failed for %s: %s",
+                           series, exc)
+            return False, 0.0
+        return live, mult
 
     # ------------------------------------------------------------------
     # Poller callback
@@ -145,18 +176,20 @@ class WeatherChangeHandler:
                 change.station, forecast_high,
             )
 
+        series_live, mult = self._series_live_state(change.series)
+
         logger.info(
             "[wx-handler] %s %s  %s°F→%.0f°F  high=%.0f  fc=%.0f  "
-            "traj=%+.1f°F/hr  hrs_left=%.1f  mode=%s",
+            "traj=%+.1f°F/hr  hrs_left=%.1f  mode=%s  mult=%.2f",
             change.series, change.station,
             "?" if change.old_temp_f is None else f"{change.old_temp_f:.0f}",
             change.new_temp_f, change.running_high_f, forecast_high,
             change.trajectory_f_per_hr, change.hours_left,
-            "LIVE" if self.live else "SHADOW",
+            "LIVE" if series_live else "SHADOW", mult,
         )
 
         try:
-            if self.live:
+            if series_live:
                 results = self.quoter.requote_city(
                     series=change.series,
                     station=change.station,
@@ -165,6 +198,9 @@ class WeatherChangeHandler:
                     hours_left=change.hours_left,
                     trajectory_f_per_hr=change.trajectory_f_per_hr,
                     smart_gates=self.smart_gate,
+                    order_size_multiplier=mult,
+                    old_temp_f=change.old_temp_f,
+                    new_temp_f=change.new_temp_f,
                 )
                 quoted = sum(1 for r in results if not r.skipped)
                 skipped = sum(1 for r in results if r.skipped)

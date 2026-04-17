@@ -39,7 +39,12 @@ from bot.daemon.scheduler import Scheduler
 from bot.daemon.weather_handler import WeatherChangeHandler
 from bot.daemon.weather_quoter import WeatherQuoter
 from bot.db import init_db, kv_cleanup
+from bot.learning.mm_promotion import (
+    match_shadow_fills,
+    run_mm_promotion_sweep,
+)
 from bot.learning.shadow_promotion import run_promotion_sweep
+from bot.learning.threshold_tuner import propose_thresholds
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,14 @@ FORECAST_REFRESH_TASK_INTERVAL_S = FORECAST_REFRESH_INTERVAL_S
 # a day's lag between meeting the gate and flipping live is fine, and daily
 # avoids recomputing the same settled-row stats on every cycle.
 PROMOTION_SWEEP_INTERVAL_S = 24 * 3600
+
+# MM shadow fill matcher runs often — it's the input to every MM promotion
+# decision, and the per-call cost is a bounded scan over unmatched rows.
+MM_FILL_MATCH_INTERVAL_S = 300  # 5 minutes = quote lifetime window
+MM_PROMOTION_SWEEP_INTERVAL_S = 24 * 3600
+# T.8: the weekly threshold tuner. Writes to threshold_proposals for the
+# operator to review; never mutates live config directly.
+THRESHOLD_TUNER_INTERVAL_S = 7 * 24 * 3600
 
 
 def _configure_logging() -> None:
@@ -110,6 +123,51 @@ def _run_promotion_sweep(conn) -> None:
     else:
         logger.info(
             "[promotion] checked=%d unchanged=%d",
+            summary["checked"], len(summary["unchanged"]),
+        )
+
+
+def _run_mm_fill_match(conn) -> None:
+    """Scan recent weather_mm_shadow rows and populate bid/ask fill flags."""
+    try:
+        summary = match_shadow_fills(conn)
+    except Exception as exc:  # pragma: no cover
+        logger.exception("[mm_fill] matcher failed: %s", exc)
+        return
+    if summary["bid_fills"] or summary["ask_fills"]:
+        logger.info(
+            "[mm_fill] checked=%d bid_fills=%d ask_fills=%d no_fill=%d",
+            summary["checked"], summary["bid_fills"], summary["ask_fills"],
+            summary["no_fill"],
+        )
+    else:
+        logger.debug(
+            "[mm_fill] checked=%d no_fill=%d",
+            summary["checked"], summary["no_fill"],
+        )
+
+
+def _run_mm_promotion_sweep(conn) -> None:
+    """Daily MM promotion/graduation/demotion sweep (Phase 1 step 10)."""
+    equity = _latest_equity_dollars(conn)
+    try:
+        summary = run_mm_promotion_sweep(conn, equity_dollars=equity)
+    except Exception as exc:  # pragma: no cover
+        logger.exception("[mm_promotion] sweep failed: %s", exc)
+        return
+    if summary["promoted"] or summary["graduated"] or summary["demoted"]:
+        logger.info(
+            "[mm_promotion] checked=%d promoted=%d graduated=%d demoted=%d",
+            summary["checked"], len(summary["promoted"]),
+            len(summary["graduated"]), len(summary["demoted"]),
+        )
+        for entry in summary["promoted"] + summary["graduated"]:
+            logger.info("[mm_promotion]   ↑ %s", entry)
+        for entry in summary["demoted"]:
+            logger.warning("[mm_promotion]   ↓ %s", entry)
+    else:
+        logger.info(
+            "[mm_promotion] checked=%d unchanged=%d",
             summary["checked"], len(summary["unchanged"]),
         )
 
@@ -207,6 +265,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_promotion_sweep(conn),
         interval_s=PROMOTION_SWEEP_INTERVAL_S,
         initial_delay_s=600.0,  # give the cycle a chance to write a sessions row first
+    )
+    scheduler.register(
+        "mm_fill_match",
+        lambda: _run_mm_fill_match(conn),
+        interval_s=MM_FILL_MATCH_INTERVAL_S,
+        initial_delay_s=120.0,  # first pass after a full quote-lifetime has elapsed
+    )
+    scheduler.register(
+        "mm_promotion_sweep",
+        lambda: _run_mm_promotion_sweep(conn),
+        interval_s=MM_PROMOTION_SWEEP_INTERVAL_S,
+        initial_delay_s=900.0,  # run after directional promotion so logs group
+    )
+    scheduler.register(
+        "threshold_tuner",
+        lambda: propose_thresholds(conn),
+        interval_s=THRESHOLD_TUNER_INTERVAL_S,
+        initial_delay_s=1800.0,  # let at least a cycle + fill-match run first
     )
     scheduler.register(
         "health_log",

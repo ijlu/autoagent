@@ -374,6 +374,36 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         "ON promotion_events(trigger, ts_unix)"
     )
 
+    # ── Phase 1 step 10: threshold-tuner proposal log (T.8) ──
+    # Weekly tuner job writes one row per proposed threshold change. `applied`
+    # flips when an operator (or, eventually, an auto-apply guard) merges the
+    # proposal. The table is the forever-audit-log for "why did we move
+    # min_pnl_floor from $30 to $35 on date X."
+    conn.execute("""CREATE TABLE IF NOT EXISTS threshold_proposals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_unix REAL NOT NULL,
+        ts_iso TEXT NOT NULL,
+        tuner TEXT NOT NULL,
+        evidence_window_days INTEGER,
+        n_observations INTEGER,
+        current_thresholds_json TEXT NOT NULL,
+        proposed_thresholds_json TEXT NOT NULL,
+        objective_current REAL,
+        objective_proposed REAL,
+        objective_delta REAL,
+        supporting_metrics_json TEXT,
+        applied INTEGER NOT NULL DEFAULT 0,
+        applied_ts_unix REAL,
+        applied_by TEXT)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_threshold_proposals_tuner_ts "
+        "ON threshold_proposals(tuner, ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_threshold_proposals_applied "
+        "ON threshold_proposals(applied, ts_unix)"
+    )
+
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
         ("trades", "action", "TEXT DEFAULT 'buy'"),
@@ -405,6 +435,24 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         ("timing_patterns", "alpha_id", "INTEGER"),
         ("edge_convergence", "alpha_id", "INTEGER"),
         ("loss_postmortems", "alpha_id", "INTEGER"),
+        # Phase 1 step 10: MM promotion gate needs per-shadow-quote fill
+        # status and settlement P&L. Matcher populates shadow_bid_filled /
+        # shadow_ask_filled from subsequent market snapshots; settlement
+        # annotator fills shadow_pnl_cents + (if live) live_pnl_cents. T.6
+        # paired-logging: live_pnl_cents is non-null on live-mode rows so
+        # mm_promotion can compute realized/shadow ratio for fill-model
+        # calibration monitoring.
+        ("weather_mm_shadow", "ticker_settled_yes", "INTEGER"),
+        ("weather_mm_shadow", "ts_settle_unix", "REAL"),
+        ("weather_mm_shadow", "shadow_bid_filled", "INTEGER"),
+        ("weather_mm_shadow", "shadow_bid_fill_ts_unix", "REAL"),
+        ("weather_mm_shadow", "shadow_ask_filled", "INTEGER"),
+        ("weather_mm_shadow", "shadow_ask_fill_ts_unix", "REAL"),
+        ("weather_mm_shadow", "shadow_pnl_cents", "INTEGER"),
+        ("weather_mm_shadow", "live_pnl_cents", "INTEGER"),
+        ("weather_mm_shadow", "live_order_id_bid", "TEXT"),
+        ("weather_mm_shadow", "live_order_id_ask", "TEXT"),
+        ("weather_mm_shadow", "order_size", "INTEGER"),
     ]
     for table, col, coltype in _migrations:
         try:

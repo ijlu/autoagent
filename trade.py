@@ -3453,6 +3453,20 @@ def record_settlements(conn):
             except Exception as e:
                 print(f"[alpha_log] fill failed for {ticker}: {e}")
 
+        # Phase 1 step 10: annotate matching weather_mm_shadow rows with P&L
+        # so the MM promotion gate has realized-spread-capture data.
+        # Only weather tickers have shadow rows; other families simply no-op.
+        if result in ("yes", "no"):
+            try:
+                from bot.learning.mm_promotion import annotate_shadow_pnl
+                annotate_shadow_pnl(
+                    conn, ticker,
+                    won_yes=(result == "yes"),
+                    ts_settle_unix=time.time(),
+                )
+            except Exception as e:
+                print(f"[mm_promotion] annotate failed for {ticker}: {e}")
+
         # Record calibration data for directional trades with estimates
         if est_prob is not None:
             bucket = _prob_bucket(est_prob)

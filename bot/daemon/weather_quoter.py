@@ -203,25 +203,17 @@ class WeatherQuoter:
         hours_left: float,
         trajectory_f_per_hr: float = 0.0,
         smart_gates: Optional[SmartGateFn] = None,
+        order_size_multiplier: float = 1.0,
+        old_temp_f: Optional[float] = None,
+        new_temp_f: Optional[float] = None,
     ) -> list[RequoteResult]:
         """Requote all open markets for a weather series.
 
-        Args:
-            series: Kalshi series ticker, e.g. "KXHIGHNY".
-            station: METAR station ID, e.g. "KJFK".
-            running_high_f: Current running daily high in Fahrenheit.
-            forecast_high_f: Today's forecast high in Fahrenheit.
-            hours_left: Hours remaining in the settlement day.
-            trajectory_f_per_hr: Recent temperature change rate (positive = warming).
-            smart_gates: Optional callable that decides whether to quote a market
-                and what spread multiplier to use. Signature:
-                ``(station, bracket_floor, bracket_cap, running_high,
-                   forecast_high, hours_left, trajectory)``
-                Returns ``(should_quote, reason, spread_multiplier)``.
-                If *None*, all markets are quoted with base spread.
-
-        Returns:
-            List of :class:`RequoteResult`, one per market examined.
+        ``order_size_multiplier`` scales ``MM_ORDER_SIZE`` and the
+        ``MM_MAX_INVENTORY`` cap for the graduated promotion states
+        (canary=0.5, full=1.0). The live path also writes a paired
+        ``weather_mm_shadow`` row with ``live_mode=1`` so the T.6 shadow-vs-
+        live calibration monitor has inputs.
         """
         results: list[RequoteResult] = []
 
@@ -245,6 +237,9 @@ class WeatherQuoter:
                     hours_left=hours_left,
                     trajectory_f_per_hr=trajectory_f_per_hr,
                     smart_gates=smart_gates,
+                    order_size_multiplier=order_size_multiplier,
+                    old_temp_f=old_temp_f,
+                    new_temp_f=new_temp_f,
                 )
                 results.append(result)
             except Exception as exc:
@@ -428,6 +423,9 @@ class WeatherQuoter:
         gate_spread_mult: float,
         latency_ms: float,
         live_mode: bool,
+        live_order_id_bid: Optional[str] = None,
+        live_order_id_ask: Optional[str] = None,
+        order_size: Optional[int] = None,
     ) -> Optional[int]:
         """Insert one row into weather_mm_shadow. Returns rowid on success."""
         now = time.time()
@@ -446,8 +444,9 @@ class WeatherQuoter:
                      fair_value_cents, proposed_bid_cents, proposed_ask_cents,
                      half_spread_cents, market_yes_bid, market_yes_ask, market_mid,
                      inventory, gate_should_quote, gate_reason, gate_spread_mult,
-                     latency_ms, live_mode)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     latency_ms, live_mode,
+                     live_order_id_bid, live_order_id_ask, order_size)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         int(now), now_iso, ticker, series, station,
                         old_temp_f, new_temp_f, running_high_f, forecast_high_f,
@@ -456,6 +455,7 @@ class WeatherQuoter:
                         half_spread_cents, market_yes_bid, market_yes_ask, market_mid,
                         inventory, 1 if gate_should_quote else 0, gate_reason,
                         gate_spread_mult, latency_ms, 1 if live_mode else 0,
+                        live_order_id_bid, live_order_id_ask, order_size,
                     ),
                 )
                 self.conn.commit()
@@ -477,6 +477,9 @@ class WeatherQuoter:
         hours_left: float,
         trajectory_f_per_hr: float,
         smart_gates: Optional[SmartGateFn],
+        order_size_multiplier: float = 1.0,
+        old_temp_f: Optional[float] = None,
+        new_temp_f: Optional[float] = None,
     ) -> RequoteResult:
         """Cancel stale orders, compute new fair value, post fresh quotes."""
         t0 = time.monotonic()
@@ -484,6 +487,7 @@ class WeatherQuoter:
 
         # -- Smart gate check --
         spread_mult = 1.0
+        gate_reason: Optional[str] = None
         if smart_gates is not None:
             should_quote, gate_reason, spread_mult = smart_gates(
                 station,
@@ -534,15 +538,51 @@ class WeatherQuoter:
         base_hs = max(base_hs, 8)
         effective_hs = max(1, int(round(base_hs * spread_mult)))
 
+        # -- Effective order size (graduated promotion multiplier) --
+        eff_order_size = max(1, int(round(MM_ORDER_SIZE * order_size_multiplier)))
+
         # -- Post new quotes --
-        n_posted = self._post_quotes(
+        n_posted, bid_oid, ask_oid, bid_price, ask_price = self._post_quotes(
             ticker=ticker,
             fair_value_cents=fair_value_cents,
             half_spread=effective_hs,
             inventory=inventory,
+            order_size=eff_order_size,
+            max_inventory=max(eff_order_size, int(round(
+                MM_MAX_INVENTORY * order_size_multiplier))),
         )
 
         latency = _ms_since(t0)
+
+        # T.6 paired logging — write a live-mode weather_mm_shadow row with
+        # the posted prices + order IDs so the shadow fill model can be
+        # compared against realized live fills at settlement.
+        self._write_shadow_row(
+            ticker=ticker,
+            series=market.series,
+            station=station,
+            old_temp_f=old_temp_f,
+            new_temp_f=new_temp_f,
+            running_high_f=running_high_f,
+            forecast_high_f=forecast_high_f,
+            hours_left=hours_left,
+            trajectory_f_per_hr=trajectory_f_per_hr,
+            fair_value_cents=fair_value_cents,
+            bid_cents=bid_price,
+            ask_cents=ask_price,
+            half_spread_cents=effective_hs,
+            market_yes_bid=market.yes_bid,
+            market_yes_ask=market.yes_ask,
+            inventory=inventory,
+            gate_should_quote=True,
+            gate_reason=gate_reason,
+            gate_spread_mult=spread_mult,
+            latency_ms=latency,
+            live_mode=True,
+            live_order_id_bid=bid_oid,
+            live_order_id_ask=ask_oid,
+            order_size=eff_order_size,
+        )
 
         result = RequoteResult(
             ticker=ticker,
@@ -558,9 +598,10 @@ class WeatherQuoter:
         self._log_requote(result)
 
         logger.info(
-            "[wx-quoter] %s  fv=%dc  cancel=%d  post=%d  inv=%d  hs=%d  %.0fms",
+            "[wx-quoter] %s  fv=%dc  cancel=%d  post=%d  inv=%d  hs=%d  "
+            "size=%d  mult=%.2f  %.0fms",
             ticker, fair_value_cents, n_cancelled, n_posted, inventory,
-            effective_hs, latency,
+            effective_hs, eff_order_size, order_size_multiplier, latency,
         )
 
         return result
@@ -778,22 +819,29 @@ class WeatherQuoter:
         fair_value_cents: int,
         half_spread: int,
         inventory: int,
-    ) -> int:
+        order_size: int = MM_ORDER_SIZE,
+        max_inventory: int = MM_MAX_INVENTORY,
+    ) -> Tuple[int, Optional[str], Optional[str], int, int]:
         """Post two-sided limit orders for a weather market.
 
-        Returns the number of orders successfully posted (0, 1, or 2).
+        Returns ``(n_posted, bid_order_id, ask_order_id, bid_price, ask_price)``.
+        Order IDs may be ``None`` when the leg was skipped or failed. DRY_RUN
+        emits a synthetic ``dry_<ticker>_<ts>`` ID so the paired shadow row
+        still has a handle.
         """
         bid, ask, effective_hs = self.compute_quote_prices(
             fair_value_cents, half_spread, inventory,
         )
 
         orders_posted = 0
+        bid_oid: Optional[str] = None
+        ask_oid: Optional[str] = None
         ts = int(time.time())
         expiration_ts = ts + 90  # 90s expiry (faster cycle = shorter life)
 
         # -- Inventory cap enforcement --
-        can_buy = abs(inventory + MM_ORDER_SIZE) <= MM_MAX_INVENTORY
-        can_sell = abs(inventory - MM_ORDER_SIZE) <= MM_MAX_INVENTORY
+        can_buy = abs(inventory + order_size) <= max_inventory
+        can_sell = abs(inventory - order_size) <= max_inventory
 
         # -- Post BID (buy YES) --
         if can_buy:
@@ -803,7 +851,7 @@ class WeatherQuoter:
                 "ticker": ticker,
                 "side": "yes",
                 "type": "limit",
-                "count": MM_ORDER_SIZE,
+                "count": order_size,
                 "yes_price": bid,
                 "action": "buy",
                 "expiration_ts": expiration_ts,
@@ -811,15 +859,17 @@ class WeatherQuoter:
                 "post_only": True,
             }
             if MM_DRY_RUN:
-                logger.info("[wx-quoter] DRY BID %s YES x%d @ %dc", ticker, MM_ORDER_SIZE, bid)
+                logger.info("[wx-quoter] DRY BID %s YES x%d @ %dc", ticker, order_size, bid)
                 orders_posted += 1
+                bid_oid = f"dry_{client_id}"
             else:
                 try:
                     resp = api_post("/portfolio/orders", bid_body)
                     oid = resp.get("order", {}).get("order_id", "")
                     if oid:
                         orders_posted += 1
-                        logger.info("[wx-quoter] BID %s YES x%d @ %dc  oid=%s", ticker, MM_ORDER_SIZE, bid, oid)
+                        bid_oid = oid
+                        logger.info("[wx-quoter] BID %s YES x%d @ %dc  oid=%s", ticker, order_size, bid, oid)
                     else:
                         logger.warning("[wx-quoter] BID %s: API returned empty order_id", ticker)
                 except Exception as exc:
@@ -834,7 +884,7 @@ class WeatherQuoter:
                 "ticker": ticker,
                 "side": "no",
                 "type": "limit",
-                "count": MM_ORDER_SIZE,
+                "count": order_size,
                 "no_price": no_price,
                 "action": "buy",
                 "expiration_ts": expiration_ts,
@@ -842,21 +892,23 @@ class WeatherQuoter:
                 "post_only": True,
             }
             if MM_DRY_RUN:
-                logger.info("[wx-quoter] DRY ASK %s NO x%d @ %dc (YES ask=%dc)", ticker, MM_ORDER_SIZE, no_price, ask)
+                logger.info("[wx-quoter] DRY ASK %s NO x%d @ %dc (YES ask=%dc)", ticker, order_size, no_price, ask)
                 orders_posted += 1
+                ask_oid = f"dry_{client_id}"
             else:
                 try:
                     resp = api_post("/portfolio/orders", ask_body)
                     oid = resp.get("order", {}).get("order_id", "")
                     if oid:
                         orders_posted += 1
-                        logger.info("[wx-quoter] ASK %s NO x%d @ %dc  oid=%s", ticker, MM_ORDER_SIZE, no_price, oid)
+                        ask_oid = oid
+                        logger.info("[wx-quoter] ASK %s NO x%d @ %dc  oid=%s", ticker, order_size, no_price, oid)
                     else:
                         logger.warning("[wx-quoter] ASK %s: API returned empty order_id", ticker)
                 except Exception as exc:
                     logger.error("[wx-quoter] ASK %s FAILED: %s", ticker, exc)
 
-        return orders_posted
+        return orders_posted, bid_oid, ask_oid, bid, ask
 
     # ------------------------------------------------------------------
     # Inventory lookup

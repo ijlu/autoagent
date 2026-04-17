@@ -303,7 +303,9 @@ class TestPriceConstraints:
 
         # Skew = -(20/10)*2 = -4 -> bid and ask shift down by 4
         # With fair=50, hs=8: bid = 50 - 8 - 4 = 38, ask = 50 + 8 - 4 = 54
-        n = quoter._post_quotes("TEST-T75", fair_value_cents=50, half_spread=8, inventory=20)
+        n, _, _, _, _ = quoter._post_quotes(
+            "TEST-T75", fair_value_cents=50, half_spread=8, inventory=20,
+        )
         assert n == 2  # both bid and ask posted (dry run)
 
     @patch("bot.daemon.weather_quoter.MM_DRY_RUN", True)
@@ -313,7 +315,10 @@ class TestPriceConstraints:
         """At inventory cap, should not post more in same direction."""
         quoter = WeatherQuoter(mock_conn)
         # inventory=10, order_size=10 -> abs(10+10)=20 > 15 -> can't buy
-        n = quoter._post_quotes("TEST-T75", fair_value_cents=50, half_spread=8, inventory=10)
+        n, _, _, _, _ = quoter._post_quotes(
+            "TEST-T75", fair_value_cents=50, half_spread=8, inventory=10,
+            order_size=10, max_inventory=15,
+        )
         # Can still sell (abs(10-10)=0 <= 15) but can't buy
         assert n == 1  # only ask posted
 
@@ -333,7 +338,7 @@ class TestPostQuotesDryRun:
     def test_dry_run_does_not_call_api(self, mock_api_post, mock_conn):
         """In DRY_RUN, api_post should never be called."""
         quoter = WeatherQuoter(mock_conn)
-        n = quoter._post_quotes("KXHIGHNY-T75", fair_value_cents=50, half_spread=8, inventory=0)
+        n, _, _, _, _ = quoter._post_quotes("KXHIGHNY-T75", fair_value_cents=50, half_spread=8, inventory=0)
         assert n == 2
         mock_api_post.assert_not_called()
 
@@ -346,7 +351,7 @@ class TestPostQuotesDryRun:
         """In live mode, api_post is called for each quote."""
         mock_api_post.return_value = {"order": {"order_id": "abc123"}}
         quoter = WeatherQuoter(mock_conn)
-        n = quoter._post_quotes("KXHIGHNY-T75", fair_value_cents=50, half_spread=8, inventory=0)
+        n, _, _, _, _ = quoter._post_quotes("KXHIGHNY-T75", fair_value_cents=50, half_spread=8, inventory=0)
         assert n == 2
         assert mock_api_post.call_count == 2
 
