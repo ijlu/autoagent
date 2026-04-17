@@ -326,12 +326,25 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         ("opportunity_log", "four_factor_scores", "TEXT"),
         ("opportunity_log", "regime", "TEXT"),
         ("opportunity_log", "rank", "INTEGER"),
+        # Phase 1: link learning rows back to their alpha_backtest source for
+        # idempotent population. Legacy rows pass through as alpha_id IS NULL.
+        ("calibration", "alpha_id", "INTEGER"),
+        ("timing_patterns", "alpha_id", "INTEGER"),
+        ("edge_convergence", "alpha_id", "INTEGER"),
+        ("loss_postmortems", "alpha_id", "INTEGER"),
     ]
     for table, col, coltype in _migrations:
         try:
             conn.execute(f"SELECT {col} FROM {table} LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+
+    # Partial unique indexes on alpha_id (null rows exempt, non-null must be unique)
+    for tbl in ("calibration", "timing_patterns", "edge_convergence", "loss_postmortems"):
+        conn.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{tbl}_alpha_id "
+            f"ON {tbl}(alpha_id) WHERE alpha_id IS NOT NULL"
+        )
 
     conn.commit()
     _PERSIST_CONN = conn

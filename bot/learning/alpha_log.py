@@ -416,3 +416,81 @@ def fill_settlement(
     except Exception as e:
         logger.warning("[alpha_log] fill_settlement(%s) failed: %s", ticker, e)
         return 0
+
+
+def fill_settlement_for_ticker(
+    conn: sqlite3.Connection,
+    *,
+    ticker: str,
+    settlement_result: str,
+    ts_settle_unix: Optional[float] = None,
+) -> int:
+    """Settle all open alpha_backtest rows for a ticker.
+
+    Unlike `fill_settlement`, this computes per-row won_yes and counterfactual
+    realized_pnl_cents from (side, price_cents, contracts) + market_result.
+    Use this from record_settlements() — one call handles every shadow decision
+    we logged for this ticker, across both sides.
+
+    Counterfactual P&L (had we actually traded at price_cents × contracts):
+      won:  contracts * (100 - price_cents)
+      lost: -contracts * price_cents
+
+    Rows with side IS NULL or price_cents IS NULL get settlement_result filled
+    but won_yes / realized_pnl_cents left NULL (not enough info).
+
+    Returns the number of rows updated. Idempotent (only rows where
+    ts_settle_unix IS NULL are touched).
+    """
+    try:
+        if settlement_result not in ("yes", "no"):
+            logger.warning(
+                "[alpha_log] fill_settlement_for_ticker(%s) bad result: %s",
+                ticker, settlement_result,
+            )
+            return 0
+        if ts_settle_unix is None:
+            ts_settle_unix = time.time()
+        ts_settle = (
+            datetime.fromtimestamp(ts_settle_unix, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+
+        with DB_WRITE_LOCK:
+            cur = conn.execute(
+                """UPDATE alpha_backtest
+                   SET ts_settle = ?,
+                       ts_settle_unix = ?,
+                       settlement_result = ?,
+                       won_yes = CASE
+                           WHEN side = 'yes' AND ? = 'yes' THEN 1
+                           WHEN side = 'yes' AND ? = 'no'  THEN 0
+                           WHEN side = 'no'  AND ? = 'no'  THEN 1
+                           WHEN side = 'no'  AND ? = 'yes' THEN 0
+                           ELSE NULL
+                       END,
+                       realized_pnl_cents = CASE
+                           WHEN side IS NULL OR price_cents IS NULL OR contracts IS NULL
+                               THEN NULL
+                           WHEN (side = 'yes' AND ? = 'yes')
+                             OR (side = 'no'  AND ? = 'no')
+                               THEN contracts * (100 - price_cents)
+                           ELSE -contracts * price_cents
+                       END
+                   WHERE ticker = ? AND ts_settle_unix IS NULL""",
+                (
+                    ts_settle, ts_settle_unix, settlement_result,
+                    settlement_result, settlement_result,
+                    settlement_result, settlement_result,
+                    settlement_result, settlement_result,
+                    ticker,
+                ),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+    except Exception as e:
+        logger.warning(
+            "[alpha_log] fill_settlement_for_ticker(%s) failed: %s", ticker, e
+        )
+        return 0

@@ -83,9 +83,11 @@ from bot.learning.alpha_log import (
     DecisionOutcome as _AlphaOutcome,
     DecisionType as _AlphaType,
     EnsembleSnapshot as _AlphaEnsemble,
+    fill_settlement_for_ticker as _alpha_fill_settlement,
     log_decision as _alpha_log_decision,
     market_snapshot_from_dict as _alpha_market_snapshot,
 )
+from bot.learning.populate_from_alpha import populate_all as _alpha_populate_all
 ESTIMATED_EXIT_SPREAD = float(os.environ.get("ESTIMATED_EXIT_SPREAD", "0.03"))  # 3¢ expected exit slippage
 
 def _round_trip_fee_dollars(price_dollars: float) -> float:
@@ -3425,6 +3427,14 @@ def record_settlements(conn):
             (now_str, settlement_id, ticker, side,
              pc, contracts, revenue, profit, won, None, None, strat))
 
+        # Mark matching alpha_backtest shadow rows settled (both sides). Uses
+        # counterfactual P&L per row — this is the Phase 1 gate input.
+        if result in ("yes", "no"):
+            try:
+                _alpha_fill_settlement(conn, ticker=ticker, settlement_result=result)
+            except Exception as e:
+                print(f"[alpha_log] fill failed for {ticker}: {e}")
+
         # Record calibration data for directional trades with estimates
         if est_prob is not None:
             bucket = _prob_bucket(est_prob)
@@ -6351,6 +6361,17 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
     result["orders_pruned"] = prune_stale_orders()
     track_fills(conn)
     result["settlements_recorded"] = record_settlements(conn)
+
+    # Phase 1: cascade newly-settled alpha_backtest rows into the learning
+    # tables (calibration / timing_patterns / edge_convergence / postmortems).
+    # Legacy writers below still run on `trades`+`mm_orders`; this adds the
+    # shadow-decision rows so directional DRY_RUN isn't invisible.
+    try:
+        result["alpha_populated"] = _alpha_populate_all(conn)
+    except Exception as e:
+        print(f"[alpha_log] populate_all failed: {e}")
+        result["alpha_populated"] = {}
+
     result["positions_managed"] = manage_positions(conn, dyn)
     avoid_filters = compute_avoid_filters(conn)
     result["patterns_avoided"] = avoid_filters.get("summary", [])
