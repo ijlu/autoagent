@@ -2,7 +2,7 @@
 
 ## What This Is
 
-An autonomous trading bot for Kalshi prediction markets. Runs as a **persistent daemon** on a DigitalOcean VPS: a supervisor process (`bot.daemon.main`) with a 60s cycle task plus event-driven pollers on their own threads. All trading logic lives in `trade.py` (~4.8K lines) invoked in-process by the daemon's `CycleRunner` — no more forking every 2 minutes.
+An autonomous trading bot for Kalshi prediction markets. Runs as a **persistent daemon** on a DigitalOcean VPS: a supervisor process (`bot.daemon.main`) with a 60s cycle task plus event-driven pollers on their own threads. All trading logic lives in `trade.py` (~7K lines) invoked in-process by the daemon's `CycleRunner` — no more forking every 2 minutes.
 
 **Owner:** Josh Lu (joshlu@a16z.com)
 **VPS:** 45.55.79.193 (user: `kalshi`, path: `/home/kalshi/autoagent/`)
@@ -15,8 +15,8 @@ An autonomous trading bot for Kalshi prediction markets. Runs as a **persistent 
 **Phase 0 (signal validation) passed; Phase 1 (learning infra + event-driven weather MM) is the current work.**
 
 - Phase 0 gate: per-family Brier on weather beat baseline by 4–8× on 5 families (KXHIGHMIA/CHI/AUS/LAX/NY). See [reports/BACKTEST_APR17.md](reports/BACKTEST_APR17.md).
-- Phase 1 items: `alpha_backtest` table + atomic decision logging, settlement-driven learning population, Platt calibration correction in the ensemble, METAR → `WeatherQuoter` event wiring in shadow mode, directional shadow evaluator.
-- **Nothing trades live right now.** MM is disabled (all 11 weather series blocked in config; no non-weather MM). Directional is DRY_RUN. Safe Compounder is behind `SC_ENABLED=false`.
+- Phase 1 core items (atomic decision logging, settlement-driven learning population, Platt calibration in ensemble, METAR→`WeatherQuoter` wiring, directional shadow evaluator, deploy swap) have landed; the remaining work is the shadow-to-live graduated promotion gate and the T3 fills-ledger consumer migration. See §Phase 1 Work below.
+- **Nothing trades live right now.** MM is disabled (all 11 weather series blocked in config; no non-weather MM). Directional is DRY_RUN. Safe Compounder has `SC_ENABLED=true` but is still gated by phase + DRY_RUN.
 - Weather MM re-enable is **shadow-first**: log what `WeatherQuoter` would have posted, compare shadow-markout to shadow-settlement P&L over N settlements, flip to live only if the favorable markout (+4.7¢ historical) converts to realized P&L under the new event-driven cancel-replace path.
 
 ## Architecture
@@ -42,7 +42,7 @@ All cross-thread coordination goes through locks in `bot/daemon/locks.py`:
 ### Code Structure
 
 ```
-trade.py                 — Cycle body (~4.8K lines). Called once per cycle by CycleRunner.
+trade.py                 — Cycle body (~7K lines). Called once per cycle by CycleRunner.
 bot/
   config.py              — Env vars, constants, source weights, phase config, dynamic sizing, block lists
   db.py                  — init_db(), WAL setup, migrations, kv_cache helpers
@@ -50,36 +50,44 @@ bot/
   core/
     money.py             — Canonical fee formulas (kalshi_maker_fee, kalshi_taker_fee)
     categorization.py    — Ticker → family/category mapping
+    exposure.py          — Per-family / per-expiry exposure caps and sizing
+    exit_model.py        — Directional exit evaluator (edge-decay + time backstops)
+    sizing.py            — Thompson-sampled MM sizing (replaces shadow/canary/full step gate)
   daemon/                — THE MM ARCHITECTURE (replaces bot/market_maker/, deleted)
-    main.py              — Supervisor entrypoint (`python -m bot.daemon`)
+    __main__.py          — `python -m bot.daemon` entrypoint wrapper
+    main.py              — Supervisor (scheduler + pollers + shared DB conn)
     scheduler.py         — Periodic-task scheduler with on_start/on_stop hooks
     poller_base.py       — Poller ABC (own thread, health stats, graceful stop)
     metar_poller.py      — METAR observations poller, emits TemperatureChange events
     stations.py          — Station catalogue + SERIES_TO_STATION map
     smart_gates.py       — Pre-quote gates (trajectory, volatility, spread sanity)
     weather_quoter.py    — Event-driven weather MM (on METAR change → cancel-replace)
+    weather_handler.py   — METAR change → WeatherQuoter bridge (shadow/live routing)
+    requote_triggers.py  — Material-change detector for cancel-replace decisions
+    dispatcher.py        — Order write dispatcher (serializes mm_orders writes)
+    fills_writer.py      — Canonical writer for the fills_ledger table (T3)
+    forecast_cache.py    — Shared forecast cache (METAR + quoter + requote triggers)
     orchestrator.py      — WeatherDaemon integration layer
     cycle_runner.py      — Wraps trade.main() for in-process invocation
     locks.py             — DB_WRITE_LOCK, API_LOCK, PIPELINE_STATS_LOCK
   signals/
     ensemble.py          — get_independent_estimate(), source routing, weighted averaging,
                             correlated-group handling, pipeline health
-    weather_ensemble.py  — Multi-source weather stitcher (METAR + NBM + HRRR + NWS + MADIS)
+    weather_ensemble.py  — Multi-source weather stitcher (METAR + NBM + HRRR + NWS + MADIS + AFD)
     family_routers.py    — Per-family source routing policy
+    regime.py            — Market-regime classification (volatility, time-to-expiry bucketing)
     sources/
-      weather.py             — Open-Meteo (bracket CDF)
-      weather_tomorrow.py    — Tomorrow.io (bracket CDF)
-      weather_noaa.py        — NOAA alerts
+      weather.py             — Open-Meteo + Tomorrow.io + NOAA alerts (consolidated)
       metar_observations.py  — METAR real-time airport observations
       nws_point.py           — NWS point forecast
       ndfd_nbm.py            — National Blend of Models
       hrrr.py                — HRRR (high-res rapid refresh)
       madis.py                — MADIS mesonet
       afd.py                  — Area Forecast Discussion
-      economics_fred.py      — FRED
-      economics_bls.py       — BLS
-      economics_clevfed.py   — Cleveland Fed
+      economics.py           — FRED + BLS + Cleveland Fed (consolidated)
       fedwatch.py            — CME FedWatch implied rate probabilities
+      zq_futures.py          — Yahoo ZQ fed-funds futures → meeting probabilities
+      _fomc_calendar.py      — Shared FOMC meeting calendar (fedwatch + zq_futures)
       adp_nfp.py             — ADP private payrolls
       gdpnow.py              — Atlanta Fed GDPNow
       commodity_futures.py   — CME / ICE futures
@@ -94,31 +102,50 @@ bot/
       llm.py                 — GPT-4o-mini (fallback only)
   learning/
     adaptive_weights.py    — Bayesian source weight evolution
-    calibration.py         — Probability bucket bias correction (Platt, in Phase 1)
+    calibration.py         — Platt/isotonic probability calibration (fit per cycle)
     active_feedback.py     — Synthesize learning into edge threshold + source gating
     bandit.py              — Exit decision bandit over graduated health bands
     category_scoring.py    — Per-family score aggregation
     timing_patterns.py     — Hour-of-day / time-to-expiry edge patterns
     postmortems.py         — Loss classification tagger
+    edge_convergence.py    — Did our estimate beat market mid over time? (Phase 0 gate leg 2)
+    alpha_log.py           — Atomic decision-time logger → alpha_backtest
+    populate_from_alpha.py — Cascade settled alpha_backtest rows into learning tables
+    directional_shadow.py  — Pre-trade gate for DRY_RUN directional evaluator
+    shadow_testing.py      — Shadow-mode evaluator plumbing (weather MM, directional)
+    shadow_promotion.py    — Shadow-vs-live P&L delta tracking
+    mm_promotion.py        — Graduated shadow→canary→full family promotion gate
+    bakeoff.py             — Competing-strategy bake-off evaluator
+    self_modifier.py       — Persists tuned hyperparameters to learned_config
   scoring/
     market_scorer.py       — score_market, strategy-specific scoring
     filters.py             — Pre-scan filters (volume, spread, age, blocklist)
+    four_factor.py         — Four-factor composite score (edge, confidence, liquidity, risk)
   arbitrage/
     bracket_arb.py         — Intra-series bracket arb
     correlation_arb.py     — Cross-market correlation arb
   observability/
     alerts.py              — Telegram notifications
+    cost_tracker.py        — Per-source API cost / latency accounting
 deploy/
   04_redeploy.sh              — Sync .py + bot/ + tests/ + .env to VPS, full import-check battery
   05_deploy_weather_daemon.sh — Daemon-specific deploy + systemd unit install
   kalshi-daemon.service       — systemd unit for persistent daemon (Restart=always)
   kalshi-weather-daemon.service — legacy weather-only daemon unit
 tests/
-  daemon/                — cycle_runner, scheduler, poller_base, smart_gates_trajectory
+  daemon/                — cycle_runner, scheduler, poller_base, smart_gates_trajectory,
+                            dispatcher, requote_triggers, writer_ownership, station_registry,
+                            forecast_cache, weather_handler, integration_{cadence,row_shape}
   signals/               — source + ensemble + routing coverage
+                            (adp_nfp, commodity_futures, ensemble_family_routing,
+                             family_routers, gdpnow, new_weather_sources, weather_ensemble)
   bot/                   — api_concurrency, db_wal
   test_{weather_daemon,weather_quoter,smart_gates,money,fee_calc,fedwatch_parser,
-        positions,settlement_certainty,db_schema}.py
+        positions,settlement_certainty,db_schema,exposure,sizing,exit_model,
+        alpha_log,calibration,directional_shadow,populate_from_alpha,
+        position_health_backfill,mm_promotion,shadow_promotion,bakeoff,
+        backtest_comprehensive,weather_direction,config_no_drift,db_discipline,
+        client_order_id_coverage,no_secrets_in_repo,writer_ownership}.py
 backtest_comprehensive.py — 12-section per-family Brier / calibration / alpha analysis
 reports/                 — Committed backtest and phase-gate reports
 ```
@@ -127,15 +154,27 @@ reports/                 — Committed backtest and phase-gate reports
 
 `CycleRunner.run_once()` → `trade.main(conn=shared, close_conn=False)`:
 
-1. `compute_dynamic_sizing()` — scale MM params to total equity
-2. `prune_stale_orders()` + `track_fills()` — housekeeping
-3. `record_settlements()` — check for settled markets, record P&L, trigger learning updates
-4. `manage_positions()` — graduated health-score exit with synthetic sell
-5. Adaptive learning: source weights, calibration buckets, postmortems, edge convergence, timing patterns
-6. Active feedback: disable bad sources/hours, adjust edge thresholds
-7. `get_independent_estimate()` on candidate tickers — ensemble of 15+ sources → fair value
-8. Directional evaluator (currently DRY_RUN; Phase 1 will log to `alpha_backtest`)
-9. MM quoting (currently no-op — weather blocked, no non-weather series targeted)
+1. `compute_current_phase()` + `apply_phase_limits()` — track-record-driven sizing envelope (PHASE_CONFIG 1–5)
+2. `compute_dynamic_sizing()` — scale MM/exit thresholds to total equity
+3. `prune_stale_orders()` + `track_fills()` + `record_settlements()` — housekeeping + P&L
+4. `_alpha_populate_all()` — cascade newly-settled `alpha_backtest` rows into `calibration` / `timing_patterns` / `edge_convergence` / `postmortems`
+5. `manage_positions()` — graduated health-score exit with synthetic sell (sole exit path)
+6. `compute_avoid_filters()` — loss-pattern avoidance filters
+7. Adaptive learning: `compute_adaptive_weights`, `_cal_fit_and_persist` (Platt, persisted to `kv_cache`), `compute_category_edge_thresholds`
+8. Advanced learning: `run_loss_postmortems`, `check_edge_convergence`, `record_timing_data`, `analyze_shadow_performance`
+9. `compute_active_feedback()` — disable bad sources/hours, adjust `MIN_EDGE` via multiplier
+10. Portfolio balance + check_limits (halt if over caps)
+11. Scan markets (paginated `/markets?status=open`), filter parlays
+12. `score_market()` per candidate → ensemble estimate + strategy selection
+13. Correlation limits (`MAX_PER_CATEGORY`), per-family + per-expiry exposure caps (`bot/core/exposure.py`)
+14. Per-family graduated sizing multiplier (shadow=0 / canary=0.5 / full=1.0 from `mm_promotion`)
+15. `_eval_directional_shadow()` — block-list + kelly-zero + below-edge gate → logs to `alpha_backtest`
+16. Order book depth check + Kelly-by-market sizing → place order (DRY_RUN respects phase)
+
+No MM quoting path in `trade.main` — legacy MM code was deleted; weather MM runs entirely
+event-driven through `WeatherQuoter` on the METAR poller thread. `mm_inventory` may still
+hold pre-deletion positions that settle naturally; their carry value is subtracted from the
+directional exposure budget.
 
 ### Event-driven path (between cycles)
 
@@ -163,22 +202,22 @@ All MM and exit thresholds scale with total equity (balance + portfolio value):
 
 ## Synthetic Sell
 
-All exit paths (`manage_positions`, QA auto-liquidation, `mm_liquidate_expiring`) use **buy-opposite-side** instead of sell-same-side. Saves ~1.3¢/contract (taker → maker fee). Exiting a YES position = buy NO (limit, maker fee ~0.44¢) instead of sell YES (taker fee ~1.75¢).
+The single exit path (`manage_positions`) uses **buy-opposite-side** instead of sell-same-side. Saves ~1.3¢/contract (taker → maker fee). Exiting a YES position = buy NO (limit, maker fee ~0.44¢) instead of sell YES (taker fee ~1.75¢).
+
+Legacy exit paths `QA auto-liquidation` and `mm_liquidate_expiring` were removed during the daemon refactor — they no longer exist. All exits now flow through `manage_positions`.
 
 ## Graduated Position Exits
 
-Health score 0–1 (edge 40%, trend 20%, time 15%, P&L 15%, confidence 10%):
+`manage_positions` is the sole exit policy. Health score 0–1 (edge 40%, trend 20%, time 15%, P&L 15%, confidence 10%):
 - ≥0.65: HOLD
 - 0.45–0.65: Trim 25–33%
 - 0.30–0.45: Exit 50%
 - 0.15–0.30: Exit 75%
 - <0.15: Full exit
 
+Edge-decay and time-based backstops fire within the same function (`edge_flipped`, `edge_decayed`, `time_exit`). Every exit sets an `exit_reason` string which is logged to `position_exits` for bandit training, and posts orders tagged with `client_order_id` prefix `mm_exit_` for the T3 fills-ledger source tagger.
+
 Edge trend tracked in `kv_cache` (last 10 readings across cycles). Exit decisions logged to `position_health_log` for bandit training.
-
-## MM QA Auto-Liquidation
-
-QA loop checks inventory against fresh ensemble each cycle. Tracks consecutive flags per ticker in `kv_cache`. After 3 flags AND >10¢ loss magnitude → auto-liquidate via synthetic sell.
 
 ## Critical Conventions
 
@@ -195,10 +234,17 @@ Settlement P&L:
 - **Bracket (-B suffix):** Mutually exclusive outcomes. Probability = `CDF(upper) − CDF(lower)`, NOT simple above/below.
 - **Threshold (-T suffix):** Simple above/below probability. NOT mutually exclusive.
 
-### `fair_value_cents` is per-order-side
-- A YES order at `fv=85` means P(YES)=85%
-- A NO order at `fv=85` means P(NO)=85% ≡ P(YES)=15%
-- Any cross-order aggregation MUST normalize: `CASE WHEN side='yes' THEN fv ELSE 100-fv END`. Failure to do this produced a backtest that inverted probabilities (Brier 0.50) before the Apr 17 fix.
+### `mm_orders.fair_value_cents` stores P(YES), *not* per-order-side
+The now-deleted MM writer (`mm_post_quotes`) stored the **same** `fair_value_cents` value on both the YES and NO sides of a pair (empirically verified on the Apr 17 live DB: `KXFED-27APR-T2.00` YES fv=69 price=61, NO fv=69 price=25). The sum of prices (61+25=86) proves prices were correct; storage was simply P(YES) for both rows.
+
+CLAUDE.md previously described a "per-order-side" convention that the code never implemented — that was aspirational. The v1 Apr 17 backtest (Brier 0.50) was broken because it assumed per-side storage. The v2 fix normalizes by reading `CASE WHEN side='yes' THEN fv ELSE 100-fv END` — this turns the buggy-but-consistent P(YES) storage into correct per-side values on read.
+
+Rules for any future code:
+- **Readers** aggregating across mixed YES/NO rows MUST apply `CASE WHEN side='yes' THEN fv ELSE 100-fv END`.
+- **New writers** should continue storing P(YES) regardless of side, to preserve compatibility with existing data. Or introduce a new column with a clearly-documented convention — don't silently change the semantics of `fair_value_cents`.
+
+### `opportunity_log.ensemble_prob` *is* P(our-side)
+Different convention from `mm_orders.fair_value_cents` — this one is genuinely per-order-side. `score_market` computes `indep_prob = ensemble_prob if side=='yes' else (1 - ensemble_prob)` before logging. So reads can use `ensemble_prob` directly, or flip back to P(YES) via `CASE WHEN side='yes' THEN ensemble_prob ELSE 1 - ensemble_prob END`.
 
 ### client_order_id
 Must start with `mm_` and must NOT contain periods (Kalshi rejects). Use `.replace('.', '_')` for decimal tickers.
@@ -206,37 +252,37 @@ Must start with `mm_` and must NOT contain periods (Kalshi rejects). Use `.repla
 ### Fixed-Point Parsing
 Kalshi returns `*_fp` and `*_dollars` as strings. Always `round(float(...))`, never `int(float(...))` — off-by-one from floating point otherwise.
 
-### `ensemble_prob` in `opportunity_log`
-Stored as P(our-side), not P(YES). Same normalization rule as `fair_value_cents` applies.
-
 ## Data Sources (Ensemble)
 
 20+ sources, weighted and averaged in `bot/signals/ensemble.py`. `SOURCE_WEIGHTS` in `bot/config.py`. Correlated sources count as ~1 effective source, not N. Edge threshold scales with effective independent count: 3+ → 5%, 2 → 7%, 1 → 10–12%.
 
 | Source | Weight | Category | Notes |
 |--------|--------|----------|-------|
-| METAR observations | 0.90 | Weather | Real-time airport station data, highest weather weight |
+| Weather ensemble (router) | 0.95 | Weather | Combined router output; dominates when present |
+| METAR observations | 0.90 | Weather | Real-time airport station data, highest single-source weather weight |
 | Odds API | 0.85 | Sports | |
+| HRRR | 0.85 | Weather | High-res short-range (tightest sigma) |
+| ZQ futures | 0.85 | Economics | Yahoo 30-day fed funds futures → meeting probabilities |
 | Tomorrow.io | 0.82 | Weather | 7-day reliable horizon |
 | Open-Meteo | 0.80 | Weather | Correlated with Tomorrow.io |
 | FedWatch | 0.80 | Economics | FRED-based synthetic probabilities |
+| NBM | 0.80 | Weather | NOAA National Blend of Models |
+| ADP/NFP | 0.80 | Economics | ADP 2-day lead on BLS NFP |
 | NWS Point | 0.78 | Weather | Official US forecast |
-| NBM | 0.77 | Weather | National Blend of Models |
+| GDPNow | 0.78 | Economics | Atlanta Fed nowcast |
 | Polymarket | 0.75 | Prediction | Correlated with Metaculus |
-| NOAA | 0.75 | Weather | Correlated with weather group |
+| NOAA alerts | 0.75 | Weather | Correlated with weather group |
 | Series | 0.75 | Structural | Intra-series CDF |
 | Cleveland Fed | 0.72 | Economics | |
-| HRRR | 0.72 | Weather | High-res short-range |
 | Metaculus | 0.70 | Prediction | |
-| MADIS | 0.68 | Weather | Mesonet network |
 | Crypto (CoinGecko+Deribit) | 0.65 | Crypto | **Blocked for directional — Brier 0.76–0.94** |
 | Company KPI | 0.65 | Company | |
-| GDPNow | 0.60 | Economics | Atlanta Fed nowcast |
-| ADP/NFP | 0.58 | Economics | |
+| MADIS | 0.60 | Weather | Mesonet/citizen stations, noisier |
 | SensorTower | 0.55 | Company | |
-| Commodity Futures | 0.55 | Commodity | CME/ICE |
+| Commodity Futures | 0.55 | Commodity | CME/ICE → CPI transmission |
 | FRED | 0.50 | Economics | Correlated with BLS |
 | BLS | 0.50 | Economics | Correlated with FRED |
+| AFD | 0.50 | Weather | Forecaster discussion text |
 | Finnhub | 0.30 | News | |
 | Momentum | 0.15 | Structural | Endogenous — not counted as real source for MM |
 | LLM (GPT-4o-mini) | 0.15 | Fallback | Lowest weight |
@@ -248,22 +294,44 @@ Pre-daemon, weather MM required fresh (<10 min) METAR to quote. Phase 1's event-
 
 ## Database Schema (key tables)
 
-- `mm_orders` — all MM orders (ticker, side, price, contracts, order_id, status, fill_qty, fair_value_cents *per-order-side*)
-- `mm_inventory` — current position per ticker
-- `mm_processed_fills` — deduplicated fills with fee_cents
-- `settlements` — settled market outcomes with P&L
+Core trading:
 - `trades` — directional trade records
-- `kv_cache` — persistent key-value with TTL
-- `mm_sessions` — per-cycle stats
-- `opportunity_log` — decision-time snapshot per quoted ticker (ensemble_prob is P(our-side))
-- `position_health_log` — health scores for bandit learning
+- `settlements` — settled market outcomes with P&L
+- `sessions` — per-cycle supervisor stats (balance, scanned, halts)
 - `position_exits` — exit orders with entry/exit prices and reason
-- `pipeline_health` — per-cycle source health counters
+- `position_health_log` — health scores for bandit learning (back-filled with settlement result on resolve)
+- `kv_cache` — persistent key-value with TTL (Platt curve, edge-trend series, pipeline stats)
+- `learned_config` — self-tuned hyperparameters persisted by `bot/learning/self_modifier.py`
+
+Market making (mostly legacy — MM writer deleted; `weather_mm_shadow` is the active MM table):
+- `mm_orders` — pre-deletion MM orders (ticker, side, price, fair_value_cents; see Conventions — stores P(YES))
+- `mm_inventory` — residual position per ticker (drains naturally)
+- `mm_processed_fills` — deduplicated fills with fee_cents
+- `mm_sessions` — per-cycle stats
+
+Decision logs:
+- `opportunity_log` — every candidate seen per cycle, traded and rejected (ensemble_prob is P(our-side))
+- `decision_log` — full audit trail (source estimates, four-factor scores, regime, feedback)
 - `strategy_journal` — decision log with accept/discard reasons
+- `alpha_backtest` — atomic decision-time log for Phase 0 gate leg 2 (MM quote, directional shadow/live, weather shadow) with settlement back-fill
+- `weather_mm_shadow` — every quote `WeatherQuoter` would have posted (FV, bid/ask, gate decision, METAR context) — joined to `settlements` for shadow-to-live P&L
+
+Learning loop:
+- `calibration` — Platt/isotonic correction fit from settled outcomes (populated each cycle)
+- `timing_patterns` — hour-of-day / day-of-week edge patterns (populated each cycle)
+- `edge_convergence` — did our estimate beat market mid? (Phase 0 gate leg 2)
 - `loss_postmortems` — tagged loss attributions
-- `calibration` — Platt/isotonic correction fit from settled outcomes (**populated in Phase 1**)
-- `timing_patterns`, `edge_convergence`, `hyperparam_shadow` — **populated in Phase 1**
-- `alpha_backtest` — atomic decision log for Phase 0 gate leg 2 (**added in Phase 1**)
+- `hyperparam_shadow` — actual-vs-alternative hyperparameter P&L
+- `pipeline_health` — per-cycle source health counters
+- `weather_source_weights` — per-series Bayesian weights for weather sub-ensemble
+- `weather_forecast_snapshots` — per-source component estimates for post-hoc calibration
+
+Promotion / tuning:
+- `promotion_events` — shadow→canary→full state transitions with metrics at decision time
+- `threshold_proposals` — weekly tuner-proposed threshold changes (audit log)
+
+T3 canonical fills:
+- `fills_ledger` — append-only, Kalshi-`trade_id`-keyed fill ledger (see [reports/T3_FILLS_LEDGER_SCOPING.md](reports/T3_FILLS_LEDGER_SCOPING.md)). In progress.
 
 ## Deploy
 
@@ -279,8 +347,18 @@ Rsyncs `.py`, `bot/`, `tests/`, and `.env` to VPS, runs the full daemon-module i
 KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH
 FRED_API_KEY, BLS_API_KEY, BEA_API_KEY, CENSUS_API_KEY, EIA_API_KEY, TOMORROW_API_KEY
 MM_MIN_VOLUME=25
-SC_ENABLED=false         # Safe Compounder (Phase 4sc)
-WEATHER_MM_LIVE=false    # Phase 1 shadow-to-live gate (flip only after shadow data proves out)
+SC_ENABLED=true                   # Safe Compounder (Phase 4sc). Default ON; only live if phase + DRY_RUN allow.
+WEATHER_MM_LIVE=false             # Phase 1 shadow-to-live gate (flip only after shadow data proves out)
+FORCE_PHASE=                      # override PHASE_CONFIG track-record gate (empty = auto)
+DIRECTIONAL_BLOCKLIST=KXBTC,KXETH,KXHIGHDEN   # families blocked for directional entry
+MAX_PORTFOLIO_EXPOSURE_RATIO=0.50 # global exposure throttle (directional + SC + legacy MM)
+MAX_FAMILY_EXPOSURE_RATIO=0.25    # per-family cap as fraction of equity
+MAX_EXPIRY_EXPOSURE_RATIO=0.075   # per-settlement-date cap (e.g. one FOMC day)
+EXIT_EDGE_DECAY_RATIO=0.33        # exit when remaining_edge < entry_edge × this
+EXIT_TIME_BACKSTOP_HOURS=0.25     # near-expiry window for edge-below-threshold exit
+EXIT_TIME_BACKSTOP_EDGE_ABS=0.02  # |remaining_edge| threshold inside that window
+EXIT_STALE_HOLD_HOURS=24.0        # stale-hold backstop (flat-or-deteriorating)
+MM_SIZING_TARGET_EDGE_CENTS=2.0   # target realized-per-fill cents for full-size quoting
 ```
 
 RSA key for Kalshi API auth: `.kalshi_private_key.pem` (gitignored; MUST NOT be committed).
@@ -292,16 +370,16 @@ Fixed; re-check on every touch of the relevant code:
 1. `client_order_id` containing periods → 400 Bad Request
 2. `_apply_trade()` short-close P&L using `(100 − avg_entry) − price` instead of `avg_entry − price`
 3. `record_settlements()` not subtracting `fee_cost`, or `won = revenue > 0` instead of `profit > 0`
-4. `mm_liquidate_expiring()` zeroing inventory without confirmed settlement
+4. Any exit path zeroing inventory without confirmed settlement (original offender `mm_liquidate_expiring()` was removed; watch for recurrence in `manage_positions` or future exit policies)
 5. Fixed-point parsing with `int(float(...))` instead of `round(float(...))`
 6. `cancel_failed` orders excluded from exposure headroom
 7. Resting order exposure query silently swallowing exceptions (fail closed instead)
 8. Tomorrow.io forecasts beyond 7-day reliable horizon
 9. Correlated sources (weather+weather, FRED+BLS) counted as fully independent
 10. MM spread not checked against expected maker fees
-11. Settlement path in `mm_liquidate_expiring()` not subtracting fees
+11. Any exit/settlement path not subtracting fees (original offender `mm_liquidate_expiring()` was removed; watch in `manage_positions` and `record_settlements`)
 12. Cache isolation: `trade.py._CACHE` vs `bot.api._CACHE` (daemon now shares a DB-backed cache where possible)
-13. `fair_value_cents` / `ensemble_prob` aggregated without per-side normalization (caused the Apr 17 v1 backtest inversion)
+13. `mm_orders.fair_value_cents` aggregated assuming per-side storage when it's actually P(YES) on both rows (caused the Apr 17 v1 backtest inversion). `opportunity_log.ensemble_prob` has the opposite convention (per-side) — check Conventions section before aggregating either.
 14. Daemon pollers writing to SQLite without holding `DB_WRITE_LOCK` (causes `database is locked` under contention)
 15. Any code path assuming the DB connection is process-local — daemon shares one connection across threads
 
@@ -328,16 +406,17 @@ Fixed; re-check on every touch of the relevant code:
 - **Directional:** DRY_RUN throughout
 - **Root cause of losses:** MM structure held through directional moves; favorable markout never converted to P&L. Not a signal problem.
 
-## Phase 1 Work (in flight)
+## Phase 1 Work
 
 1. ✅ `bot/daemon/` architecture committed (checkpoint `04ca78f`)
-2. `alpha_backtest` table + atomic decision-time logging
-3. Settlement-driven learning population: `calibration`, `timing_patterns`, `edge_convergence`, `position_health_log`, `postmortems`
-4. Platt/isotonic correction from `calibration` wired into `get_independent_estimate()`
-5. `METARPoller.on_result` → `WeatherQuoter.handle_temp_change()` in shadow mode
-6. Directional shadow evaluator (DRY_RUN, logs to `alpha_backtest`, blocks KXBTC/KXETH/KXHIGHDEN)
-7. Deploy pipeline swap: `kalshi-bot.timer` oneshot → `kalshi-daemon.service` persistent
-8. Shadow-to-live gate: `WEATHER_MM_LIVE=true` only after N shadow settlements prove positive-EV
+2. ✅ `alpha_backtest` table + atomic decision-time logging (`bot/learning/alpha_log.py`)
+3. ✅ Settlement-driven learning population: `calibration`, `timing_patterns`, `edge_convergence`, `position_health_log`, `postmortems` (`_alpha_populate_all` called per cycle; settlement back-fill in `record_settlements`)
+4. ✅ Platt correction fit per cycle from `calibration`, persisted to `kv_cache`, read by ensemble (`_cal_fit_and_persist`)
+5. ✅ `METARPoller` → `WeatherChangeHandler` → `WeatherQuoter.handle_temp_change()` (`bot/daemon/weather_handler.py`)
+6. ✅ Directional shadow evaluator (DRY_RUN, logs to `alpha_backtest`, blocks KXBTC/KXETH/KXHIGHDEN via `DIRECTIONAL_BLOCKLIST`)
+7. ✅ Deploy pipeline swap: `kalshi-bot.timer` oneshot → `kalshi-daemon.service` persistent (`deploy/04_redeploy.sh`)
+8. 🚧 Shadow-to-live gate: graduated shadow→canary→full promotion per family (`bot/learning/mm_promotion.py`, `promotion_events` table). `WEATHER_MM_LIVE` still gates any live posting.
+9. 🚧 T3 canonical fills ledger — scoping at [reports/T3_FILLS_LEDGER_SCOPING.md](reports/T3_FILLS_LEDGER_SCOPING.md); schema + writer landed, consumers still being migrated.
 
 ## Future Work (post-Phase-1)
 
