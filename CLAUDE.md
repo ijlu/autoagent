@@ -117,6 +117,7 @@ bot/
     mm_promotion.py        — Graduated shadow→canary→full family promotion gate
     bakeoff.py             — Competing-strategy bake-off evaluator
     self_modifier.py       — Persists tuned hyperparameters to learned_config
+    fills_validator.py     — T3.1 dual-run validator (fills_ledger vs mm_processed_fills)
   scoring/
     market_scorer.py       — score_market, strategy-specific scoring
     filters.py             — Pre-scan filters (volume, spread, age, blocklist)
@@ -416,7 +417,7 @@ Fixed; re-check on every touch of the relevant code:
 6. ✅ Directional shadow evaluator (DRY_RUN, logs to `alpha_backtest`, blocks KXBTC/KXETH/KXHIGHDEN via `DIRECTIONAL_BLOCKLIST`)
 7. ✅ Deploy pipeline swap: `kalshi-bot.timer` oneshot → `kalshi-daemon.service` persistent (`deploy/04_redeploy.sh`)
 8. 🚧 Shadow-to-live gate: graduated shadow→canary→full promotion per family (`bot/learning/mm_promotion.py`, `promotion_events` table). `WEATHER_MM_LIVE` still gates any live posting.
-9. 🚧 T3 canonical fills ledger — scoping at [reports/T3_FILLS_LEDGER_SCOPING.md](reports/T3_FILLS_LEDGER_SCOPING.md); schema + writer landed, consumers still being migrated.
+9. 🚧 T3 canonical fills ledger — scoping at [reports/T3_FILLS_LEDGER_SCOPING.md](reports/T3_FILLS_LEDGER_SCOPING.md). **T3.1 complete (2026-04-21)**: `fills_ledger` schema, `FillsWriter` (`bot/daemon/fills_writer.py` — `ingest_page` + `sync_since`), `fills_sync` @60s + `fills_validator` @24h scheduler tasks in `bot/daemon/main.py`, writer-ownership registry entry, dual-run validator (`bot/learning/fills_validator.py`) with `is_meaningful` gating for the steady-state one-sided case, T0.2 write-discipline via `db_write_ctx()`. **T3.3 complete (2026-04-21)**: reader migration — `bot/signals/regime.py` and `backtest_comprehensive.py` read from `fills_ledger`; `annotate_shadow_pnl` joins `fills_ledger` at settlement to populate `weather_mm_shadow.live_pnl_cents`, which is what `evaluate_mm_graduation`'s `live_pnl_cents IS NOT NULL` filter requires (without this, CANARY was a terminal state). T3.4 `trade.py` fills-write freeze still pending.
 
 ## Future Work (post-Phase-1)
 
