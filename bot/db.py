@@ -5,10 +5,11 @@ Extracted from trade.py. This is the canonical source for all table schemas.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Callable, Iterator, Optional, TypeVar
 
 from bot.config import DB_PATH
 from bot.daemon.locks import DB_WRITE_LOCK
@@ -92,7 +93,18 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         health_score REAL, remaining_edge REAL, edge_trend REAL,
         action TEXT, exit_qty INTEGER,
         settlement_result TEXT DEFAULT NULL,
-        settlement_pnl_cents INTEGER DEFAULT NULL)""")
+        settlement_pnl_cents INTEGER DEFAULT NULL,
+        fresh_prob REAL DEFAULT NULL,
+        fresh_source_count INTEGER DEFAULT NULL,
+        entry_edge REAL DEFAULT NULL)""")
+    # Idempotent backfill for DBs created before these columns existed.
+    for _col, _type in (("fresh_prob", "REAL"),
+                         ("fresh_source_count", "INTEGER"),
+                         ("entry_edge", "REAL")):
+        try:
+            conn.execute(f"ALTER TABLE position_health_log ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass
 
     # ── Learning tables ──
     conn.execute("""CREATE TABLE IF NOT EXISTS calibration (
@@ -404,6 +416,64 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         "ON threshold_proposals(applied, ts_unix)"
     )
 
+    # ── T3.1: canonical fills ledger ──
+    # Append-only, Kalshi-owned primary key (trade_id). One row per Kalshi
+    # fill event. Every reader of "realized fill P&L" must read from here
+    # rather than deriving from mm_processed_fills/weather_mm_shadow/
+    # settlements. The scoping doc at reports/T3_FILLS_LEDGER_SCOPING.md
+    # has the full rationale.
+    #
+    # Schema decisions (see scoping doc §7 open questions):
+    #   Q6: ingested_ts_unix is first-write-only via INSERT OR IGNORE.
+    #   Q7: no cycle_id column — we don't have a producer today, and
+    #       weather-MM fills come from an event-driven path with no cycle.
+    #   Q4: source values are drawn from a closed set of client_order_id
+    #       prefix matches: mm_quote, safe_compounder, exit, directional,
+    #       legacy, manual. Never null, never "unknown".
+    conn.execute("""CREATE TABLE IF NOT EXISTS fills_ledger (
+        -- Identity (immutable, Kalshi-owned)
+        trade_id              TEXT    PRIMARY KEY,
+        order_id              TEXT    NOT NULL,
+        client_order_id       TEXT,
+        ticker                TEXT    NOT NULL,
+        series                TEXT    NOT NULL,
+        family                TEXT    NOT NULL,
+
+        -- Fill semantics
+        side                  TEXT    NOT NULL,
+        action                TEXT    NOT NULL,
+        contracts             INTEGER NOT NULL,
+        yes_price_cents       INTEGER NOT NULL,
+        no_price_cents        INTEGER NOT NULL,
+        is_taker              INTEGER NOT NULL,
+        fee_cents             INTEGER NOT NULL,
+
+        -- Time
+        fill_ts_iso           TEXT    NOT NULL,
+        fill_ts_unix          REAL    NOT NULL,
+        ingested_ts_unix      REAL    NOT NULL,
+
+        -- Write-time context (derived once, never updated)
+        live_mode             INTEGER NOT NULL,
+        source                TEXT    NOT NULL
+    )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_ticker_ts "
+        "ON fills_ledger(ticker, fill_ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_order_id "
+        "ON fills_ledger(order_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_series_ts "
+        "ON fills_ledger(series, fill_ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_family_ts "
+        "ON fills_ledger(family, fill_ts_unix)"
+    )
+
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
         ("trades", "action", "TEXT DEFAULT 'buy'"),
@@ -453,6 +523,13 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         ("weather_mm_shadow", "live_order_id_bid", "TEXT"),
         ("weather_mm_shadow", "live_order_id_ask", "TEXT"),
         ("weather_mm_shadow", "order_size", "INTEGER"),
+        # T1.2: trigger attribution. `metar_change` = METAR delta ≥1°F
+        # (legacy default), `time_decay` = sigma-shrink requote fired by
+        # TimeDecayDriver, `forecast_change` = Open-Meteo forecast high
+        # moved ≥1°F between refreshes. The step-9 shadow-to-live gate
+        # breaks P&L out by reason so we can measure whether added
+        # requotes earn edge or just burn fees.
+        ("weather_mm_shadow", "trigger_reason", "TEXT DEFAULT 'metar_change'"),
     ]
     for table, col, coltype in _migrations:
         try:
@@ -535,6 +612,34 @@ def db_write(fn: Callable[[sqlite3.Connection], _T], conn: Optional[sqlite3.Conn
             result = fn(c)
             c.commit()
             return result
+        except Exception:
+            c.rollback()
+            raise
+
+
+@contextlib.contextmanager
+def db_write_ctx(conn: Optional[sqlite3.Connection] = None) -> Iterator[sqlite3.Connection]:
+    """Context-manager form of db_write() — holds DB_WRITE_LOCK for the whole
+    `with` block, commits on clean exit, rolls back on exception.
+
+    Prefer this over bare `conn.execute(...); conn.commit()` pairs in any
+    daemon-shared connection context: two threads calling .execute() on the
+    same connection object concurrently is not safe in sqlite3, and the lock
+    must protect the full execute→commit region, not just the commit.
+
+    Example:
+        with db_write_ctx(conn):
+            conn.execute("INSERT INTO settlements ...", row)
+            conn.execute("UPDATE ... WHERE ...", params)
+        # commit happens at `with` exit
+    """
+    c = conn or _PERSIST_CONN
+    if c is None:
+        raise RuntimeError("Database not initialized — call init_db() first")
+    with DB_WRITE_LOCK:
+        try:
+            yield c
+            c.commit()
         except Exception:
             c.rollback()
             raise
