@@ -29,6 +29,120 @@ def family_from_ticker(ticker: str) -> str:
     return ticker if idx == -1 else ticker[:idx]
 
 
+def expiry_from_ticker(ticker: str) -> str:
+    """Extract the settlement-event key (family + expiry date, no strike).
+
+    Kalshi tickers: ``{FAMILY}-{EXPIRY}-{STRIKE}`` where STRIKE starts with
+    ``T`` (threshold) or ``B`` (bracket). Examples:
+        KXFED-27APR-T2.00        → KXFED-27APR
+        KXHIGHMIA-26APR18-B75    → KXHIGHMIA-26APR18
+        KXETH-26APR0917-B2150    → KXETH-26APR0917
+
+    Two strikes sharing this key settle on the same real-world event and
+    are near-perfectly correlated (one Fed decision moves all KXFED-27APR
+    strikes together). Family-level caps miss this because KXFED-27APR
+    and KXFED-26OCT are different bets, but family-cap treats them as one.
+
+    Returns ``""`` for empty input. Returns the full ticker if no
+    T/B-prefixed segment is found (degrades to family-level granularity).
+    """
+    if not ticker:
+        return ""
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return ticker
+    for i in range(1, len(parts)):
+        p = parts[i]
+        if p and p[0] in ("T", "B") and len(p) > 1 and (p[1].isdigit() or p[1] == "."):
+            return "-".join(parts[:i])
+    return ticker
+
+
+def compute_expiry_exposures(positions: Iterable[dict]) -> dict[str, int]:
+    """Bucket a list of Kalshi position dicts into {expiry_key: exposure_cents}.
+
+    Parallel to compute_family_exposures but keyed on settlement event.
+    Only non-zero positions contribute. Returns an empty dict on empty input.
+    """
+    out: dict[str, int] = {}
+    for pos in positions or []:
+        ticker = pos.get("ticker", "") or ""
+        if not ticker:
+            continue
+        key = expiry_from_ticker(ticker)
+        if not key:
+            continue
+        expo = _position_exposure_cents(pos)
+        if expo <= 0:
+            continue
+        out[key] = out.get(key, 0) + expo
+    return out
+
+
+def expiry_headroom_cents(
+    *,
+    expiry_key: str,
+    current_expiry_exposure_cents: int,
+    total_equity_cents: int,
+    max_expiry_ratio: float,
+) -> int:
+    """How many more cents we can put on this settlement event before cap.
+
+    Returns 0 if already at or over the cap. Negative-ratio or zero-equity
+    inputs clamp to 0 (safe-closed).
+    """
+    if max_expiry_ratio <= 0 or total_equity_cents <= 0:
+        return 0
+    cap = int(total_equity_cents * max_expiry_ratio)
+    return max(0, cap - max(0, current_expiry_exposure_cents))
+
+
+def size_trade_against_expiry_cap(
+    *,
+    ticker: str,
+    proposed_contracts: int,
+    price_cents: int,
+    expiry_exposures: dict[str, int],
+    total_equity_cents: int,
+    max_expiry_ratio: float,
+) -> tuple[int, Optional[str]]:
+    """Apply the per-settlement-event cap to a proposed trade.
+
+    Mirror of size_trade_against_family_cap, keyed on expiry instead of
+    family. Both caps compose: caller runs family cap first, then expiry
+    cap, and whichever binds tighter wins.
+
+    Returns ``(allowed_contracts, skip_reason)``:
+        - ``(proposed_contracts, None)`` when the trade fits
+        - ``(reduced_contracts, None)`` when scaled down with some fit
+        - ``(0, "expiry_cap_exhausted:<key>")`` when no contracts fit
+    """
+    if proposed_contracts <= 0 or price_cents <= 0:
+        return 0, "invalid_input"
+
+    key = expiry_from_ticker(ticker)
+    if not key:
+        return proposed_contracts, None
+
+    headroom = expiry_headroom_cents(
+        expiry_key=key,
+        current_expiry_exposure_cents=expiry_exposures.get(key, 0),
+        total_equity_cents=total_equity_cents,
+        max_expiry_ratio=max_expiry_ratio,
+    )
+    if headroom <= 0:
+        return 0, f"expiry_cap_exhausted:{key}"
+
+    order_cost = proposed_contracts * price_cents
+    if order_cost <= headroom:
+        return proposed_contracts, None
+
+    fitted = max(1, headroom // price_cents)
+    if fitted < 1:
+        return 0, f"expiry_cap_exhausted:{key}"
+    return fitted, None
+
+
 def _position_exposure_cents(pos: dict) -> int:
     """Cost basis for one Kalshi position row, in cents.
 

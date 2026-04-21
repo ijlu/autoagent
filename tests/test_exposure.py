@@ -17,9 +17,13 @@ import pytest
 
 from bot.core.exposure import (
     _position_exposure_cents,
+    compute_expiry_exposures,
     compute_family_exposures,
+    expiry_from_ticker,
+    expiry_headroom_cents,
     family_from_ticker,
     family_headroom_cents,
+    size_trade_against_expiry_cap,
     size_trade_against_family_cap,
 )
 
@@ -197,3 +201,147 @@ class TestSizeTradeAgainstFamilyCap:
         n, skip = size_trade_against_family_cap(**self._args(ticker=""))
         assert n == 10
         assert skip is None
+
+
+class TestExpiryFromTicker:
+    def test_strips_strike_segment(self):
+        assert expiry_from_ticker("KXFED-27APR-T0.25") == "KXFED-27APR"
+        assert expiry_from_ticker("KXFED-27APR-T2.00") == "KXFED-27APR"
+        assert expiry_from_ticker("KXHIGHMIA-26APR18-T75") == "KXHIGHMIA-26APR18"
+        assert expiry_from_ticker("KXHIGHMIA-26APR18-B75.5") == "KXHIGHMIA-26APR18"
+
+    def test_handles_extra_hyphens_in_ticker(self):
+        assert expiry_from_ticker("KXETH-26APR0917-B2150") == "KXETH-26APR0917"
+
+    def test_no_strike_returns_full_ticker(self):
+        assert expiry_from_ticker("KXWEIRD") == "KXWEIRD"
+        assert expiry_from_ticker("KXWEIRD-NOSTRIKE") == "KXWEIRD-NOSTRIKE"
+
+    def test_empty_returns_empty(self):
+        assert expiry_from_ticker("") == ""
+
+
+class TestComputeExpiryExposures:
+    def test_buckets_by_expiry_key(self):
+        # Two strikes on 27APR aggregate; 26OCT is separate.
+        positions = [
+            {"ticker": "KXFED-27APR-T2.00", "position": 10, "average_price_paid": 50},
+            {"ticker": "KXFED-27APR-T2.25", "position": 20, "average_price_paid": 60},
+            {"ticker": "KXFED-26OCT-T3.00", "position": 5, "average_price_paid": 40},
+        ]
+        exp = compute_expiry_exposures(positions)
+        assert exp["KXFED-27APR"] == 500 + 1200
+        assert exp["KXFED-26OCT"] == 200
+
+    def test_separates_same_family_different_dates(self):
+        """The whole point: KXFED-27APR and KXFED-26OCT settle separately."""
+        positions = [
+            {"ticker": "KXFED-27APR-T1.00", "position": 10, "average_price_paid": 80},
+            {"ticker": "KXFED-26OCT-T1.00", "position": 10, "average_price_paid": 60},
+        ]
+        exp = compute_expiry_exposures(positions)
+        assert "KXFED-27APR" in exp
+        assert "KXFED-26OCT" in exp
+        assert exp["KXFED-27APR"] != exp["KXFED-26OCT"]
+
+    def test_empty_input(self):
+        assert compute_expiry_exposures([]) == {}
+        assert compute_expiry_exposures(None) == {}  # type: ignore[arg-type]
+
+
+class TestExpiryHeadroom:
+    def test_headroom_is_cap_minus_current(self):
+        # 7.5% of $1000 = $75 = 7_500 cents
+        h = expiry_headroom_cents(
+            expiry_key="KXFED-27APR", current_expiry_exposure_cents=3_000,
+            total_equity_cents=100_000, max_expiry_ratio=0.075,
+        )
+        assert h == 4_500
+
+    def test_headroom_zero_when_over_cap(self):
+        h = expiry_headroom_cents(
+            expiry_key="KXFED-27APR", current_expiry_exposure_cents=10_000,
+            total_equity_cents=100_000, max_expiry_ratio=0.075,
+        )
+        assert h == 0
+
+    def test_safe_closed_on_bad_ratio_or_equity(self):
+        assert expiry_headroom_cents(
+            expiry_key="KXFED-27APR", current_expiry_exposure_cents=0,
+            total_equity_cents=100_000, max_expiry_ratio=0,
+        ) == 0
+        assert expiry_headroom_cents(
+            expiry_key="KXFED-27APR", current_expiry_exposure_cents=0,
+            total_equity_cents=0, max_expiry_ratio=0.075,
+        ) == 0
+
+
+class TestSizeTradeAgainstExpiryCap:
+    def _args(self, **kw):
+        base = dict(
+            ticker="KXFED-27APR-T2.00",
+            proposed_contracts=10,
+            price_cents=50,
+            expiry_exposures={},
+            total_equity_cents=100_000,
+            max_expiry_ratio=0.075,
+        )
+        base.update(kw)
+        return base
+
+    def test_trade_fits_untouched(self):
+        n, skip = size_trade_against_expiry_cap(**self._args())
+        assert n == 10
+        assert skip is None
+
+    def test_reduces_when_partial_headroom(self):
+        # cap = 7500c, existing KXFED-27APR = 7000c → headroom 500c
+        # proposed 40 @ 50c = 2000c > 500c → reduce to 500/50=10
+        n, skip = size_trade_against_expiry_cap(
+            **self._args(
+                expiry_exposures={"KXFED-27APR": 7_000},
+                proposed_contracts=40,
+            )
+        )
+        assert n == 10
+        assert skip is None
+
+    def test_rejects_when_cap_exhausted(self):
+        n, skip = size_trade_against_expiry_cap(
+            **self._args(expiry_exposures={"KXFED-27APR": 7_500})
+        )
+        assert n == 0
+        assert skip == "expiry_cap_exhausted:KXFED-27APR"
+
+    def test_different_expiries_do_not_cross_contaminate(self):
+        # 27APR is full, trading 26OCT on same family should be unaffected
+        n, skip = size_trade_against_expiry_cap(
+            **self._args(
+                ticker="KXFED-26OCT-T3.00",
+                expiry_exposures={"KXFED-27APR": 7_500},
+            )
+        )
+        assert n == 10
+        assert skip is None
+
+    def test_within_cycle_accumulation_is_on_caller(self):
+        exposures = {"KXFED-27APR": 0}
+        n1, skip1 = size_trade_against_expiry_cap(
+            **self._args(expiry_exposures=exposures, proposed_contracts=100)
+        )
+        # 100 @ 50c = 5000c, cap 7500c → fits
+        assert n1 == 100 and skip1 is None
+        exposures["KXFED-27APR"] += n1 * 50
+
+        # Second trade: 100 @ 50c = 5000c, only 2500c left
+        n2, skip2 = size_trade_against_expiry_cap(
+            **self._args(expiry_exposures=exposures, proposed_contracts=100)
+        )
+        assert n2 == 50  # 2500 / 50
+        assert skip2 is None
+
+    def test_invalid_input_returns_zero(self):
+        n, skip = size_trade_against_expiry_cap(**self._args(proposed_contracts=0))
+        assert n == 0 and skip == "invalid_input"
+        n, skip = size_trade_against_expiry_cap(**self._args(price_cents=0))
+        assert n == 0 and skip == "invalid_input"
