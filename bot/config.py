@@ -96,6 +96,88 @@ MAX_PORTFOLIO_EXPOSURE_RATIO = float(os.environ.get("MAX_PORTFOLIO_EXPOSURE_RATI
 # touching per-market Kelly sizing on uncorrelated bets.
 MAX_FAMILY_EXPOSURE_RATIO = float(os.environ.get("MAX_FAMILY_EXPOSURE_RATIO", "0.25"))
 
+# Per-settlement-event cap. Every KXFED-27APR-T* strike resolves on the
+# same FOMC date (55 brackets, one risk). Family-cap pools KXFED-27APR
+# with KXFED-26OCT — a 7.5% per-expiry cap separates them so one surprise
+# decision can't compound. Apr 17 diagnostic: 27APR was at 9.1% equity.
+MAX_EXPIRY_EXPOSURE_RATIO = float(os.environ.get("MAX_EXPIRY_EXPOSURE_RATIO", "0.075"))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Directional exit model (edge-decay anchor + backstops)
+# ══════════════════════════════════════════════════════════════════════════════
+# Exit when remaining_edge drops below entry_edge × this ratio. 0.33 holds
+# positions with ≥⅓ of original edge. Lower = more patient; higher = exits
+# sooner as edge erodes. See bot/core/exit_model.py for the evaluator.
+EXIT_EDGE_DECAY_RATIO = float(os.environ.get("EXIT_EDGE_DECAY_RATIO", "0.33"))
+
+# Near-expiry + no-conviction backstop. Window (hours) inside which we exit
+# if |remaining_edge| is below the edge threshold. Handles "ensemble froze,
+# signal never updated as info arrived."
+EXIT_TIME_BACKSTOP_HOURS = float(os.environ.get("EXIT_TIME_BACKSTOP_HOURS", "0.25"))
+EXIT_TIME_BACKSTOP_EDGE_ABS = float(os.environ.get("EXIT_TIME_BACKSTOP_EDGE_ABS", "0.02"))
+
+# Stale-hold backstop. Hours held after which a flat-or-deteriorating
+# position gets closed even if edge technically remains. Catches positions
+# stuck in a frozen-ensemble regime.
+EXIT_STALE_HOLD_HOURS = float(os.environ.get("EXIT_STALE_HOLD_HOURS", "24.0"))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MM Thompson-sampled sizing (replaces SHADOW/CANARY/FULL step gate)
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-fill P&L (cents, net of maker fees) that maps to the cap multiplier.
+# A series realizing ≥ this much per fill in expectation gets sized at full
+# `MM_ORDER_SIZE`. Phase 0 favorable markout was +4.7¢; we target 2¢ realized
+# after fill-matching losses and maker fees — conservative relative to that
+# ceiling. See bot/core/sizing.py for the evaluator.
+MM_SIZING_TARGET_EDGE_CENTS = float(
+    os.environ.get("MM_SIZING_TARGET_EDGE_CENTS", "2.0"))
+
+# Upper clamp on the sizing multiplier. 1.0 = configured MM_ORDER_SIZE; values
+# >1 would over-size relative to the equity-scaled baseline. Keep at 1.0 until
+# we have evidence that a series reliably clears the target edge.
+MM_SIZING_CAP_MULTIPLIER = float(
+    os.environ.get("MM_SIZING_CAP_MULTIPLIER", "1.0"))
+
+# Minimum settled filled rows required to sample from the posterior. Below
+# this, multiplier = 0 (equivalent to SHADOW). 5 is enough to establish a
+# non-degenerate sample variance without being so high it stalls ramp-up.
+MM_SIZING_MIN_N = int(os.environ.get("MM_SIZING_MIN_N", "5"))
+
+# Cache TTL for the sampled multiplier. Between sweeps the quoter reads a
+# stable value; on cache miss the next call re-samples from the posterior.
+# 300s keeps within-cycle quote bursts stable while letting posterior drift
+# in at reasonable cadence.
+MM_SIZING_CACHE_TTL_S = int(os.environ.get("MM_SIZING_CACHE_TTL_S", "300"))
+
+# ── Graduated SHADOW → CANARY → FULL promotion gate (2026-04-21) ──────────────
+# Plan B+D from the post-data-bug review: block promotion on unprofitable
+# shadow P&L (step B), and require paired live-vs-shadow agreement during
+# a canary phase before scaling to full Thompson sizing (step D).
+
+# Minimum realized per-fill shadow P&L (cents, net of maker fees) required
+# for SHADOW → CANARY. 1¢ is intentionally low — the gate is about "is the
+# shadow model showing positive P&L *at all*", not about target edge. The
+# earlier +4.7¢ markout target belongs to FULL-state Thompson sizing, not
+# promotion gating. Setting this = 0 would let the pre-fix spurious fills
+# (weather-bracket YES at 1¢ that always resolved NO — strictly losing)
+# sneak through, so the lower bound is strictly positive.
+MM_CANARY_MIN_PNL_PER_FILL_CENTS = float(
+    os.environ.get("MM_CANARY_MIN_PNL_PER_FILL_CENTS", "1.0"))
+
+# Minimum paired (live, shadow) row count accumulated since entering CANARY
+# before graduation is evaluated. 20 is a compromise: tight enough to
+# graduate within ~24h at typical weather-MM quote cadence, loose enough to
+# suppress one-lucky-run false positives.
+MM_GRADUATION_MIN_PAIRED_N = int(
+    os.environ.get("MM_GRADUATION_MIN_PAIRED_N", "20"))
+
+# CANARY → FULL requires sum(live_pnl) / sum(shadow_pnl) >= this ratio over
+# the paired-row window. 0.5 = live captures at least half the P&L the
+# shadow model predicted. Below that, the shadow model is over-predicting
+# realizable edge and we should not scale up blindly.
+MM_GRADUATION_MIN_PNL_RATIO = float(
+    os.environ.get("MM_GRADUATION_MIN_PNL_RATIO", "0.5"))
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Source horizon compatibility (max forecast horizon in days per source)
 # ══════════════════════════════════════════════════════════════════════════════

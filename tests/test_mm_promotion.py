@@ -1,21 +1,22 @@
-"""Tests for bot/learning/mm_promotion.py (Phase 1 step 10 — option A.7)."""
+"""Tests for bot/learning/mm_promotion.py — Thompson-sized MM gate."""
 from __future__ import annotations
 
+import random
 import time
 
 import pytest
 
+from bot.config import MM_ORDER_SIZE
 from bot.db import init_db
 from bot.learning.directional_shadow import LiveState
 from bot.learning.mm_promotion import (
     DEFAULT_MM_KILL_SWITCH,
-    DEFAULT_MM_PROMOTION,
     MMKillSwitchConfig,
-    MMPromotionConfig,
     _compute_mm_stats,
     _pnl_for_side_fill,
+    _sample_mm_multiplier,
     annotate_shadow_pnl,
-    evaluate_mm_canary_graduation,
+    evaluate_mm_graduation,
     evaluate_mm_kill_switch,
     evaluate_mm_promotion,
     get_mm_live_state,
@@ -43,13 +44,16 @@ def _insert_shadow_row(
     ts_unix: float,
     proposed_bid: int,
     proposed_ask: int,
-    market_yes_bid: int,
-    market_yes_ask: int,
+    market_yes_bid: int | None,
+    market_yes_ask: int | None,
     gate_should_quote: int = 1,
     live_mode: int = 0,
     live_order_id_bid: str | None = None,
     live_order_id_ask: str | None = None,
 ) -> int:
+    mid = None
+    if market_yes_bid is not None and market_yes_ask is not None:
+        mid = (market_yes_bid + market_yes_ask) // 2
     cur = conn.execute(
         "INSERT INTO weather_mm_shadow "
         "(ts_unix, ts_iso, ticker, series, station, "
@@ -61,12 +65,39 @@ def _insert_shadow_row(
         (int(ts_unix), "t", ticker, series, "KJFK",
          (proposed_bid + proposed_ask) // 2, proposed_bid, proposed_ask,
          (proposed_ask - proposed_bid) // 2,
-         market_yes_bid, market_yes_ask, (market_yes_bid + market_yes_ask) // 2,
+         market_yes_bid, market_yes_ask, mid,
          gate_should_quote, live_mode,
          live_order_id_bid, live_order_id_ask),
     )
     conn.commit()
     return cur.lastrowid
+
+
+def _seed_settled_shadow_rows(
+    conn, series: str, n: int, *,
+    pnl_per_row: int = 10, fill_pattern: str = "both",
+    live_mode: int = 0, start_ts: float | None = None,
+):
+    """Seed `n` settled shadow rows with the given P&L and fill pattern."""
+    if start_ts is None:
+        start_ts = time.time() - 14 * 86400
+    for i in range(n):
+        rid = _insert_shadow_row(
+            conn, ticker=f"{series}-{i}", series=series,
+            ts_unix=start_ts + i * 3600,
+            proposed_bid=40, proposed_ask=60,
+            market_yes_bid=45, market_yes_ask=55,
+            live_mode=live_mode,
+        )
+        bid_f = 1 if fill_pattern in ("both", "bid") else 0
+        ask_f = 1 if fill_pattern in ("both", "ask") else 0
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_bid_filled=?, "
+            "shadow_ask_filled=?, shadow_pnl_cents=?, ts_settle_unix=? "
+            "WHERE id=?",
+            (bid_f, ask_f, pnl_per_row, start_ts + (i + 1) * 3600, rid),
+        )
+    conn.commit()
 
 
 # ── Per-series state API ────────────────────────────────────────────────
@@ -75,18 +106,54 @@ class TestMMLiveState:
         flag = get_mm_live_state(conn, "KXHIGHNY")
         assert flag.state == LiveState.SHADOW
 
-    def test_promote_to_canary(self, conn):
-        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
-        assert is_mm_live(conn, "KXHIGHNY") is True
-        assert get_mm_order_size_multiplier(conn, "KXHIGHNY") == 0.5
-
-    def test_promote_to_full(self, conn):
-        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_FULL)
-        assert get_mm_order_size_multiplier(conn, "KXHIGHNY") == 1.0
-
     def test_shadow_multiplier_is_zero(self, conn):
         assert get_mm_order_size_multiplier(conn, "KXHIGHNY") == 0.0
         assert is_mm_live(conn, "KXHIGHNY") is False
+
+    def test_canary_multiplier_is_fixed_one_contract(self, conn):
+        # LIVE_CANARY returns 1 / MM_ORDER_SIZE so consumer rounds the
+        # effective order_size to exactly 1 contract regardless of equity.
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
+        assert is_mm_live(conn, "KXHIGHNY") is True
+        mult = get_mm_order_size_multiplier(conn, "KXHIGHNY")
+        assert mult == pytest.approx(1.0 / max(1, MM_ORDER_SIZE))
+        # Effective order size after rounding is ≥1.
+        assert max(1, int(round(MM_ORDER_SIZE * mult))) == 1
+
+    def test_canary_multiplier_ignores_shadow_data(self, conn):
+        # Even with rich shadow history, CANARY stays at 1 contract.
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=40, pnl_per_row=8, fill_pattern="bid",
+        )
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
+        mult = get_mm_order_size_multiplier(
+            conn, "KXHIGHNY", force_resample=True,
+        )
+        assert mult == pytest.approx(1.0 / max(1, MM_ORDER_SIZE))
+
+    def test_live_without_data_returns_zero(self, conn):
+        # LIVE_FULL but <min_n settled fills → Thompson returns 0.
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_FULL)
+        assert is_mm_live(conn, "KXHIGHNY") is True
+        assert get_mm_order_size_multiplier(
+            conn, "KXHIGHNY", force_resample=True,
+        ) == 0.0
+
+    def test_live_with_good_data_returns_positive(self, conn):
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=30, pnl_per_row=5, fill_pattern="bid",
+        )
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_FULL)
+        # With mean=5¢ and target=2¢, the Thompson draw centered at 5/2=2.5
+        # clamps to cap=1.0 almost always. Take the average of many samples.
+        mults = []
+        for _ in range(20):
+            m = get_mm_order_size_multiplier(
+                conn, "KXHIGHNY", force_resample=True,
+            )
+            mults.append(m)
+        assert max(mults) > 0.5
+        assert sum(mults) / len(mults) > 0.5
 
     def test_case_insensitive_key(self, conn):
         set_mm_live_state(conn, "kxhighny", LiveState.LIVE_FULL)
@@ -96,12 +163,19 @@ class TestMMLiveState:
         with pytest.raises(ValueError):
             set_mm_live_state(conn, "KXHIGHNY", "nonsense")
 
+    def test_multiplier_is_cached_between_calls(self, conn):
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=30, pnl_per_row=5, fill_pattern="bid",
+        )
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_FULL)
+        m1 = get_mm_order_size_multiplier(conn, "KXHIGHNY")
+        m2 = get_mm_order_size_multiplier(conn, "KXHIGHNY")
+        assert m1 == m2  # cached
+
 
 # ── P&L helper ──────────────────────────────────────────────────────────
 class TestPnLPerSideFill:
     def test_yes_wins_at_40c_gains_60c(self):
-        # Bought YES @ 40, settles YES → gross = 60c/contract * 10 = 600c
-        # Fee on 10 contracts at 40c: tiny compared to 600.
         pnl = _pnl_for_side_fill("yes", 40, contracts=10, won=True)
         assert pnl > 0
         assert pnl <= 600
@@ -109,11 +183,9 @@ class TestPnLPerSideFill:
     def test_yes_loses_at_40c_loses_40c(self):
         pnl = _pnl_for_side_fill("yes", 40, contracts=10, won=False)
         assert pnl < 0
-        # Gross = -40c * 10 = -400c; fees make it worse.
         assert pnl <= -400
 
     def test_no_bought_at_30c_wins_gains_70c(self):
-        # NO side: we "bought NO" at 30c ⇒ if NO wins, +70c per contract.
         pnl = _pnl_for_side_fill("no", 30, contracts=5, won=True)
         assert pnl > 0
 
@@ -122,7 +194,6 @@ class TestPnLPerSideFill:
 class TestMatchShadowFills:
     def test_bid_fills_when_market_ask_drops(self, conn):
         t0 = time.time() - 1000
-        # Posted BID at 55¢. Later snapshot shows market_yes_ask=54 → fill.
         _insert_shadow_row(
             conn, ticker="KXHIGHNY-X", series="KXHIGHNY", ts_unix=t0,
             proposed_bid=55, proposed_ask=60,
@@ -131,15 +202,10 @@ class TestMatchShadowFills:
         _insert_shadow_row(
             conn, ticker="KXHIGHNY-X", series="KXHIGHNY", ts_unix=t0 + 60,
             proposed_bid=55, proposed_ask=60,
-            market_yes_bid=48, market_yes_ask=54,  # ask dropped below our bid
+            market_yes_bid=48, market_yes_ask=54,
         )
         summary = match_shadow_fills(conn, lifetime_s=600)
         assert summary["bid_fills"] >= 1
-        row = conn.execute(
-            "SELECT shadow_bid_filled, shadow_ask_filled "
-            "FROM weather_mm_shadow WHERE ts_unix=?", (int(t0),)
-        ).fetchone()
-        assert row[0] == 1
 
     def test_ask_fills_when_market_bid_rises(self, conn):
         t0 = time.time() - 1000
@@ -151,7 +217,7 @@ class TestMatchShadowFills:
         _insert_shadow_row(
             conn, ticker="KXHIGHNY-Y", series="KXHIGHNY", ts_unix=t0 + 60,
             proposed_bid=40, proposed_ask=55,
-            market_yes_bid=56, market_yes_ask=62,  # bid rose above our ask
+            market_yes_bid=56, market_yes_ask=62,
         )
         match_shadow_fills(conn, lifetime_s=600)
         row = conn.execute(
@@ -179,13 +245,13 @@ class TestMatchShadowFills:
         ).fetchone()
         assert row[0] == 0 and row[1] == 0
 
-    def test_gate_rejected_marks_unfilled_and_moves_on(self, conn):
+    def test_gate_rejected_marks_unfilled(self, conn):
         t0 = time.time() - 1000
         _insert_shadow_row(
             conn, ticker="KXHIGHNY-G", series="KXHIGHNY", ts_unix=t0,
             proposed_bid=55, proposed_ask=60,
             market_yes_bid=40, market_yes_ask=50,
-            gate_should_quote=0,  # gate said no
+            gate_should_quote=0,
         )
         match_shadow_fills(conn, lifetime_s=600)
         row = conn.execute(
@@ -195,17 +261,95 @@ class TestMatchShadowFills:
         assert row[0] == 0 and row[1] == 0
 
     def test_idempotent(self, conn):
-        t0 = time.time() - 1000
+        # Two candidate rows (old enough that their lifetime window is
+        # closed) plus a recent observation row that seeds the window.
+        now = time.time()
         _insert_shadow_row(
-            conn, ticker="KXHIGHNY-I", series="KXHIGHNY", ts_unix=t0,
+            conn, ticker="KXHIGHNY-I", series="KXHIGHNY", ts_unix=now - 1000,
+            proposed_bid=55, proposed_ask=60,
+            market_yes_bid=40, market_yes_ask=50,
+        )
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-I", series="KXHIGHNY", ts_unix=now - 900,
+            proposed_bid=55, proposed_ask=60,
+            market_yes_bid=40, market_yes_ask=50,
+        )
+        # Recent row inside both candidates' 600s windows but outside the
+        # matcher's ts_unix < now - 600 scan filter — acts as pure data.
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-I", series="KXHIGHNY", ts_unix=now - 500,
             proposed_bid=55, proposed_ask=60,
             market_yes_bid=40, market_yes_ask=50,
         )
         s1 = match_shadow_fills(conn, lifetime_s=600)
         s2 = match_shadow_fills(conn, lifetime_s=600)
-        assert s1["checked"] >= 1
-        # second pass re-checks nothing (already matched rows filtered)
+        assert s1["checked"] >= 2
         assert s2["checked"] == 0
+
+    def test_zero_book_observations_do_not_produce_fills(self, conn):
+        # Regression for the 2026-04-17 data-corruption episode: when the
+        # book snapshot is all zeros (which _safe_cents used to store for
+        # missing sides), the matcher must not treat zero as a crossing
+        # price. Otherwise every row's bid "fills" at 0¢.
+        t0 = time.time() - 1000
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-Z0", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=55, proposed_ask=60,
+            market_yes_bid=0, market_yes_ask=0,
+        )
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-Z0", series="KXHIGHNY", ts_unix=t0 + 60,
+            proposed_bid=55, proposed_ask=60,
+            market_yes_bid=0, market_yes_ask=0,
+        )
+        summary = match_shadow_fills(conn, lifetime_s=600)
+        assert summary["bid_fills"] == 0
+        assert summary["ask_fills"] == 0
+
+    def test_no_observations_leaves_row_unmatched(self, conn):
+        # If the lifetime window saw no valid book observation on either
+        # side, the matcher must *not* UPDATE — leaving shadow_bid_filled
+        # as NULL so a later run with better data can still resolve it.
+        t0 = time.time() - 1000
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-ZN", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=55, proposed_ask=60,
+            market_yes_bid=None, market_yes_ask=None,
+        )
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-ZN", series="KXHIGHNY", ts_unix=t0 + 60,
+            proposed_bid=55, proposed_ask=60,
+            market_yes_bid=0, market_yes_ask=0,
+        )
+        match_shadow_fills(conn, lifetime_s=600)
+        row = conn.execute(
+            "SELECT shadow_bid_filled, shadow_ask_filled "
+            "FROM weather_mm_shadow WHERE ts_unix=?", (int(t0),),
+        ).fetchone()
+        assert row[0] is None and row[1] is None
+
+    def test_partial_observation_does_match(self, conn):
+        # If only the ask side has real observations (bid is None/0), the
+        # matcher should still resolve the bid-fill question and mark the
+        # row (ask remains 0 because no real bid obs means no ask-fill).
+        t0 = time.time() - 1000
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-P", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=55, proposed_ask=70,
+            market_yes_bid=0, market_yes_ask=60,
+        )
+        _insert_shadow_row(
+            conn, ticker="KXHIGHNY-P", series="KXHIGHNY", ts_unix=t0 + 60,
+            proposed_bid=55, proposed_ask=70,
+            market_yes_bid=0, market_yes_ask=50,  # crosses bid=55
+        )
+        match_shadow_fills(conn, lifetime_s=600)
+        row = conn.execute(
+            "SELECT shadow_bid_filled, shadow_ask_filled "
+            "FROM weather_mm_shadow WHERE ts_unix=?", (int(t0),),
+        ).fetchone()
+        assert row[0] == 1
+        assert row[1] == 0
 
 
 # ── Settlement annotator ────────────────────────────────────────────────
@@ -229,7 +373,7 @@ class TestAnnotateShadowPnl:
             "SELECT shadow_pnl_cents, ticker_settled_yes "
             "FROM weather_mm_shadow WHERE id=?", (rid,),
         ).fetchone()
-        assert row[0] > 0  # bought YES at 40, YES wins ⇒ positive
+        assert row[0] > 0
         assert row[1] == 1
 
     def test_no_settlement_punishes_filled_bid(self, conn):
@@ -275,124 +419,482 @@ class TestAnnotateShadowPnl:
         assert n2 == 0
 
 
-# ── Evaluators ──────────────────────────────────────────────────────────
-def _seed_settled_shadow_rows(
-    conn, series: str, n: int, *,
-    pnl_per_row: int = 10, fill_pattern: str = "both",
-    live_mode: int = 0, start_ts: float | None = None,
-):
-    """Seed `n` settled shadow rows for one series, each with the given P&L.
-
-    fill_pattern ∈ {both, bid, ask, none}.
+# ── live_pnl_cents wiring via fills_ledger join (T3.3) ──────────────────
+def _insert_fill(
+    conn,
+    *,
+    trade_id: str,
+    ticker: str,
+    side: str,
+    yes_price: int,
+    no_price: int,
+    contracts: int,
+    fee_cents: int,
+    fill_ts_unix: float,
+    source: str = "mm_quote",
+    live_mode: int = 1,
+    action: str = "buy",
+    is_taker: int = 0,
+    client_order_id: str = "mm_wx_abc",
+) -> None:
+    """Insert one fills_ledger row. Mirrors FillsWriter schema exactly —
+    tests that need to drive the live P&L annotator forge rows here
+    rather than running the real writer, which would require network.
     """
-    if start_ts is None:
-        start_ts = time.time() - 14 * 86400
-    for i in range(n):
-        rid = _insert_shadow_row(
-            conn, ticker=f"{series}-{i}", series=series,
-            ts_unix=start_ts + i * 3600,
-            proposed_bid=40, proposed_ask=60,
-            market_yes_bid=45, market_yes_ask=55,
-            live_mode=live_mode,
-        )
-        bid_f = 1 if fill_pattern in ("both", "bid") else 0
-        ask_f = 1 if fill_pattern in ("both", "ask") else 0
-        conn.execute(
-            "UPDATE weather_mm_shadow SET shadow_bid_filled=?, "
-            "shadow_ask_filled=?, shadow_pnl_cents=?, ts_settle_unix=? "
-            "WHERE id=?",
-            (bid_f, ask_f, pnl_per_row, start_ts + (i + 1) * 3600, rid),
-        )
+    from bot.core.categorization import _get_series_prefix
+    from bot.learning.alpha_log import family_from_ticker
+    series, _ = _get_series_prefix(ticker)
+    family = family_from_ticker(ticker)
+    conn.execute(
+        "INSERT INTO fills_ledger "
+        "(trade_id, order_id, client_order_id, ticker, series, family, "
+        " side, action, contracts, yes_price_cents, no_price_cents, "
+        " is_taker, fee_cents, fill_ts_iso, fill_ts_unix, "
+        " ingested_ts_unix, live_mode, source) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (trade_id, "ord_" + trade_id, client_order_id, ticker, series, family,
+         side, action, contracts, yes_price, no_price,
+         is_taker, fee_cents, "t", float(fill_ts_unix),
+         float(fill_ts_unix), live_mode, source),
+    )
     conn.commit()
 
 
+class TestAnnotateShadowPnlLivePaired:
+    """T3.3 — live_pnl_cents populated from fills_ledger at settlement."""
+
+    def test_shadow_only_row_leaves_live_pnl_null(self, conn):
+        # live_mode=0 row: no live order was posted, so the column must
+        # stay NULL. evaluate_mm_graduation filters on `live_pnl_cents
+        # IS NOT NULL` and would incorrectly include shadow-only rows if
+        # we wrote 0 here.
+        t0 = time.time() - 5000
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-SH", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=0,
+        )
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_bid_filled=1 WHERE id=?",
+            (rid,),
+        )
+        conn.commit()
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-SH", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        row = conn.execute(
+            "SELECT shadow_pnl_cents, live_pnl_cents "
+            "FROM weather_mm_shadow WHERE id=?", (rid,),
+        ).fetchone()
+        assert row[0] > 0           # shadow still credits the fill
+        assert row[1] is None       # live column untouched
+
+    def test_live_row_without_fills_gets_zero(self, conn):
+        # The drift case graduation exists to catch: shadow predicted a
+        # fill but the live order never crossed. live_pnl_cents must be
+        # 0, not NULL, so the graduation gate counts this as a paired
+        # row pulling the realization ratio down.
+        t0 = time.time() - 5000
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-L0", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=1,
+        )
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_bid_filled=1 WHERE id=?",
+            (rid,),
+        )
+        conn.commit()
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-L0", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        row = conn.execute(
+            "SELECT shadow_pnl_cents, live_pnl_cents "
+            "FROM weather_mm_shadow WHERE id=?", (rid,),
+        ).fetchone()
+        assert row[0] > 0           # shadow optimistic
+        assert row[1] == 0          # live realized zero — paired drift
+
+    def test_live_row_with_matching_fill_accumulates_realized_pnl(self, conn):
+        t0 = time.time() - 5000
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-LP", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=1,
+        )
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_bid_filled=1 WHERE id=?",
+            (rid,),
+        )
+        conn.commit()
+        # Live fill inside the shadow row's 300s lifetime window: bought
+        # YES @ 40¢, 5 contracts, 2¢ maker fee. YES settles → gross
+        # payout = (100-40)*5 = 300; net = 300 - 2 = 298.
+        _insert_fill(
+            conn, trade_id="t1", ticker="KXHIGHNY-LP",
+            side="yes", yes_price=40, no_price=60,
+            contracts=5, fee_cents=2, fill_ts_unix=t0 + 30,
+        )
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-LP", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        row = conn.execute(
+            "SELECT live_pnl_cents FROM weather_mm_shadow WHERE id=?",
+            (rid,),
+        ).fetchone()
+        assert row[0] == 298
+
+    def test_no_side_fill_on_ticker_yields_negative_on_yes_win(self, conn):
+        # ask-side live fill: bought NO @ (100-proposed_ask)=30¢. If YES
+        # wins, NO pays 0 → P&L = (0-30)*contracts - fee.
+        t0 = time.time() - 5000
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-NO", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=1,
+        )
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_ask_filled=1 WHERE id=?",
+            (rid,),
+        )
+        conn.commit()
+        _insert_fill(
+            conn, trade_id="t2", ticker="KXHIGHNY-NO",
+            side="no", yes_price=70, no_price=30,
+            contracts=5, fee_cents=2, fill_ts_unix=t0 + 30,
+        )
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-NO", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        row = conn.execute(
+            "SELECT live_pnl_cents FROM weather_mm_shadow WHERE id=?",
+            (rid,),
+        ).fetchone()
+        # (0 - 30) * 5 - 2 = -152
+        assert row[0] == -152
+
+    def test_fills_outside_lifetime_are_orphaned(self, conn):
+        t0 = time.time() - 10_000
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-ORF", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=1,
+        )
+        conn.commit()
+        # Fill happens 1 hour after the shadow row — well past the 300s
+        # lifetime. Live order would have been cancelled by a later
+        # requote before this; don't attribute.
+        _insert_fill(
+            conn, trade_id="t3", ticker="KXHIGHNY-ORF",
+            side="yes", yes_price=40, no_price=60,
+            contracts=5, fee_cents=2, fill_ts_unix=t0 + 3600,
+        )
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-ORF", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        row = conn.execute(
+            "SELECT live_pnl_cents FROM weather_mm_shadow WHERE id=?",
+            (rid,),
+        ).fetchone()
+        # Row is live_mode=1 but orphan-fill → live_pnl_cents = 0
+        assert row[0] == 0
+
+    def test_fills_attributed_to_latest_preceding_shadow_row(self, conn):
+        # Two live shadow rows at t0 and t0+60. A fill at t0+90 belongs
+        # to the second row (the later one that was resting at the time).
+        t0 = time.time() - 5000
+        rid_old = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-AT", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=1,
+        )
+        rid_new = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-AT", series="KXHIGHNY", ts_unix=t0 + 60,
+            proposed_bid=42, proposed_ask=72,
+            market_yes_bid=42, market_yes_ask=72,
+            live_mode=1,
+        )
+        conn.commit()
+        _insert_fill(
+            conn, trade_id="t4", ticker="KXHIGHNY-AT",
+            side="yes", yes_price=42, no_price=58,
+            contracts=1, fee_cents=0, fill_ts_unix=t0 + 90,
+        )
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-AT", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        old_pnl = conn.execute(
+            "SELECT live_pnl_cents FROM weather_mm_shadow WHERE id=?",
+            (rid_old,),
+        ).fetchone()[0]
+        new_pnl = conn.execute(
+            "SELECT live_pnl_cents FROM weather_mm_shadow WHERE id=?",
+            (rid_new,),
+        ).fetchone()[0]
+        assert old_pnl == 0                # fill did not belong to it
+        assert new_pnl == (100 - 42)       # fill belonged to the newer row
+
+    def test_non_mm_quote_source_is_ignored(self, conn):
+        # Directional or exit fills must not pollute MM paired data.
+        t0 = time.time() - 5000
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-EX", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=1,
+        )
+        conn.commit()
+        _insert_fill(
+            conn, trade_id="t5", ticker="KXHIGHNY-EX",
+            side="yes", yes_price=40, no_price=60,
+            contracts=5, fee_cents=2, fill_ts_unix=t0 + 30,
+            source="exit", client_order_id="mm_exit_xyz",
+        )
+        _insert_fill(
+            conn, trade_id="t6", ticker="KXHIGHNY-EX",
+            side="yes", yes_price=40, no_price=60,
+            contracts=5, fee_cents=2, fill_ts_unix=t0 + 40,
+            source="directional", client_order_id="mm_dir_abc",
+        )
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-EX", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        live_pnl = conn.execute(
+            "SELECT live_pnl_cents FROM weather_mm_shadow WHERE id=?",
+            (rid,),
+        ).fetchone()[0]
+        assert live_pnl == 0        # neither fill was source='mm_quote'
+
+    def test_live_mode_zero_fill_is_ignored(self, conn):
+        # A live fill ingested before WEATHER_MM_LIVE was set (live_mode=0
+        # on the fills_ledger row) must not count toward live_pnl for a
+        # later live-mode shadow row. Paired data are strictly live×live.
+        t0 = time.time() - 5000
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-SM", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=70,
+            market_yes_bid=40, market_yes_ask=70,
+            live_mode=1,
+        )
+        conn.commit()
+        _insert_fill(
+            conn, trade_id="t7", ticker="KXHIGHNY-SM",
+            side="yes", yes_price=40, no_price=60,
+            contracts=5, fee_cents=2, fill_ts_unix=t0 + 30,
+            live_mode=0,
+        )
+        annotate_shadow_pnl(
+            conn, "KXHIGHNY-SM", won_yes=True, ts_settle_unix=t0 + 7200,
+        )
+        live_pnl = conn.execute(
+            "SELECT live_pnl_cents FROM weather_mm_shadow WHERE id=?",
+            (rid,),
+        ).fetchone()[0]
+        assert live_pnl == 0
+
+
+# ── SHADOW → CANARY promotion gate (B+D rewrite) ────────────────────────
 class TestEvaluatePromotion:
-    def test_insufficient_settled_fails(self, conn):
-        _seed_settled_shadow_rows(conn, "KXHIGHNY", n=10, pnl_per_row=10)
+    def test_no_fills_fails(self, conn):
         ok, reason, _ = evaluate_mm_promotion(conn, "KXHIGHNY")
         assert not ok
-        assert "insufficient_shadow_n" in reason
+        assert "insufficient_fills" in reason
 
-    def test_negative_pnl_fails(self, conn):
+    def test_few_fills_fails(self, conn):
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=100, pnl_per_row=-5, fill_pattern="bid",
+            conn, "KXHIGHNY", n=3, pnl_per_row=10, fill_pattern="bid",
         )
         ok, reason, _ = evaluate_mm_promotion(conn, "KXHIGHNY")
         assert not ok
+        assert "insufficient_fills" in reason
 
-    def test_passing_promotes(self, conn):
+    def test_negative_pnl_blocks_promotion(self, conn):
+        # B+D rewrite: negative realized shadow P&L must block promotion
+        # (was previously accepted on N-floor alone; the 2026-04-17
+        # _safe_cents bug proved that rule dangerous).
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=100, pnl_per_row=10, fill_pattern="bid",
+            conn, "KXHIGHNY", n=10, pnl_per_row=-5, fill_pattern="bid",
+        )
+        ok, reason, metrics = evaluate_mm_promotion(conn, "KXHIGHNY")
+        assert not ok
+        assert "unprofitable_shadow" in reason
+        assert metrics["pnl_per_fill_cents"] == pytest.approx(-5.0)
+
+    def test_breakeven_pnl_blocks_promotion(self, conn):
+        # Zero P&L per fill (the Apr-17 contamination signature) must also
+        # fail the > 1¢ floor.
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=10, pnl_per_row=0, fill_pattern="bid",
+        )
+        ok, reason, _ = evaluate_mm_promotion(conn, "KXHIGHNY")
+        assert not ok
+        assert "unprofitable_shadow" in reason
+
+    def test_positive_pnl_passes_gate(self, conn):
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=10, pnl_per_row=5, fill_pattern="bid",
         )
         ok, reason, metrics = evaluate_mm_promotion(conn, "KXHIGHNY")
         assert ok, reason
-        assert metrics["n_settled"] == 100
-        assert metrics["n_fills"] == 100
+        assert "canary_gate_passed" in reason
+        assert metrics["n_fills"] == 10
+        assert metrics["pnl_per_fill_cents"] == pytest.approx(5.0)
 
-    def test_oos_slice_blocks_late_regression(self, conn):
-        # First half +10, second half 0 → overall clears per-fill gate
-        # (mean = 5¢ > 1¢), but OOS slice (0¢) fails the OOS gate (0.5¢).
-        start = time.time() - 20 * 86400
-        # Need >= min_shadow_settled=80 and enough total P&L. 120 rows,
-        # first half +15, second half 0 → total $9, mean 7.5¢, OOS 0¢.
-        n = 120
-        for i in range(n):
-            pnl = 15 if i < n // 2 else 0
-            rid = _insert_shadow_row(
-                conn, ticker=f"KXHIGHNY-O{i}", series="KXHIGHNY",
-                ts_unix=start + i * 3600,
-                proposed_bid=40, proposed_ask=60,
-                market_yes_bid=45, market_yes_ask=55,
+
+# ── CANARY → FULL graduation gate ───────────────────────────────────────
+def _insert_paired_row(
+    conn, *, series: str, ticker: str, ts_unix: float,
+    shadow_pnl: int, live_pnl: int,
+) -> int:
+    """Insert a settled, paired (shadow + live) row at ts_unix."""
+    rid = _insert_shadow_row(
+        conn, ticker=ticker, series=series, ts_unix=ts_unix,
+        proposed_bid=40, proposed_ask=60,
+        market_yes_bid=45, market_yes_ask=55,
+        live_mode=1,
+    )
+    conn.execute(
+        "UPDATE weather_mm_shadow SET shadow_bid_filled=1, "
+        "shadow_ask_filled=0, shadow_pnl_cents=?, "
+        "live_pnl_cents=?, ts_settle_unix=? WHERE id=?",
+        (shadow_pnl, live_pnl, ts_unix + 3600, rid),
+    )
+    conn.commit()
+    return rid
+
+
+class TestEvaluateGraduation:
+    def test_insufficient_paired_fails(self, conn):
+        # Below MM_GRADUATION_MIN_PAIRED_N (default 20).
+        t0 = time.time() - 86400
+        for i in range(5):
+            _insert_paired_row(
+                conn, series="KXHIGHNY", ticker=f"KXHIGHNY-{i}",
+                ts_unix=t0 + i * 3600,
+                shadow_pnl=10, live_pnl=8,
             )
-            conn.execute(
-                "UPDATE weather_mm_shadow SET shadow_bid_filled=1, "
-                "shadow_ask_filled=0, shadow_pnl_cents=?, ts_settle_unix=? "
-                "WHERE id=?", (pnl, start + (i + 1) * 3600, rid),
-            )
-        conn.commit()
-        ok, reason, _ = evaluate_mm_promotion(conn, "KXHIGHNY")
-        assert not ok
-        assert "oos" in reason
-
-
-class TestEvaluateCanaryGraduation:
-    def test_not_enough_canary_data_fails(self, conn):
-        _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=10, pnl_per_row=10, live_mode=1,
+        ok, reason, metrics = evaluate_mm_graduation(
+            conn, "KXHIGHNY", since_ts_unix=t0 - 60,
         )
-        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
-        flag = get_mm_live_state(conn, "KXHIGHNY")
-        ok, reason, _ = evaluate_mm_canary_graduation(conn, "KXHIGHNY", flag)
         assert not ok
+        assert "insufficient_paired" in reason
+        assert metrics["n_paired"] == 5
 
-    def test_positive_canary_graduates(self, conn):
-        # Seed *before* flipping canary so rows' ts_unix > flag.since_ts_unix
-        # (here they will — since we seed in the past).
-        start = time.time() - 10 * 86400
-        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
-        flag = get_mm_live_state(conn, "KXHIGHNY")
-        # Seed 80 live-mode rows *after* flag.since_ts_unix (i.e. "now")
-        for i in range(80):
-            rid = _insert_shadow_row(
-                conn, ticker=f"KXHIGHNY-C{i}", series="KXHIGHNY",
-                ts_unix=flag.since_ts_unix + (i + 1) * 60,
-                proposed_bid=40, proposed_ask=60,
-                market_yes_bid=45, market_yes_ask=55,
-                live_mode=1,
+    def test_shadow_nonpositive_blocks_graduation(self, conn):
+        # Enough pairs, but shadow sum is 0 → can't divide, refuse.
+        t0 = time.time() - 86400
+        for i in range(25):
+            _insert_paired_row(
+                conn, series="KXHIGHNY", ticker=f"KXHIGHNY-{i}",
+                ts_unix=t0 + i * 3600,
+                shadow_pnl=-5, live_pnl=-5,
             )
-            conn.execute(
-                "UPDATE weather_mm_shadow SET shadow_bid_filled=1, "
-                "shadow_pnl_cents=?, ts_settle_unix=? WHERE id=?",
-                (10, flag.since_ts_unix + (i + 2) * 60, rid),
+        ok, reason, _ = evaluate_mm_graduation(
+            conn, "KXHIGHNY", since_ts_unix=t0 - 60,
+        )
+        assert not ok
+        assert "shadow_nonpositive" in reason
+
+    def test_ratio_below_floor_blocks(self, conn):
+        # Shadow predicts $1 profit per row but live captures only 20% of it.
+        t0 = time.time() - 86400
+        for i in range(25):
+            _insert_paired_row(
+                conn, series="KXHIGHNY", ticker=f"KXHIGHNY-{i}",
+                ts_unix=t0 + i * 3600,
+                shadow_pnl=100, live_pnl=20,
             )
-        conn.commit()
-        ok, reason, _ = evaluate_mm_canary_graduation(conn, "KXHIGHNY", flag)
+        ok, reason, metrics = evaluate_mm_graduation(
+            conn, "KXHIGHNY", since_ts_unix=t0 - 60,
+        )
+        assert not ok
+        assert "ratio_below_floor" in reason
+        assert metrics["live_over_shadow_ratio"] == pytest.approx(0.2)
+
+    def test_all_gates_pass_graduates(self, conn):
+        t0 = time.time() - 86400
+        for i in range(25):
+            _insert_paired_row(
+                conn, series="KXHIGHNY", ticker=f"KXHIGHNY-{i}",
+                ts_unix=t0 + i * 3600,
+                shadow_pnl=100, live_pnl=80,
+            )
+        ok, reason, metrics = evaluate_mm_graduation(
+            conn, "KXHIGHNY", since_ts_unix=t0 - 60,
+        )
         assert ok, reason
+        assert "graduated" in reason
+        assert metrics["n_paired"] == 25
+        assert metrics["live_over_shadow_ratio"] == pytest.approx(0.8)
+
+    def test_since_ts_excludes_older_rows(self, conn):
+        # Rows older than since_ts_unix must not count toward graduation.
+        # Canary floor is 20 paired rows; plant 25 old rows + 3 new ones.
+        t_old = time.time() - 30 * 86400
+        for i in range(25):
+            _insert_paired_row(
+                conn, series="KXHIGHNY", ticker=f"KXHIGHNY-old-{i}",
+                ts_unix=t_old + i * 3600,
+                shadow_pnl=100, live_pnl=80,
+            )
+        t_canary = time.time() - 3600
+        for i in range(3):
+            _insert_paired_row(
+                conn, series="KXHIGHNY", ticker=f"KXHIGHNY-new-{i}",
+                ts_unix=t_canary + i * 60,
+                shadow_pnl=100, live_pnl=80,
+            )
+        ok, reason, metrics = evaluate_mm_graduation(
+            conn, "KXHIGHNY", since_ts_unix=t_canary - 60,
+        )
+        assert not ok
+        assert "insufficient_paired" in reason
+        assert metrics["n_paired"] == 3
 
 
+# ── Thompson sampling integration ───────────────────────────────────────
+class TestSampleMMMultiplier:
+    def test_empty_series_returns_zero(self, conn):
+        decision = _sample_mm_multiplier(conn, "KXHIGHNY")
+        assert decision.multiplier == 0.0
+        assert decision.reason == "insufficient_n"
+
+    def test_zero_fill_rows_ignored(self, conn):
+        # 20 settled rows but none filled → n=0 into Thompson.
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=20, pnl_per_row=0, fill_pattern="none",
+        )
+        decision = _sample_mm_multiplier(conn, "KXHIGHNY")
+        assert decision.multiplier == 0.0
+        assert decision.n == 0
+
+    def test_positive_pnl_samples_positive(self, conn):
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=40, pnl_per_row=8, fill_pattern="bid",
+        )
+        decision = _sample_mm_multiplier(conn, "KXHIGHNY")
+        # Mean = 8¢ / target = 2¢ → posterior mean ≈ 4.0, clamped to cap 1.0.
+        assert decision.mean_cents == 8.0
+        assert decision.multiplier == 1.0
+        assert decision.reason == "degenerate_variance"
+
+    def test_negative_pnl_samples_zero(self, conn):
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=40, pnl_per_row=-10, fill_pattern="bid",
+        )
+        decision = _sample_mm_multiplier(conn, "KXHIGHNY")
+        assert decision.multiplier == 0.0
+
+
+# ── Kill switch ─────────────────────────────────────────────────────────
 class TestKillSwitch:
     def test_single_large_loss_trips(self, conn):
-        # Seed a single catastrophic live row.
         t0 = time.time() - 3600
         rid = _insert_shadow_row(
             conn, ticker="KXHIGHNY-K1", series="KXHIGHNY", ts_unix=t0,
@@ -402,7 +904,7 @@ class TestKillSwitch:
         conn.execute(
             "UPDATE weather_mm_shadow SET shadow_bid_filled=1, "
             "shadow_pnl_cents=?, ts_settle_unix=? WHERE id=?",
-            (-10000, t0 + 60, rid),  # -$100
+            (-10000, t0 + 60, rid),
         )
         conn.commit()
         tripped, reason, _ = evaluate_mm_kill_switch(
@@ -435,17 +937,89 @@ class TestKillSwitch:
 
 # ── Sweep orchestration ─────────────────────────────────────────────────
 class TestRunMMPromotionSweep:
-    def test_shadow_to_canary_path(self, conn):
+    def test_gate_promotes_to_canary_not_full(self, conn):
+        # B+D rewrite: promotion lands on LIVE_CANARY; FULL requires
+        # graduation evidence the sweep can't fabricate on first pass.
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=120, pnl_per_row=15, fill_pattern="bid",
+            conn, "KXHIGHNY", n=10, pnl_per_row=6, fill_pattern="bid",
         )
         summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
-        assert "KXHIGHNY" in [p["series"] for p in summary["promoted"]]
-        assert get_mm_live_state(conn, "KXHIGHNY").state == LiveState.LIVE_CANARY
+        promoted = [p for p in summary["promoted"]
+                    if p["series"] == "KXHIGHNY"]
+        assert len(promoted) == 1
+        assert promoted[0]["to"] == LiveState.LIVE_CANARY
+        assert (get_mm_live_state(conn, "KXHIGHNY").state
+                == LiveState.LIVE_CANARY)
+        # Canary does not Thompson-sample, so no "multiplier" key on entry.
+        assert "multiplier" not in promoted[0]
 
-    def test_kill_switch_demotes(self, conn):
+    def test_negative_pnl_blocks_promotion(self, conn):
+        # Even with n >= min_n, bad shadow P&L must keep us in SHADOW.
+        # This is the regression guard against the 2026-04-17 corruption
+        # that produced near-zero P&L across hundreds of rows.
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=10, pnl_per_row=-5, fill_pattern="bid",
+        )
+        summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
+        assert len(summary["promoted"]) == 0
+        assert (get_mm_live_state(conn, "KXHIGHNY").state
+                == LiveState.SHADOW)
+
+    def test_summary_has_graduated_key(self, conn):
+        # Sanity: the sweep summary exposes the new "graduated" key.
+        summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
+        assert "graduated" in summary
+        assert summary["graduated"] == []
+
+    def test_canary_graduates_to_full_with_paired_evidence(self, conn):
+        # Set CANARY, seed 25 paired rows after the since_ts, expect
+        # graduation to LIVE_FULL and a Thompson resample.
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
+        flag = get_mm_live_state(conn, "KXHIGHNY")
+        # Insert paired rows strictly after the CANARY since_ts_unix.
+        for i in range(25):
+            _insert_paired_row(
+                conn, series="KXHIGHNY", ticker=f"KXHIGHNY-g{i}",
+                ts_unix=flag.since_ts_unix + 60 + i * 60,
+                shadow_pnl=100, live_pnl=80,
+            )
+        summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
+        graduated = [g["series"] for g in summary["graduated"]]
+        assert "KXHIGHNY" in graduated
+        assert (get_mm_live_state(conn, "KXHIGHNY").state
+                == LiveState.LIVE_FULL)
+
+    def test_canary_unchanged_without_paired_evidence(self, conn):
+        # CANARY with no paired data stays CANARY.
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
+        summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
+        assert len(summary["graduated"]) == 0
+        assert (get_mm_live_state(conn, "KXHIGHNY").state
+                == LiveState.LIVE_CANARY)
+
+    def test_kill_switch_demotes_canary_to_shadow(self, conn):
+        # Kill-switch fires on any LIVE state and demotes straight to
+        # SHADOW (no intermediate stop).
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
+        t0 = time.time() - 3600
+        rid = _insert_shadow_row(
+            conn, ticker="KXHIGHNY-K3", series="KXHIGHNY", ts_unix=t0,
+            proposed_bid=40, proposed_ask=60,
+            market_yes_bid=45, market_yes_ask=55, live_mode=1,
+        )
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_bid_filled=1, "
+            "shadow_pnl_cents=?, ts_settle_unix=? WHERE id=?",
+            (-10000, t0 + 60, rid),
+        )
+        conn.commit()
+        summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
+        assert "KXHIGHNY" in [d["series"] for d in summary["demoted"]]
+        assert (get_mm_live_state(conn, "KXHIGHNY").state
+                == LiveState.SHADOW)
+
+    def test_kill_switch_demotes_full_to_shadow(self, conn):
         set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_FULL)
-        # Seed a single catastrophic live row to trigger the single-loss rule.
         t0 = time.time() - 3600
         rid = _insert_shadow_row(
             conn, ticker="KXHIGHNY-K2", series="KXHIGHNY", ts_unix=t0,
@@ -459,15 +1033,25 @@ class TestRunMMPromotionSweep:
         )
         conn.commit()
         summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
-        demoted_series = [d["series"] for d in summary["demoted"]]
-        assert "KXHIGHNY" in demoted_series
-        # Should demote FULL → CANARY (not all the way to shadow)
-        assert get_mm_live_state(conn, "KXHIGHNY").state == LiveState.LIVE_CANARY
+        assert "KXHIGHNY" in [d["series"] for d in summary["demoted"]]
+        assert (get_mm_live_state(conn, "KXHIGHNY").state
+                == LiveState.SHADOW)
 
-    def test_unchanged_when_below_threshold(self, conn):
+    def test_resampled_section_populated_for_existing_full(self, conn):
+        set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_FULL)
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=20, pnl_per_row=5, fill_pattern="bid",
+            conn, "KXHIGHNY", n=20, pnl_per_row=4, fill_pattern="bid",
+        )
+        summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
+        resampled_series = [r["series"] for r in summary["resampled"]]
+        assert "KXHIGHNY" in resampled_series
+        assert "KXHIGHNY" not in [p["series"] for p in summary["promoted"]]
+
+    def test_unchanged_when_below_n_floor(self, conn):
+        _seed_settled_shadow_rows(
+            conn, "KXHIGHNY", n=2, pnl_per_row=5, fill_pattern="bid",
         )
         summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
         assert len(summary["promoted"]) == 0
-        assert get_mm_live_state(conn, "KXHIGHNY").state == LiveState.SHADOW
+        assert (get_mm_live_state(conn, "KXHIGHNY").state
+                == LiveState.SHADOW)

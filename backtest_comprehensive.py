@@ -746,22 +746,38 @@ def analyze_mm_performance(conn) -> dict:
     print(f"\n  ─── Fee Impact ───")
 
     try:
-        # Try new schema first (price_cents, contracts, fee_cents)
+        # T3.3: read from the canonical fills ledger. Price-per-side comes
+        # from yes_price_cents when side='yes' else no_price_cents — same
+        # CASE pattern used in regime.detect_regime.
         fee_rows = conn.execute("""
-            SELECT price_cents, contracts, fee_cents FROM mm_processed_fills
+            SELECT CASE WHEN side='yes' THEN yes_price_cents
+                         ELSE no_price_cents END,
+                   contracts, fee_cents
+            FROM fills_ledger
         """).fetchall()
         total_fees = sum(int(f[2] or 0) for f in fee_rows)
         total_notional = sum(int(f[0] or 0) * int(f[1] or 0) for f in fee_rows)
     except Exception:
-        # Old schema: fill_id, processed_at, fee_cents, order_id, ticker
+        # Fallback: legacy mm_processed_fills (pre-T3 data only; no
+        # live writer since the MM path was removed). Kept as a
+        # read-through so historical DBs still report a fee total.
         try:
-            fee_rows = conn.execute("SELECT fee_cents FROM mm_processed_fills").fetchall()
-            total_fees = sum(int(f[0] or 0) for f in fee_rows)
-            total_notional = 0  # can't compute without price/contracts
+            fee_rows = conn.execute(
+                "SELECT price_cents, contracts, fee_cents FROM mm_processed_fills"
+            ).fetchall()
+            total_fees = sum(int(f[2] or 0) for f in fee_rows)
+            total_notional = sum(int(f[0] or 0) * int(f[1] or 0) for f in fee_rows)
         except Exception:
-            fee_rows = []
-            total_fees = 0
-            total_notional = 0
+            try:
+                fee_rows = conn.execute(
+                    "SELECT fee_cents FROM mm_processed_fills"
+                ).fetchall()
+                total_fees = sum(int(f[0] or 0) for f in fee_rows)
+                total_notional = 0
+            except Exception:
+                fee_rows = []
+                total_fees = 0
+                total_notional = 0
 
     if fee_rows:
         print(f"  Total fees paid: {fmt_pnl(total_fees)}")
