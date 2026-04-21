@@ -169,7 +169,6 @@ def predict(
             for p, _, name in estimates:
                 _snapshot_component(c, series, ticker, name, p, None)
             _snapshot_component(c, series, ticker, "combined", combined, None)
-            c.commit()
         db_write(_write)
     except Exception as e:
         print(f"[weather_ensemble] snapshot batch error: {type(e).__name__}: {e}")

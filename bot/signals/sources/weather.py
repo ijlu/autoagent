@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from bot.api import cached_get
 from bot.config import TOMORROW_API_KEY
+from bot.daemon.stations import STATION_BY_CITY, STATION_BY_SERIES
 from bot.db import get_connection, kv_get, kv_set
 
 
@@ -22,6 +23,14 @@ from bot.db import get_connection, kv_get, kv_set
 # Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Broad city catalog for signal sources. A superset of the daemon's
+# tradeable-series registry (``bot.daemon.stations``) — includes cities
+# used by directional signals on markets we score but don't market-make
+# (phoenix, seattle, boston, etc.). Tradeable-city coordinates are
+# intentionally duplicated here: registry entries track the primary
+# METAR station (KNYC), while WEATHER_CITIES tracks downtown lat/lon
+# for the Open-Meteo / Tomorrow.io forecast endpoints, which grid to
+# city center rather than airport.
 WEATHER_CITIES = {
     "nyc":          {"lat": 40.71, "lon": -74.01, "tz": "America/New_York"},
     "new york":     {"lat": 40.71, "lon": -74.01, "tz": "America/New_York"},
@@ -46,11 +55,12 @@ WEATHER_CITIES = {
     "las vegas":    {"lat": 36.17, "lon": -115.14, "tz": "America/Los_Angeles"},
 }
 
-# Ticker prefix -> city key mapping for Kalshi weather tickers
-_TICKER_CITY_MAP = {
-    "KXHIGHNY": "nyc", "KXHIGHLAX": "los angeles", "KXHIGHCHI": "chicago",
-    "KXHIGHMIA": "miami", "KXHIGHAUS": "austin", "KXHIGHHOU": "houston",
-    "KXHIGHPHX": "phoenix", "KXHIGHDEN": "denver", "KXHIGHSF": "san francisco",
+# Ticker prefix → city key map. Tradeable series derive from the
+# canonical registry (T1.1). Dead-market prefixes (KXHIGHHOU/PHX/SF)
+# were removed 2026-04-16 — signal sources now gracefully return None
+# for those tickers instead of fabricating city guesses.
+_TICKER_CITY_MAP: dict[str, str] = {
+    series: station.city for series, station in STATION_BY_SERIES.items()
 }
 
 # Tomorrow.io in-memory cache: {city_key: (data, timestamp)}
@@ -58,14 +68,18 @@ _TOMORROW_CACHE: dict = {}
 _TOMORROW_TTL = 1800  # 30 minutes -- 9 cities x 48 fetches/day = 432 calls (under 500)
 
 # LST offsets for settlement-day computation (Kalshi weather markets settle
-# in Local Standard Time year-round, matching metar_observations.py).
-_CITY_LST_OFFSET: dict[str, int] = {
-    "nyc": -5, "new york": -5, "chicago": -6, "miami": -5,
-    "austin": -6, "los angeles": -8, "la": -8, "phoenix": -7,
-    "houston": -6, "dallas": -6, "denver": -7, "atlanta": -5,
+# in Local Standard Time year-round). Tradeable cities pull from the
+# canonical registry; non-tradeable cities keep hardcoded offsets so the
+# directional signal path on those markets stays unchanged.
+_NON_TRADEABLE_LST_OFFSET: dict[str, int] = {
+    "phoenix": -7, "houston": -6, "dallas": -6, "atlanta": -5,
     "seattle": -8, "boston": -5, "san francisco": -8, "sf": -8,
     "dc": -5, "washington": -5, "minneapolis": -6, "detroit": -5,
     "las vegas": -8,
+}
+_CITY_LST_OFFSET: dict[str, int] = {
+    **{city: s.lst_offset for city, s in STATION_BY_CITY.items()},
+    **_NON_TRADEABLE_LST_OFFSET,
 }
 
 _WEATHER_KEYWORDS = [
@@ -73,16 +87,12 @@ _WEATHER_KEYWORDS = [
     "weather", "heat", "cold", "freeze", "highest temperature",
 ]
 
-# Reverse mapping: city key → METAR station ID.
+# Reverse mapping: city key → primary METAR station ID.
 # Used to persist forecast highs into kv_cache so metar_observations.py
 # can compare observations against forecasts (Defense 4: weather conditional quoting).
-_CITY_STATION_MAP = {
-    "nyc": "KNYC", "new york": "KNYC",
-    "chicago": "KMDW",
-    "los angeles": "KLAX", "la": "KLAX",
-    "austin": "KAUS",
-    "miami": "KMIA",
-    "denver": "KDEN",
+# Derived from the canonical registry — do not hand-maintain.
+_CITY_STATION_MAP: dict[str, str] = {
+    city: s.icao for city, s in STATION_BY_CITY.items()
 }
 
 

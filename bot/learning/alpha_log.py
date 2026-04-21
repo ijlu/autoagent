@@ -65,6 +65,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from bot.daemon.locks import DB_WRITE_LOCK
+from bot.db import db_write_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +202,9 @@ def market_snapshot_from_dict(market: dict) -> MarketSnapshot:
 
     vol_raw = market.get("volume") or market.get("volume_fp") or market.get("volume_24h")
     try:
-        volume_fp = int(float(vol_raw)) if vol_raw else None
+        # round(), not int(): matches the fixed-point parsing convention
+        # in CLAUDE.md §5 (avoid float truncation off-by-one).
+        volume_fp = round(float(vol_raw)) if vol_raw else None
     except (TypeError, ValueError):
         volume_fp = None
 
@@ -315,7 +318,7 @@ def log_decision(
             else None
         )
 
-        with DB_WRITE_LOCK:
+        with db_write_ctx(conn):
             cur = conn.execute(
                 """INSERT INTO alpha_backtest (
                     ts_decision, ts_decision_unix, ticker, family,
@@ -343,8 +346,7 @@ def log_decision(
                     cycle_id, notes,
                 ),
             )
-            conn.commit()
-            return cur.lastrowid
+        return cur.lastrowid
     except Exception as e:
         logger.warning("[alpha_log] log_decision(%s) failed: %s", ticker, e)
         return None
@@ -392,7 +394,7 @@ def fill_settlement(
         else:
             won_yes = None
 
-        with DB_WRITE_LOCK:
+        with db_write_ctx(conn):
             if side:
                 cur = conn.execute(
                     """UPDATE alpha_backtest
@@ -411,8 +413,7 @@ def fill_settlement(
                     (ts_settle, ts_settle_unix, settlement_result,
                      realized_pnl_cents, ticker),
                 )
-            conn.commit()
-            return cur.rowcount or 0
+        return cur.rowcount or 0
     except Exception as e:
         logger.warning("[alpha_log] fill_settlement(%s) failed: %s", ticker, e)
         return 0
@@ -457,7 +458,7 @@ def fill_settlement_for_ticker(
             .replace("+00:00", "Z")
         )
 
-        with DB_WRITE_LOCK:
+        with db_write_ctx(conn):
             cur = conn.execute(
                 """UPDATE alpha_backtest
                    SET ts_settle = ?,
@@ -487,8 +488,7 @@ def fill_settlement_for_ticker(
                     ticker,
                 ),
             )
-            conn.commit()
-            return cur.rowcount or 0
+        return cur.rowcount or 0
     except Exception as e:
         logger.warning(
             "[alpha_log] fill_settlement_for_ticker(%s) failed: %s", ticker, e

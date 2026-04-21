@@ -45,6 +45,7 @@ from typing import Optional
 
 from bot.core.categorization import categorize_market
 from bot.daemon.locks import DB_WRITE_LOCK
+from bot.db import db_write_ctx
 from bot.learning.calibration import _prob_bucket_label as _prob_bucket
 
 logger = logging.getLogger(__name__)
@@ -102,7 +103,7 @@ def populate_calibration(conn) -> int:
             return 0
 
         inserted = 0
-        with DB_WRITE_LOCK:
+        with db_write_ctx(conn):
             for alpha_id, ticker, side, p_yes, src_count, won_yes in rows:
                 if p_yes is None:
                     continue
@@ -118,7 +119,6 @@ def populate_calibration(conn) -> int:
                      "alpha:shadow", src_count, bucket, alpha_id),
                 )
                 inserted += 1
-            conn.commit()
         return inserted
     except Exception as e:
         logger.warning("[populate_from_alpha] calibration failed: %s", e)
@@ -153,7 +153,7 @@ def populate_timing_patterns(conn) -> int:
             return 0
 
         inserted = 0
-        with DB_WRITE_LOCK:
+        with db_write_ctx(conn):
             for (alpha_id, ticker, ts_dec, dtype, p_yes, mkt_p, side,
                  won_yes, pnl) in rows:
                 try:
@@ -180,7 +180,6 @@ def populate_timing_patterns(conn) -> int:
                      edge, int(won_yes), pnl, alpha_id),
                 )
                 inserted += 1
-            conn.commit()
         return inserted
     except Exception as e:
         logger.warning("[populate_from_alpha] timing_patterns failed: %s", e)
@@ -220,7 +219,7 @@ def populate_edge_convergence(conn) -> int:
             return 0
 
         inserted = 0
-        with DB_WRITE_LOCK:
+        with db_write_ctx(conn):
             for alpha_id, ticker, side, p_yes, mkt_p, result in rows:
                 settlement_yes = 1.0 if result == "yes" else 0.0
                 our_gap = abs(p_yes - settlement_yes)
@@ -241,7 +240,6 @@ def populate_edge_convergence(conn) -> int:
                      converged, conv_pct, alpha_id),
                 )
                 inserted += 1
-            conn.commit()
         return inserted
     except Exception as e:
         logger.warning("[populate_from_alpha] edge_convergence failed: %s", e)
@@ -273,7 +271,7 @@ def populate_postmortems(conn) -> int:
             return 0
 
         inserted = 0
-        with DB_WRITE_LOCK:
+        with db_write_ctx(conn):
             for (alpha_id, ticker, side, p_yes, mkt_p, price_c, contracts,
                  dtype, sources_json, won_yes, pnl) in rows:
                 cat = categorize_market(ticker, "")
@@ -321,7 +319,6 @@ def populate_postmortems(conn) -> int:
                      price_c, detail, alpha_id),
                 )
                 inserted += 1
-            conn.commit()
         return inserted
     except Exception as e:
         logger.warning("[populate_from_alpha] postmortems failed: %s", e)

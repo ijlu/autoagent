@@ -19,6 +19,11 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from bot.api import _CACHE, rate_limit_wait
+from bot.daemon.stations import (
+    STATION_BY_SERIES,
+    lst_offset_for_station,
+    station_for_ticker,
+)
 from bot.db import get_connection, kv_get, kv_set
 
 
@@ -26,41 +31,20 @@ from bot.db import get_connection, kv_get, kv_set
 # Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Station list driven by the canonical registry (T1.1) — the daemon poller,
+# signal source, MADIS basket, and smart_gates all resolve to the same
+# primary ICAOs. Sorted for deterministic URL for cache-hit stability.
 _METAR_URL = (
     "https://aviationweather.gov/api/data/metar"
-    "?ids=KNYC,KMDW,KLAX,KAUS,KMIA,KDEN&format=json"
+    "?ids=" + ",".join(sorted(s.icao for s in STATION_BY_SERIES.values()))
+    + "&format=json"
 )
 _METAR_CACHE_KEY = "metar_obs"
 _METAR_CACHE_TTL = 300  # 5 minutes
 
-_METAR_STATION_MAP = {
-    "KNYC": "nyc",
-    "KMDW": "chicago",
-    "KLAX": "los angeles",
-    "KAUS": "austin",
-    "KMIA": "miami",
-    "KDEN": "denver",
-}
-
-_TICKER_STATION_MAP = {
-    "KXHIGHNY": "KNYC",
-    "KXHIGHCHI": "KMDW",
-    "KXHIGHLAX": "KLAX",
-    "KXHIGHAUS": "KAUS",
-    "KXHIGHMIA": "KMIA",
-    "KXHIGHDEN": "KDEN",
-}
-
 # CRITICAL: Settlement uses LOCAL STANDARD TIME (LST), NOT daylight saving.
 # During DST months NYC is UTC-4 locally, but settlement boundary is always UTC-5.
-_STATION_LST_OFFSET = {
-    "KNYC": -5,   # EST always
-    "KMDW": -6,   # CST always
-    "KLAX": -8,   # PST always
-    "KAUS": -6,   # CST always
-    "KMIA": -5,   # EST always
-    "KDEN": -7,   # MST always
-}
+# Offsets come from the canonical registry — do NOT maintain a parallel table.
 
 # KV cache TTL for daily high tracking (25 hours -- covers full settlement day + buffer)
 _DAILY_HIGH_TTL = 90_000
@@ -80,7 +64,7 @@ def _logistic_cdf(x: float, mu: float, sigma: float) -> float:
 
 def _get_lst_now(station: str) -> datetime:
     """Return current datetime in the station's LOCAL STANDARD TIME (fixed offset)."""
-    offset_hours = _STATION_LST_OFFSET.get(station, -5)
+    offset_hours = lst_offset_for_station(station)
     lst_tz = timezone(timedelta(hours=offset_hours))
     return datetime.now(lst_tz)
 
@@ -349,14 +333,11 @@ def get_metar_observation_estimate(ticker: str, market_data: dict) -> tuple:
     ticker_upper = ticker.upper() if ticker else ""
     title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
 
-    # ── Match ticker to station ──
-    station = None
-    for prefix, stn in _TICKER_STATION_MAP.items():
-        if prefix in ticker_upper:
-            station = stn
-            break
-    if station is None:
+    # ── Match ticker to station (via canonical registry) ──
+    ws = station_for_ticker(ticker_upper)
+    if ws is None:
         return None, None
+    station = ws.icao
 
     # ── Parse threshold and direction ──
     threshold, is_above = _parse_threshold_from_market(ticker, title)

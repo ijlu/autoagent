@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from bot.config import KELLY_FRACTION
+from bot.db import db_write_ctx
 
 SHADOW_PARAMS = {
     # param_name: [alternative_values_to_test]
@@ -25,44 +26,44 @@ def record_shadow_evaluations(conn, result):
     if not opps:
         return
 
-    for opp in opps:
-        ticker = opp.get("ticker", "")
-        contracts = opp.get("contracts", 0)
-        price_cents = opp.get("price_cents", 50)
-        indep_prob = opp.get("independent_prob")
-        edge = opp.get("edge")
+    with db_write_ctx(conn):
+        for opp in opps:
+            ticker = opp.get("ticker", "")
+            contracts = opp.get("contracts", 0)
+            price_cents = opp.get("price_cents", 50)
+            indep_prob = opp.get("independent_prob")
+            edge = opp.get("edge")
 
-        if not indep_prob or not price_cents:
-            continue
-
-        # Shadow Kelly fractions
-        for shadow_kelly in SHADOW_PARAMS.get("kelly_fraction", []):
-            # Recompute Kelly with shadow value
-            market_prob = price_cents / 100
-            edge_val = indep_prob - market_prob
-            if edge_val <= 0:
+            if not indep_prob or not price_cents:
                 continue
-            b = (100 - price_cents) / price_cents
-            q = 1 - indep_prob
-            kelly_raw = (b * indep_prob - q) / b
-            if kelly_raw <= 0:
-                continue
-            # Use the first session balance as reference
-            bal_row = conn.execute(
-                "SELECT balance_cents FROM sessions ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            balance = bal_row[0] if bal_row else 10000
-            shadow_stake = kelly_raw * shadow_kelly * (balance / 100)
-            shadow_contracts = max(1, int(shadow_stake / (price_cents / 100)))
 
-            conn.execute("""INSERT INTO hyperparam_shadow
-                (recorded_at, param_name, current_value, shadow_value,
-                 ticker, actual_contracts, shadow_contracts, actual_profit, shadow_profit)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (now_str, "kelly_fraction", KELLY_FRACTION, shadow_kelly,
-                 ticker, contracts, shadow_contracts, None, None))
+            # Shadow Kelly fractions
+            for shadow_kelly in SHADOW_PARAMS.get("kelly_fraction", []):
+                # Recompute Kelly with shadow value
+                market_prob = price_cents / 100
+                edge_val = indep_prob - market_prob
+                if edge_val <= 0:
+                    continue
+                b = (100 - price_cents) / price_cents
+                q = 1 - indep_prob
+                kelly_raw = (b * indep_prob - q) / b
+                if kelly_raw <= 0:
+                    continue
+                # Use the first session balance as reference
+                bal_row = conn.execute(
+                    "SELECT balance_cents FROM sessions ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                balance = bal_row[0] if bal_row else 10000
+                shadow_stake = kelly_raw * shadow_kelly * (balance / 100)
+                shadow_contracts = max(1, int(shadow_stake / (price_cents / 100)))
 
-    conn.commit()
+                conn.execute("""INSERT INTO hyperparam_shadow
+                    (recorded_at, param_name, current_value, shadow_value,
+                     ticker, actual_contracts, shadow_contracts, actual_profit, shadow_profit)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (now_str, "kelly_fraction", KELLY_FRACTION, shadow_kelly,
+                     ticker, contracts, shadow_contracts, None, None))
+
 
 
 def analyze_shadow_performance(conn):
@@ -98,27 +99,27 @@ def analyze_shadow_performance(conn):
         groups[key]["shadow_profit"] += per_contract_profit * shadow_c
         groups[key]["n"] += 1
 
-    for (pname, shadow_val), stats in groups.items():
-        if stats["n"] < 10:
-            continue
-        actual = stats["actual_profit"]
-        shadow = stats["shadow_profit"]
-        improvement = (shadow - actual) / abs(actual) if actual != 0 else 0
+    with db_write_ctx(conn):
+        for (pname, shadow_val), stats in groups.items():
+            if stats["n"] < 10:
+                continue
+            actual = stats["actual_profit"]
+            shadow = stats["shadow_profit"]
+            improvement = (shadow - actual) / abs(actual) if actual != 0 else 0
 
-        if abs(improvement) > 0.10:  # >10% difference
-            direction = "better" if improvement > 0 else "worse"
-            print(f"[shadow] {pname}={shadow_val} would be {abs(improvement):.0%} {direction} "
-                  f"than current {stats['current_val']} (n={stats['n']})")
+            if abs(improvement) > 0.10:  # >10% difference
+                direction = "better" if improvement > 0 else "worse"
+                print(f"[shadow] {pname}={shadow_val} would be {abs(improvement):.0%} {direction} "
+                      f"than current {stats['current_val']} (n={stats['n']})")
 
-            if improvement > 0.15 and stats["n"] >= 20:
-                # Strong evidence for change — log recommendation
-                conn.execute("""INSERT INTO strategy_journal
-                    (timestamp, entry_type, category, title, detail, metric_value, metric_name)
-                    VALUES (?,?,?,?,?,?,?)""",
-                    (now_str, "hyperparam_recommendation", pname,
-                     f"Consider changing {pname} from {stats['current_val']} to {shadow_val}",
-                     f"Shadow testing over {stats['n']} trades shows {improvement:.0%} improvement. "
-                     f"Actual profit: {actual:.0f}¢, shadow profit: {shadow:.0f}¢.",
-                     improvement, f"shadow_{pname}"))
+                if improvement > 0.15 and stats["n"] >= 20:
+                    # Strong evidence for change — log recommendation
+                    conn.execute("""INSERT INTO strategy_journal
+                        (timestamp, entry_type, category, title, detail, metric_value, metric_name)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (now_str, "hyperparam_recommendation", pname,
+                         f"Consider changing {pname} from {stats['current_val']} to {shadow_val}",
+                         f"Shadow testing over {stats['n']} trades shows {improvement:.0%} improvement. "
+                         f"Actual profit: {actual:.0f}¢, shadow profit: {shadow:.0f}¢.",
+                         improvement, f"shadow_{pname}"))
 
-    conn.commit()

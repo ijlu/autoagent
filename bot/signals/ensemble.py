@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from bot.config import SOURCE_WEIGHTS, CORRELATED_GROUPS, OPENAI_API_KEY, SOURCE_MAX_HORIZON_DAYS
+from bot.db import db_write_ctx
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -106,44 +107,45 @@ def record_pipeline_health(conn) -> None:
             for source, stats in _PIPELINE_STATS.items()
         }
 
-    for source, stats in stats_snapshot.items():
-        attempted = stats["attempted"]
-        returned = stats["returned"]
-        errors = stats["errors"]
-        latencies = stats["latencies"]
-        avg_latency = sum(latencies) / len(latencies) if latencies else 0
-        error_rate = errors / attempted if attempted > 0 else 0
+    with db_write_ctx(conn):
+        for source, stats in stats_snapshot.items():
+            attempted = stats["attempted"]
+            returned = stats["returned"]
+            errors = stats["errors"]
+            latencies = stats["latencies"]
+            avg_latency = sum(latencies) / len(latencies) if latencies else 0
+            error_rate = errors / attempted if attempted > 0 else 0
 
-        if attempted == 0:
-            status = "idle"
-        elif error_rate > 0.5:
-            status = "degraded"
-        elif returned == 0 and attempted > 0:
-            status = "broken"
-        else:
-            status = "healthy"
+            if attempted == 0:
+                status = "idle"
+            elif error_rate > 0.5:
+                status = "degraded"
+            elif returned == 0 and attempted > 0:
+                status = "broken"
+            else:
+                status = "healthy"
 
-        detail = ""
-        prev = conn.execute("""
-            SELECT markets_attempted, markets_returned, status
-            FROM pipeline_health
-            WHERE source = ? ORDER BY id DESC LIMIT 1
-        """, (source,)).fetchone()
+            detail = ""
+            prev = conn.execute("""
+                SELECT markets_attempted, markets_returned, status
+                FROM pipeline_health
+                WHERE source = ? ORDER BY id DESC LIMIT 1
+            """, (source,)).fetchone()
 
-        if prev and prev[2] == "healthy" and status in ("degraded", "broken"):
-            detail = f"ALERT: {source} degraded from healthy -> {status}"
-            print(f"[pipeline] {detail}")
-        elif prev and prev[1] and prev[1] > 5 and returned == 0:
-            detail = f"ALERT: {source} returned 0 results (was {prev[1]} last run)"
-            print(f"[pipeline] {detail}")
+            if prev and prev[2] == "healthy" and status in ("degraded", "broken"):
+                detail = f"ALERT: {source} degraded from healthy -> {status}"
+                print(f"[pipeline] {detail}")
+            elif prev and prev[1] and prev[1] > 5 and returned == 0:
+                detail = f"ALERT: {source} returned 0 results (was {prev[1]} last run)"
+                print(f"[pipeline] {detail}")
 
-        conn.execute("""INSERT INTO pipeline_health
-            (recorded_at, source, status, markets_attempted, markets_returned,
-             avg_latency_ms, error_rate, detail)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (now_str, source, status, attempted, returned, avg_latency, error_rate, detail))
+            conn.execute("""INSERT INTO pipeline_health
+                (recorded_at, source, status, markets_attempted, markets_returned,
+                 avg_latency_ms, error_rate, detail)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (now_str, source, status, attempted, returned, avg_latency, error_rate, detail))
 
-    conn.commit()
+
     with PIPELINE_STATS_LOCK:
         _PIPELINE_STATS.clear()
 

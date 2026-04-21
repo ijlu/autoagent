@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from bot.core.categorization import categorize_market
+from bot.db import db_write_ctx
 
 # Fee calculations — use exact Kalshi formulas
 from bot.core.money import fee_per_contract_cents as _fee_per_contract_cents
@@ -47,8 +48,9 @@ def run_loss_postmortems(conn):
         return 0
 
     classified = 0
-    for (oid, ticker, revenue, profit, settle_price, contracts,
-         est_prob, mkt_prob, edge, strategy, entry_price) in losses:
+    with db_write_ctx(conn):
+      for (oid, ticker, revenue, profit, settle_price, contracts,
+           est_prob, mkt_prob, edge, strategy, entry_price) in losses:
 
         loss_type = "unknown"
         detail = ""
@@ -95,8 +97,6 @@ def run_loss_postmortems(conn):
             (now_str, oid, ticker, cat, loss_type, strategy,
              est_prob, mkt_prob, edge, settle_price, detail))
         classified += 1
-
-    conn.commit()
 
     # Print summary
     if classified > 0:

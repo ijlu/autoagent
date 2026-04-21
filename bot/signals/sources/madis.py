@@ -30,6 +30,7 @@ from typing import Optional
 import requests
 
 from bot.api import _CACHE, rate_limit_wait
+from bot.daemon.stations import STATION_BY_CITY
 from bot.signals.sources.weather import (
     WEATHER_CITIES,
     _CITY_LST_OFFSET,
@@ -42,16 +43,11 @@ from bot.signals.sources.weather import (
 _MADIS_CACHE_TTL = 300  # 5 min — observations refresh every 5-15 min
 
 # City → nearby-station basket (primary + 2-4 neighbors within ~50mi).
-# These are all ASOS/AWOS stations with hourly/sub-hourly METAR reports.
+# Sourced from the canonical registry (T1.1) so the spatial ensemble
+# reflects whatever basket the daemon/poller considers authoritative.
 _CITY_STATION_BASKET: dict[str, list[str]] = {
-    "nyc":         ["KNYC", "KLGA", "KJFK", "KEWR", "KTEB"],
-    "new york":    ["KNYC", "KLGA", "KJFK", "KEWR", "KTEB"],
-    "chicago":     ["KMDW", "KORD", "KPWK", "KGYY"],
-    "los angeles": ["KLAX", "KBUR", "KSMO", "KLGB"],
-    "la":          ["KLAX", "KBUR", "KSMO", "KLGB"],
-    "austin":      ["KAUS", "KBAZ", "KGTU", "KEDC"],
-    "miami":       ["KMIA", "KFLL", "KTMB", "KHWO"],
-    "denver":      ["KDEN", "KBJC", "KAPA", "KCFO"],
+    city: list(s.madis_basket) for city, s in STATION_BY_CITY.items()
+    if s.madis_basket
 }
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 from bot.api import api_get
+from bot.db import db_write_ctx
 
 
 def check_edge_convergence(conn):
@@ -36,40 +37,39 @@ def check_edge_convergence(conn):
 
     checked = 0
     convergences = []
-    for oid, ticker, side, est_prob, mkt_prob, trade_ts, entry_price in trades:
-        # Fetch current market price for this ticker
-        try:
-            mkt = api_get(f"/markets/{ticker}")
-            current_yes = float(mkt.get("yes_ask") or mkt.get("yes_ask_dollars") or mkt.get("last_price") or mkt.get("last_price_dollars") or 0)
-            if current_yes > 1:
-                current_yes /= 100
-        except Exception:
-            continue
+    with db_write_ctx(conn):
+        for oid, ticker, side, est_prob, mkt_prob, trade_ts, entry_price in trades:
+            # Fetch current market price for this ticker
+            try:
+                mkt = api_get(f"/markets/{ticker}")
+                current_yes = float(mkt.get("yes_ask") or mkt.get("yes_ask_dollars") or mkt.get("last_price") or mkt.get("last_price_dollars") or 0)
+                if current_yes > 1:
+                    current_yes /= 100
+            except Exception:
+                continue
 
-        if current_yes <= 0 or mkt_prob is None or est_prob is None:
-            continue
+            if current_yes <= 0 or mkt_prob is None or est_prob is None:
+                continue
 
-        entry_price_frac = (entry_price / 100) if entry_price and entry_price > 1 else (entry_price or 0)
+            entry_price_frac = (entry_price / 100) if entry_price and entry_price > 1 else (entry_price or 0)
 
-        # Did the market move toward our estimate?
-        original_gap = abs(est_prob - mkt_prob)
-        current_gap = abs(est_prob - current_yes)
+            # Did the market move toward our estimate?
+            original_gap = abs(est_prob - mkt_prob)
+            current_gap = abs(est_prob - current_yes)
 
-        if original_gap > 0.01:  # only check if we had meaningful edge
-            convergence_pct = (original_gap - current_gap) / original_gap
-            converged = 1 if convergence_pct > 0.1 else 0  # >10% closer = convergence
+            if original_gap > 0.01:  # only check if we had meaningful edge
+                convergence_pct = (original_gap - current_gap) / original_gap
+                converged = 1 if convergence_pct > 0.1 else 0  # >10% closer = convergence
 
-            conn.execute("""INSERT INTO edge_convergence
-                (recorded_at, ticker, side, our_estimate, market_price_at_entry,
-                 market_price_after_24h, converged, convergence_pct)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (now_str, ticker, side, est_prob, mkt_prob, current_yes,
-                 converged, convergence_pct))
+                conn.execute("""INSERT INTO edge_convergence
+                    (recorded_at, ticker, side, our_estimate, market_price_at_entry,
+                     market_price_after_24h, converged, convergence_pct)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (now_str, ticker, side, est_prob, mkt_prob, current_yes,
+                     converged, convergence_pct))
 
-            convergences.append(convergence_pct)
-            checked += 1
-
-    conn.commit()
+                convergences.append(convergence_pct)
+                checked += 1
 
     if convergences:
         avg_conv = sum(convergences) / len(convergences)

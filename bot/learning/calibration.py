@@ -38,6 +38,8 @@ import math
 import time
 from typing import Any, Optional
 
+from bot.db import db_write_ctx
+
 # Global scope for per-run curve caching in a process (short-circuit for the
 # legacy trade.py code path that reset a module-level curve each cycle). Not
 # used by the daemon — the daemon reads from kv_cache per cycle.
@@ -385,8 +387,8 @@ def fit_and_persist(conn) -> dict:
     """Fit the curve, persist to kv_cache, return the curve."""
     curve = fit_calibration(conn)
     try:
-        save_curve(conn, curve)
-        conn.commit()
+        with db_write_ctx(conn):
+            save_curve(conn, curve)
     except Exception as e:
         print(f"[calibration] save_curve failed: {e}")
     return curve

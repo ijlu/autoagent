@@ -50,6 +50,7 @@ from typing import Any, Optional
 
 from bot.config import DIRECTIONAL_BLOCKED_FAMILIES
 from bot.daemon.locks import DB_WRITE_LOCK
+from bot.db import db_write_ctx
 from bot.learning.directional_shadow import (
     DEFAULT_MIN_CANARY_SETTLED,
     DEFAULT_MIN_EDGE_BEAT,
@@ -182,7 +183,11 @@ def _fetch_settled_rows(
 
     `limit` clips to the most-recent N rows (SQL orders DESC then we reverse).
     """
-    conn.row_factory = sqlite3.Row
+    # Use a local cursor with its own row_factory — never mutate the shared
+    # daemon connection's row_factory, which would race with other threads
+    # (see T0.2 and regression 15 in CLAUDE.md).
+    cursor = conn.cursor()
+    cursor.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in outcomes)
     sql = (
         "SELECT ensemble_p_yes, market_prob_yes, won_yes, "
@@ -199,7 +204,7 @@ def _fetch_settled_rows(
     sql += "ORDER BY ts_decision_unix DESC"
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
-    rows = conn.execute(sql, params).fetchall()
+    rows = cursor.execute(sql, params).fetchall()
     return list(reversed(rows))  # oldest → newest
 
 
@@ -398,8 +403,8 @@ def _log_event(
     now = time.time()
     iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat(
         timespec="seconds").replace("+00:00", "Z")
-    with DB_WRITE_LOCK:
-        try:
+    try:
+        with db_write_ctx(conn):
             conn.execute(
                 "INSERT INTO promotion_events "
                 "(ts_unix,ts_iso,family,old_state,new_state,reason,"
@@ -408,9 +413,8 @@ def _log_event(
                 (now, iso, family.upper(), old_state, new_state, reason,
                  trigger, json.dumps(metrics), int(bool(manual))),
             )
-            conn.commit()
-        except Exception as exc:  # pragma: no cover — logging is best-effort
-            logger.warning("[shadow-promotion] event log failed: %s", exc)
+    except Exception as exc:  # pragma: no cover — logging is best-effort
+        logger.warning("[shadow-promotion] event log failed: %s", exc)
 
 
 def _transition(

@@ -10,6 +10,8 @@ import json
 import time
 from datetime import datetime, timezone
 
+from bot.db import db_write_ctx
+
 # ---------------------------------------------------------------------------
 # Local guardrails (canonical copy; mirrors bot.config.GUARDRAILS but kept
 # self-contained so this module never silently inherits unrelated changes).
@@ -53,17 +55,17 @@ def _table_exists(conn, table_name: str) -> bool:
 def _ensure_config_version_table(conn) -> bool:
     """Create the config_versions audit table if missing.  Returns True on success."""
     try:
-        conn.execute("""CREATE TABLE IF NOT EXISTS config_versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            param_name TEXT NOT NULL,
-            old_value TEXT,
-            new_value TEXT,
-            reason TEXT,
-            evidence_n INTEGER DEFAULT 0,
-            version INTEGER DEFAULT 1,
-            created_at TEXT NOT NULL
-        )""")
-        conn.commit()
+        with db_write_ctx(conn):
+            conn.execute("""CREATE TABLE IF NOT EXISTS config_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                param_name TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                reason TEXT,
+                evidence_n INTEGER DEFAULT 0,
+                version INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL
+            )""")
         return True
     except Exception:
         return False
@@ -281,21 +283,21 @@ def record_config_version(
         next_version = 1
 
     try:
-        conn.execute(
-            """INSERT INTO config_versions
-               (param_name, old_value, new_value, reason, evidence_n, version, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                param_name,
-                str(old_value),
-                str(new_value),
-                reason,
-                evidence_count,
-                next_version,
-                _now_iso(),
-            ),
-        )
-        conn.commit()
+        with db_write_ctx(conn):
+            conn.execute(
+                """INSERT INTO config_versions
+                   (param_name, old_value, new_value, reason, evidence_n, version, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    param_name,
+                    str(old_value),
+                    str(new_value),
+                    reason,
+                    evidence_count,
+                    next_version,
+                    _now_iso(),
+                ),
+            )
     except Exception:
         pass
 
@@ -409,22 +411,22 @@ def _write_learned_config(conn, param_name: str, old_value, new_value, reason: s
     except Exception:
         next_version = 1
 
-    conn.execute(
-        """INSERT INTO learned_config (param_name, value, updated_at, evidence, previous_value, version)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(param_name) DO UPDATE SET
-               value = excluded.value,
-               updated_at = excluded.updated_at,
-               evidence = excluded.evidence,
-               previous_value = excluded.previous_value,
-               version = excluded.version""",
-        (
-            param_name,
-            str(new_value),
-            now,
-            evidence,
-            str(old_value),
-            next_version,
-        ),
-    )
-    conn.commit()
+    with db_write_ctx(conn):
+        conn.execute(
+            """INSERT INTO learned_config (param_name, value, updated_at, evidence, previous_value, version)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(param_name) DO UPDATE SET
+                   value = excluded.value,
+                   updated_at = excluded.updated_at,
+                   evidence = excluded.evidence,
+                   previous_value = excluded.previous_value,
+                   version = excluded.version""",
+            (
+                param_name,
+                str(new_value),
+                now,
+                evidence,
+                str(old_value),
+                next_version,
+            ),
+        )
