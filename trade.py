@@ -75,6 +75,19 @@ SINGLE_SOURCE_EDGE = float(os.environ.get("SINGLE_SOURCE_EDGE", "0.12"))  # 12% 
 MAX_PER_CATEGORY   = int(os.environ.get("MAX_PER_CATEGORY", "2"))        # max concurrent positions per risk category
 MAX_PORTFOLIO_PCT  = float(os.environ.get("MAX_PORTFOLIO_PCT", "0.15"))   # max 15% of balance in open positions
 
+# ── Immutable initial-config snapshot ─────────────────────────────────────────
+# Captured once at module import. apply_phase_limits() and the active-feedback
+# block MUST derive effective values from these, not from the current mutated
+# globals, otherwise each daemon cycle compounds the multiplication and drives
+# KELLY→0 / MIN_EDGE→∞ as process lifetime grows. See tests/test_config_no_drift.py.
+_INITIAL_DRY_RUN          = DRY_RUN
+_INITIAL_MAX_POSITION_PCT = MAX_POSITION_PCT
+_INITIAL_MAX_PORTFOLIO_PCT = MAX_PORTFOLIO_PCT
+_INITIAL_MAX_CONTRACTS    = MAX_CONTRACTS
+_INITIAL_KELLY_FRACTION   = KELLY_FRACTION
+_INITIAL_MIN_EDGE         = MIN_EDGE
+_INITIAL_SINGLE_SOURCE_EDGE = SINGLE_SOURCE_EDGE
+
 # Fee accounting: use exact Kalshi formulas from bot/core/money.py
 # Old flat estimate ESTIMATED_FEE_PER_CONTRACT=0.03 was ~3-7x too high for maker orders.
 # Now we compute price-dependent fees: maker entry + taker exit per contract.
@@ -223,25 +236,32 @@ def compute_current_phase(conn):
     return current_phase, PHASE_CONFIG[current_phase], stats
 
 def apply_phase_limits(phase_num, phase_cfg):
-    """Apply phase-specific limits to global config variables.
-    Returns a dict of the effective limits for logging."""
+    """Derive phase-adjusted trading limits from the immutable INITIAL snapshot.
+
+    This function is idempotent: calling it N times in a long-lived daemon with
+    the same inputs always produces the same output. It never reads the current
+    mutated globals, so per-cycle multiplications cannot compound over the
+    process lifetime. Globals are still *written* (for read-compat with the
+    rest of trade.py) but always from _INITIAL_* values.
+
+    Returns a dict of the effective limits for logging and downstream threading.
+    """
     global DRY_RUN, MAX_POSITION_PCT, MAX_PORTFOLIO_PCT, MAX_CONTRACTS
     global KELLY_FRACTION, MIN_EDGE, SINGLE_SOURCE_EDGE
 
     _, _, max_pos_pct, max_port_pct, max_contracts, kelly_mult, edge_mult, desc = phase_cfg
 
     # DIRECTIONAL TRADING DISABLED (V4): losing -$93.93 at 16% win rate.
-    # Force DRY_RUN=True for all phases so directional orders never go live.
     DRY_RUN = True
 
-    # Apply limits — never exceed what the phase allows, but respect
-    # user-configured values if they're MORE conservative
-    MAX_POSITION_PCT = min(MAX_POSITION_PCT, max_pos_pct)
-    MAX_PORTFOLIO_PCT = min(MAX_PORTFOLIO_PCT, max_port_pct)
-    MAX_CONTRACTS = min(MAX_CONTRACTS, max_contracts)
-    KELLY_FRACTION = KELLY_FRACTION * kelly_mult
-    MIN_EDGE = MIN_EDGE * edge_mult
-    SINGLE_SOURCE_EDGE = SINGLE_SOURCE_EDGE * edge_mult
+    # Take the more conservative of (user-configured initial, phase cap).
+    MAX_POSITION_PCT = min(_INITIAL_MAX_POSITION_PCT, max_pos_pct)
+    MAX_PORTFOLIO_PCT = min(_INITIAL_MAX_PORTFOLIO_PCT, max_port_pct)
+    MAX_CONTRACTS = min(_INITIAL_MAX_CONTRACTS, max_contracts)
+    # Multiplicative params derive from INITIAL, not current globals.
+    KELLY_FRACTION = _INITIAL_KELLY_FRACTION * kelly_mult
+    MIN_EDGE = _INITIAL_MIN_EDGE * edge_mult
+    SINGLE_SOURCE_EDGE = _INITIAL_SINGLE_SOURCE_EDGE * edge_mult
 
     effective = {
         "phase": phase_num, "description": desc,
@@ -373,35 +393,58 @@ def prune_stale_orders():
 
 def _init_position_health_table(conn):
     """Create position_health_log table for bandit learning on exit decisions."""
-    conn.execute("""CREATE TABLE IF NOT EXISTS position_health_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        ticker TEXT NOT NULL,
-        side TEXT NOT NULL,
-        quantity INTEGER,
-        health_score REAL,
-        remaining_edge REAL,
-        edge_trend REAL,
-        action TEXT,          -- hold, graduated_trim, graduated_half, etc.
-        exit_qty INTEGER,
-        settlement_result TEXT DEFAULT NULL,  -- filled post-settlement for learning
-        settlement_pnl_cents INTEGER DEFAULT NULL
-    )""")
-    conn.commit()
+    with db_write_ctx(conn):
+        conn.execute("""CREATE TABLE IF NOT EXISTS position_health_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER,
+            health_score REAL,
+            remaining_edge REAL,
+            edge_trend REAL,
+            action TEXT,          -- hold, graduated_trim, graduated_half, etc.
+            exit_qty INTEGER,
+            settlement_result TEXT DEFAULT NULL,  -- filled post-settlement for learning
+            settlement_pnl_cents INTEGER DEFAULT NULL
+        )""")
+        # Idempotent column adds — exit-model + calibration analysis need fresh_prob
+        # and source-count trajectories, not just the composite edge snapshot.
+        for col, coltype in (
+            ("fresh_prob", "REAL"),
+            ("fresh_source_count", "INTEGER"),
+            ("entry_edge", "REAL"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE position_health_log ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass  # column exists
 
 
 def _log_position_health(conn, ticker, side, quantity, health,
-                          remaining_edge, trend, action, exit_qty):
-    """Log a position health evaluation for future bandit learning."""
+                          remaining_edge, trend, action, exit_qty,
+                          fresh_prob=None, fresh_source_count=None,
+                          entry_edge=None):
+    """Log a position health evaluation for future bandit learning.
+
+    fresh_prob / fresh_source_count capture the ensemble's current FV so the
+    trajectory can be reconstructed per position. entry_edge is the edge at
+    the time we opened the position — needed by the edge-decay exit model
+    (task 4) to compute remaining_edge / entry_edge ratios.
+    """
     try:
-        conn.execute("""INSERT INTO position_health_log
-            (timestamp, ticker, side, quantity, health_score, remaining_edge,
-             edge_trend, action, exit_qty)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (datetime.now(timezone.utc).isoformat(), ticker, side, quantity,
-             round(health, 4), round(remaining_edge, 4),
-             round(trend, 4), action, exit_qty))
-        conn.commit()
+        with db_write_ctx(conn):
+            conn.execute("""INSERT INTO position_health_log
+                (timestamp, ticker, side, quantity, health_score, remaining_edge,
+                 edge_trend, action, exit_qty,
+                 fresh_prob, fresh_source_count, entry_edge)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.now(timezone.utc).isoformat(), ticker, side, quantity,
+                 round(health, 4), round(remaining_edge, 4),
+                 round(trend, 4), action, exit_qty,
+                 round(fresh_prob, 4) if fresh_prob is not None else None,
+                 fresh_source_count,
+                 round(entry_edge, 4) if entry_edge is not None else None))
     except Exception as e:
         print(f"[health] log_position_health failed: {e}")
 
@@ -454,15 +497,20 @@ def manage_positions(conn, dynamic_sizing=None):
         exit_price = yes_bid if side == "yes" else no_bid
         if exit_price <= 0: continue
 
-        # Look up entry price from our trades DB
+        # Look up entry price + entry edge from our trades DB. entry_edge
+        # feeds the edge-decay exit model (task 4) and lets the bandit
+        # learn remaining_edge / entry_edge ratios at settlement.
         trade = conn.execute(
-            "SELECT price_cents, timestamp FROM trades WHERE ticker=? AND side=? AND action='buy' ORDER BY id DESC LIMIT 1",
+            "SELECT price_cents, timestamp, edge FROM trades "
+            "WHERE ticker=? AND side=? AND action='buy' ORDER BY id DESC LIMIT 1",
             (ticker, side)
         ).fetchone()
 
+        entry_edge = None
         if trade:
             entry_price = trade[0] / 100  # cents to fraction
             entry_time  = trade[1]
+            entry_edge = trade[2]  # float or None
         else:
             # Fallback: use position's average cost if available
             entry_price = float(pos.get("average_price_paid") or pos.get("market_exposure") or 0)
@@ -588,7 +636,10 @@ def manage_positions(conn, dynamic_sizing=None):
                           f"— SETTLEMENT CERTAINTY HOLD")
                     _log_position_health(conn, ticker, side, quantity,
                                          our_prob, remaining_edge, 0.0,
-                                         "settlement_hold", 0)
+                                         "settlement_hold", 0,
+                                         fresh_prob=fresh_prob,
+                                         fresh_source_count=fresh_n,
+                                         entry_edge=entry_edge)
                     continue  # skip to next position
 
             # Time decay multiplier: require more edge as expiry approaches
@@ -620,6 +671,37 @@ def manage_positions(conn, dynamic_sizing=None):
                 if avg_earlier != 0:
                     trend_score = max(-1, min(1, (avg_recent - avg_earlier) / max(abs(avg_earlier), 0.01)))
 
+            # ── Edge-decay hard trigger ─────────────────────────────────
+            # Runs before the composite health score when entry_edge is
+            # available. Inverted-thesis and decayed-below-floor exits are
+            # the semantic anchor; time + stale backstops cover frozen-
+            # ensemble failure modes. Composite health-score still applies
+            # when entry_edge is missing (older positions, shadow-only).
+            if entry_edge is not None and fresh_prob is not None and fresh_n > 0:
+                from bot.core.exit_model import evaluate_edge_decay_exit
+                from bot.config import (
+                    EXIT_EDGE_DECAY_RATIO, EXIT_TIME_BACKSTOP_HOURS,
+                    EXIT_TIME_BACKSTOP_EDGE_ABS, EXIT_STALE_HOLD_HOURS,
+                )
+                _decay_dec = evaluate_edge_decay_exit(
+                    entry_edge=entry_edge,
+                    remaining_edge=remaining_edge,
+                    hours_to_expiry=hours_to_expiry,
+                    hours_held=days_held * 24.0,
+                    trend_score=trend_score,
+                    decay_ratio=EXIT_EDGE_DECAY_RATIO,
+                    time_backstop_hours=EXIT_TIME_BACKSTOP_HOURS,
+                    time_backstop_edge_abs=EXIT_TIME_BACKSTOP_EDGE_ABS,
+                    stale_hold_hours=EXIT_STALE_HOLD_HOURS,
+                )
+                if _decay_dec.trigger is not None:
+                    exit_reason = f"edge_decay_{_decay_dec.trigger}: {_decay_dec.detail}"
+                    # Urgency: flipped edge is most urgent (thesis inverted),
+                    # decayed is moderate, backstops patient.
+                    exit_urgency = (2 if _decay_dec.trigger == "edge_flipped"
+                                    else 1 if _decay_dec.trigger == "edge_decayed"
+                                    else 0)
+
             # Source confidence factor: more sources = more trust in the estimate
             confidence = min(1.0, fresh_n / 3.0) if fresh_n > 0 else 0.3
 
@@ -643,7 +725,13 @@ def manage_positions(conn, dynamic_sizing=None):
                       0.10 * confidence)
 
             # ── Map health to action ──
-            if health >= 0.65:
+            # Edge-decay trigger (above) may have already set exit_reason.
+            # When it has, skip the health-score branching so we exit at
+            # the semantically-anchored reason rather than re-deriving from
+            # the composite — and exit_qty stays at the default (full exit).
+            if exit_reason:
+                pass  # fall through to exit-execution below
+            elif health >= 0.65:
                 # Healthy — hold
                 print(f"[positions] {ticker} {side} x{quantity}: "
                       f"entry={entry_price:.2f} now={exit_price:.2f} pnl={pnl_pct:+.0%} "
@@ -652,7 +740,10 @@ def manage_positions(conn, dynamic_sizing=None):
                       f"held={days_held:.1f}d — HOLD")
                 # Log health for learning
                 _log_position_health(conn, ticker, side, quantity, health,
-                                     remaining_edge, trend_score, "hold", 0)
+                                     remaining_edge, trend_score, "hold", 0,
+                                     fresh_prob=fresh_prob,
+                                     fresh_source_count=fresh_n,
+                                     entry_edge=entry_edge)
                 continue
             elif health >= 0.45 and quantity > _trim_thresh:
                 # Moderate — trim 25-33% (only if position is large enough)
@@ -724,7 +815,9 @@ def manage_positions(conn, dynamic_sizing=None):
         if side == "yes":
             # Exiting YES → buy NO.  NO price = 100 - yes_bid.
             # Urgency adjusts how much above ask we're willing to pay.
-            base_no_price = max(1, 100 - int(yes_bid * 100))
+            # round(), not int(): avoids 1¢ misprice from float underflow
+            # (CLAUDE.md §5 — fixed-point parsing).
+            base_no_price = max(1, 100 - round(yes_bid * 100))
             if exit_urgency >= 2:
                 opp_price_cents = min(99, base_no_price + 3)
             elif exit_urgency == 1:
@@ -733,7 +826,7 @@ def manage_positions(conn, dynamic_sizing=None):
                 opp_price_cents = min(99, base_no_price)
         else:
             # Exiting NO → buy YES.  YES price = 100 - no_bid.
-            base_yes_price = max(1, 100 - int(no_bid * 100))
+            base_yes_price = max(1, 100 - round(no_bid * 100))
             if exit_urgency >= 2:
                 opp_price_cents = min(99, base_yes_price + 3)
             elif exit_urgency == 1:
@@ -745,6 +838,10 @@ def manage_positions(conn, dynamic_sizing=None):
         error = None
         if not DRY_RUN:
             try:
+                # mm_exit_ prefix: fills writer's source_tagger routes this to
+                # `exit`. Periods stripped per Kalshi constraint (CLAUDE.md
+                # §Known Bug Pattern #1).
+                client_id = f"mm_exit_{ticker.replace('.', '_')}_{int(time.time())}"
                 order_body = {
                     "ticker": ticker,
                     "side": opp_side,
@@ -753,6 +850,7 @@ def manage_positions(conn, dynamic_sizing=None):
                     ("yes_price" if opp_side == "yes" else "no_price"): opp_price_cents,
                     "action": "buy",
                     "expiration_ts": int(time.time() + ORDER_MAX_AGE_HOURS * 3600),
+                    "client_order_id": client_id,
                 }
                 # Urgency 0: patient exit — post_only to get maker fee, rests at ask
                 # Urgency 1+: must cross the spread to fill — no post_only
@@ -773,15 +871,18 @@ def manage_positions(conn, dynamic_sizing=None):
         # Log for bandit learning
         _log_position_health(conn, ticker, side, exit_qty,
                              health, remaining_edge, trend_score,
-                             exit_reason.split(":")[0], exit_qty)
+                             exit_reason.split(":")[0], exit_qty,
+                             fresh_prob=fresh_prob,
+                             fresh_source_count=fresh_n,
+                             entry_edge=entry_edge)
 
-        conn.execute("""INSERT INTO position_exits
-            (timestamp, ticker, side, entry_price_cents, exit_price_cents,
-             contracts, exit_reason, order_id, error)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (now.isoformat(), ticker, side, int(entry_price * 100),
-             opp_price_cents, quantity, exit_reason, order_id, error))
-        conn.commit()
+        with db_write_ctx(conn):
+            conn.execute("""INSERT INTO position_exits
+                (timestamp, ticker, side, entry_price_cents, exit_price_cents,
+                 contracts, exit_reason, order_id, error)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (now.isoformat(), ticker, side, round(entry_price * 100),
+                 opp_price_cents, quantity, exit_reason, order_id, error))
         exits += 1
 
     print(f"[positions] {exits} exit orders placed")
@@ -799,7 +900,7 @@ CACHE_TTL = 60  # seconds
 # ── Persistent cache (SQLite) — canonical implementation in bot/db ──────
 import json as _json_mod  # kept for other uses in trade.py
 
-from bot.db import kv_get as _db_cache_get, kv_set as _db_cache_set, kv_cleanup as _db_cache_cleanup  # noqa: E402
+from bot.db import kv_get as _db_cache_get, kv_set as _db_cache_set, kv_cleanup as _db_cache_cleanup, db_write_ctx  # noqa: E402
 
 # ── Rate limiter: per-domain minimum interval between requests ───────────
 _RATE_LIMITS = {
@@ -3362,169 +3463,171 @@ def record_settlements(conn):
     _settlement_alerts = []  # large losses to alert on
     now_str = datetime.now(timezone.utc).isoformat()
 
-    for s in settlements:
-        ticker = s.get("ticker", "")
-        if not ticker:
-            continue
+    with db_write_ctx(conn):
+        for s in settlements:
+            ticker = s.get("ticker", "")
+            if not ticker:
+                continue
 
-        # Skip personal/manual trades
-        ticker_upper = ticker.upper()
-        if any(ticker_upper.startswith(pfx) for pfx in _PERSONAL_PREFIXES):
-            skipped_personal += 1
-            continue
+            # Skip personal/manual trades
+            ticker_upper = ticker.upper()
+            if any(ticker_upper.startswith(pfx) for pfx in _PERSONAL_PREFIXES):
+                skipped_personal += 1
+                continue
 
-        # Use ticker as unique key (one settlement per ticker per account)
-        if conn.execute("SELECT 1 FROM settlements WHERE ticker=? AND order_id LIKE 'settlement_%'",
-                        (ticker,)).fetchone():
-            skipped_dup += 1
-            continue
+            # Use ticker as unique key (one settlement per ticker per account)
+            if conn.execute("SELECT 1 FROM settlements WHERE ticker=? AND order_id LIKE 'settlement_%'",
+                            (ticker,)).fetchone():
+                skipped_dup += 1
+                continue
 
-        # Check if this ticker was traded by the bot (mm_orders or trades table)
-        # For MM trades, use AVG(price_cents) as actual entry cost, not fair_value_cents
-        mm_row = conn.execute(
-            "SELECT AVG(price_cents), tag FROM mm_orders WHERE ticker=? AND fill_qty > 0",
-            (ticker,)).fetchone()
-        dir_row = conn.execute(
-            "SELECT price_cents, strategy, independent_prob FROM trades WHERE ticker=? LIMIT 1",
-            (ticker,)).fetchone()
-
-        # Also check safe_compounder_orders
-        sc_row = None
-        try:
-            sc_row = conn.execute(
-                "SELECT no_price_cents FROM safe_compounder_orders WHERE ticker=? AND settled=0 LIMIT 1",
+            # Check if this ticker was traded by the bot (mm_orders or trades table)
+            # For MM trades, use AVG(price_cents) as actual entry cost, not fair_value_cents
+            mm_row = conn.execute(
+                "SELECT AVG(price_cents), tag FROM mm_orders WHERE ticker=? AND fill_qty > 0",
                 (ticker,)).fetchone()
-        except Exception:
-            pass  # table might not exist yet
-
-        if mm_row and mm_row[0] is not None:
-            strat = "mm:" + (mm_row[1] or "mm_v1")
-            est_prob = None
-            pc = int(mm_row[0])  # AVG actual fill price, not fair value
-        elif sc_row:
-            strat = "safe_compounder"
-            est_prob = None
-            pc = sc_row[0]
-        elif dir_row:
-            pc = dir_row[0]
-            strat = dir_row[1]
-            est_prob = dir_row[2]
-        else:
-            # Not in our DB — might be a personal trade or from before bot started
-            skipped_notours += 1
-            continue
-
-        # Parse settlement data from Kalshi API
-        revenue = int(s.get("revenue", 0))
-        result = s.get("market_result", "")  # "yes" or "no"
-        yes_count = float(s.get("yes_count_fp", 0))
-        no_count = float(s.get("no_count_fp", 0))
-        yes_cost = float(s.get("yes_total_cost_dollars", 0)) * 100  # to cents
-        no_cost = float(s.get("no_total_cost_dollars", 0)) * 100
-        # Fee from Kalshi API (dollars → cents)
-        fee_raw = s.get("fee_cost") or s.get("fee_cost_dollars") or 0
-        fee_cents = float(fee_raw) * 100 if fee_raw and float(fee_raw) < 100 else float(fee_raw or 0)
-        contracts = int(round(yes_count + no_count))
-        total_cost = int(yes_cost + no_cost)
-
-        # Profit = revenue - cost - fees (V5: was missing fee subtraction)
-        profit = revenue - total_cost - int(fee_cents)
-        # Won = profit > 0 (V5: was revenue > 0, which ignores fees and can mislabel)
-        won = 1 if profit > 0 else 0
-
-        # Determine side from position
-        side = "yes" if yes_count > no_count else "no"
-
-        # Use "settlement_<ticker>" as settlement key
-        settlement_id = f"settlement_{ticker}"
-
-        conn.execute("""INSERT OR IGNORE INTO settlements
-            (recorded_at, order_id, ticker, side, price_cents, contracts,
-             revenue_cents, profit_cents, won, volume, spread_cents, strategy)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_str, settlement_id, ticker, side,
-             pc, contracts, revenue, profit, won, None, None, strat))
-
-        # Back-fill position_health_log so the bandit can train on which
-        # health-band decisions held winning vs losing positions. Stamp every
-        # prior health log for this ticker with the final settlement outcome.
-        if result in ("yes", "no"):
-            try:
-                conn.execute(
-                    "UPDATE position_health_log "
-                    "SET settlement_result=?, settlement_pnl_cents=? "
-                    "WHERE ticker=? AND settlement_result IS NULL",
-                    (result, profit, ticker),
-                )
-            except Exception as e:
-                print(f"[health] position_health_log backfill failed for {ticker}: {e}")
-
-        # Mark matching alpha_backtest shadow rows settled (both sides). Uses
-        # counterfactual P&L per row — this is the Phase 1 gate input.
-        if result in ("yes", "no"):
-            try:
-                _alpha_fill_settlement(conn, ticker=ticker, settlement_result=result)
-            except Exception as e:
-                print(f"[alpha_log] fill failed for {ticker}: {e}")
-
-        # Phase 1 step 10: annotate matching weather_mm_shadow rows with P&L
-        # so the MM promotion gate has realized-spread-capture data.
-        # Only weather tickers have shadow rows; other families simply no-op.
-        if result in ("yes", "no"):
-            try:
-                from bot.learning.mm_promotion import annotate_shadow_pnl
-                annotate_shadow_pnl(
-                    conn, ticker,
-                    won_yes=(result == "yes"),
-                    ts_settle_unix=time.time(),
-                )
-            except Exception as e:
-                print(f"[mm_promotion] annotate failed for {ticker}: {e}")
-
-        # Record calibration data for directional trades with estimates
-        if est_prob is not None:
-            bucket = _prob_bucket(est_prob)
-            conn.execute("""INSERT INTO calibration
-                (recorded_at, ticker, estimated_prob, actual_outcome, source_desc, n_sources, bucket)
-                VALUES (?,?,?,?,?,?,?)""",
-                (now_str, ticker, est_prob, won, strat, None, bucket))
-        elif mm_row and mm_row[0] is not None:
-            # MM trades: use AVG(fair_value_cents)/100 as estimated probability
-            mm_fv = conn.execute(
-                "SELECT AVG(fair_value_cents) FROM mm_orders WHERE ticker=? AND fill_qty > 0",
+            dir_row = conn.execute(
+                "SELECT price_cents, strategy, independent_prob FROM trades WHERE ticker=? LIMIT 1",
                 (ticker,)).fetchone()
-            if mm_fv and mm_fv[0] is not None:
-                mm_est_prob = mm_fv[0] / 100.0
-                mm_bucket = _prob_bucket(mm_est_prob)
+
+            # Also check safe_compounder_orders
+            sc_row = None
+            try:
+                sc_row = conn.execute(
+                    "SELECT no_price_cents FROM safe_compounder_orders WHERE ticker=? AND settled=0 LIMIT 1",
+                    (ticker,)).fetchone()
+            except Exception:
+                pass  # table might not exist yet
+
+            if mm_row and mm_row[0] is not None:
+                strat = "mm:" + (mm_row[1] or "mm_v1")
+                est_prob = None
+                pc = int(mm_row[0])  # AVG actual fill price, not fair value
+            elif sc_row:
+                strat = "safe_compounder"
+                est_prob = None
+                pc = sc_row[0]
+            elif dir_row:
+                pc = dir_row[0]
+                strat = dir_row[1]
+                est_prob = dir_row[2]
+            else:
+                # Not in our DB — might be a personal trade or from before bot started
+                skipped_notours += 1
+                continue
+
+            # Parse settlement data from Kalshi API
+            revenue = int(s.get("revenue", 0))
+            result = s.get("market_result", "")  # "yes" or "no"
+            yes_count = float(s.get("yes_count_fp", 0))
+            no_count = float(s.get("no_count_fp", 0))
+            yes_cost = float(s.get("yes_total_cost_dollars", 0)) * 100  # to cents
+            no_cost = float(s.get("no_total_cost_dollars", 0)) * 100
+            # Fee from Kalshi API (dollars → cents)
+            fee_raw = s.get("fee_cost") or s.get("fee_cost_dollars") or 0
+            fee_cents = float(fee_raw) * 100 if fee_raw and float(fee_raw) < 100 else float(fee_raw or 0)
+            contracts = int(round(yes_count + no_count))
+            # Use round(), not int(): dollars→cents float conversion can produce
+            # 28.9999... from "0.29" which int() truncates to 28. Matches the
+            # "Fixed-point parsing" known-bug pattern (CLAUDE.md §5).
+            total_cost = round(yes_cost + no_cost)
+
+            # Profit = revenue - cost - fees (V5: was missing fee subtraction)
+            profit = revenue - total_cost - round(fee_cents)
+            # Won = profit > 0 (V5: was revenue > 0, which ignores fees and can mislabel)
+            won = 1 if profit > 0 else 0
+
+            # Determine side from position
+            side = "yes" if yes_count > no_count else "no"
+
+            # Use "settlement_<ticker>" as settlement key
+            settlement_id = f"settlement_{ticker}"
+
+            conn.execute("""INSERT OR IGNORE INTO settlements
+                (recorded_at, order_id, ticker, side, price_cents, contracts,
+                 revenue_cents, profit_cents, won, volume, spread_cents, strategy)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (now_str, settlement_id, ticker, side,
+                 pc, contracts, revenue, profit, won, None, None, strat))
+
+            # Back-fill position_health_log so the bandit can train on which
+            # health-band decisions held winning vs losing positions. Stamp every
+            # prior health log for this ticker with the final settlement outcome.
+            if result in ("yes", "no"):
+                try:
+                    conn.execute(
+                        "UPDATE position_health_log "
+                        "SET settlement_result=?, settlement_pnl_cents=? "
+                        "WHERE ticker=? AND settlement_result IS NULL",
+                        (result, profit, ticker),
+                    )
+                except Exception as e:
+                    print(f"[health] position_health_log backfill failed for {ticker}: {e}")
+
+            # Mark matching alpha_backtest shadow rows settled (both sides). Uses
+            # counterfactual P&L per row — this is the Phase 1 gate input.
+            if result in ("yes", "no"):
+                try:
+                    _alpha_fill_settlement(conn, ticker=ticker, settlement_result=result)
+                except Exception as e:
+                    print(f"[alpha_log] fill failed for {ticker}: {e}")
+
+            # Phase 1 step 10: annotate matching weather_mm_shadow rows with P&L
+            # so the MM promotion gate has realized-spread-capture data.
+            # Only weather tickers have shadow rows; other families simply no-op.
+            if result in ("yes", "no"):
+                try:
+                    from bot.learning.mm_promotion import annotate_shadow_pnl
+                    annotate_shadow_pnl(
+                        conn, ticker,
+                        won_yes=(result == "yes"),
+                        ts_settle_unix=time.time(),
+                    )
+                except Exception as e:
+                    print(f"[mm_promotion] annotate failed for {ticker}: {e}")
+
+            # Record calibration data for directional trades with estimates
+            if est_prob is not None:
+                bucket = _prob_bucket(est_prob)
                 conn.execute("""INSERT INTO calibration
                     (recorded_at, ticker, estimated_prob, actual_outcome, source_desc, n_sources, bucket)
                     VALUES (?,?,?,?,?,?,?)""",
-                    (now_str, ticker, mm_est_prob, won, strat, None, mm_bucket))
+                    (now_str, ticker, est_prob, won, strat, None, bucket))
+            elif mm_row and mm_row[0] is not None:
+                # MM trades: use AVG(fair_value_cents)/100 as estimated probability
+                mm_fv = conn.execute(
+                    "SELECT AVG(fair_value_cents) FROM mm_orders WHERE ticker=? AND fill_qty > 0",
+                    (ticker,)).fetchone()
+                if mm_fv and mm_fv[0] is not None:
+                    mm_est_prob = mm_fv[0] / 100.0
+                    mm_bucket = _prob_bucket(mm_est_prob)
+                    conn.execute("""INSERT INTO calibration
+                        (recorded_at, ticker, estimated_prob, actual_outcome, source_desc, n_sources, bucket)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (now_str, ticker, mm_est_prob, won, strat, None, mm_bucket))
 
-        # Zero mm_inventory for settled tickers (canonical settlement path)
-        # This is the ONLY place inventory should be zeroed for settlements
-        try:
-            conn.execute(
-                "UPDATE mm_inventory SET net_position=0, realized_pnl_cents = realized_pnl_cents + ? WHERE ticker=?",
-                (profit, ticker))
-        except Exception as e:
-            print(f"[settlement] mm_inventory zero failed for {ticker}: {e}")
+            # Zero mm_inventory for settled tickers (canonical settlement path)
+            # This is the ONLY place inventory should be zeroed for settlements
+            try:
+                conn.execute(
+                    "UPDATE mm_inventory SET net_position=0, realized_pnl_cents = realized_pnl_cents + ? WHERE ticker=?",
+                    (profit, ticker))
+            except Exception as e:
+                print(f"[settlement] mm_inventory zero failed for {ticker}: {e}")
 
-        # Mark Safe Compounder orders as settled
-        try:
-            conn.execute(
-                "UPDATE safe_compounder_orders SET settled=1, settlement_pnl_cents=? WHERE ticker=? AND settled=0",
-                (profit, ticker))
-        except Exception as e:
-            print(f"[settlement] SC settle failed for {ticker}: {e}")
+            # Mark Safe Compounder orders as settled
+            try:
+                conn.execute(
+                    "UPDATE safe_compounder_orders SET settled=1, settlement_pnl_cents=? WHERE ticker=? AND settled=0",
+                    (profit, ticker))
+            except Exception as e:
+                print(f"[settlement] SC settle failed for {ticker}: {e}")
 
-        recorded += 1
-        # Track large losses for Telegram alert
-        if profit < -50:  # loss > 50¢
-            _settlement_alerts.append({"ticker": ticker, "profit_cents": profit})
+            recorded += 1
+            # Track large losses for Telegram alert
+            if profit < -50:  # loss > 50¢
+                _settlement_alerts.append({"ticker": ticker, "profit_cents": profit})
 
-    if recorded > 0:
-        conn.commit()
     print(f"[learn] Settlements: {recorded} recorded, {skipped_personal} personal (skipped), "
           f"{skipped_notours} not ours, {skipped_dup} already recorded")
 
@@ -3949,56 +4052,55 @@ def run_loss_postmortems(conn):
         return 0
 
     classified = 0
-    for (oid, ticker, revenue, profit, settle_price, contracts,
-         est_prob, mkt_prob, edge, strategy, entry_price) in losses:
+    with db_write_ctx(conn):
+        for (oid, ticker, revenue, profit, settle_price, contracts,
+             est_prob, mkt_prob, edge, strategy, entry_price) in losses:
 
-        loss_type = "unknown"
-        detail = ""
-        title = ""
-        cat = categorize_market(ticker, title)
-
-        if est_prob is not None and mkt_prob is not None and edge is not None:
-            # How wrong were we?
-            # Compare our estimate to what the market was pricing at entry.
-            # A large gap (est >> market) that still lost = bad source signal.
-            estimation_error = est_prob - mkt_prob  # our estimate vs market consensus
-
-            if abs(estimation_error) > 0.30:
-                loss_type = "bad_source"
-                detail = (f"Estimated {est_prob:.0%} probability but lost. "
-                         f"Sources: {strategy}. Major estimation failure.")
-            elif edge is not None and abs(edge) < 0.07:
-                # Fee calculation: exit slippage + price-dependent round-trip fees
-                fee_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(mkt_prob)
-                if edge > 0 and edge < fee_cost:
-                    loss_type = "fee_erosion"
-                    detail = (f"Edge of {edge:.1%} was below fee cost ~{fee_cost:.1%}. "
-                             f"Would need >{fee_cost:.1%} edge to be profitable after fees.")
-                else:
-                    loss_type = "efficient_market"
-                    detail = (f"Edge was only {edge:.1%}. Market was approximately correct. "
-                             f"Our estimate {est_prob:.2f} vs market {mkt_prob:.2f}.")
-            elif est_prob is not None and est_prob > 0.55:
-                # We were fairly confident but still lost — could be adverse selection
-                loss_type = "adverse_selection"
-                detail = (f"Confident estimate ({est_prob:.0%}) but lost. "
-                         f"Possible informed traders on other side or stale data.")
-            else:
-                loss_type = "bad_source"
-                detail = f"Estimate {est_prob:.2f}, edge {edge:.1%}. Sources: {strategy}"
-        else:
             loss_type = "unknown"
-            detail = "Missing estimation data for analysis"
+            detail = ""
+            title = ""
+            cat = categorize_market(ticker, title)
 
-        conn.execute("""INSERT INTO loss_postmortems
-            (recorded_at, order_id, ticker, category, loss_type, source_combo,
-             estimated_prob, market_prob, edge_at_entry, price_at_settlement, detail)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_str, oid, ticker, cat, loss_type, strategy,
-             est_prob, mkt_prob, edge, settle_price, detail))
-        classified += 1
+            if est_prob is not None and mkt_prob is not None and edge is not None:
+                # How wrong were we?
+                # Compare our estimate to what the market was pricing at entry.
+                # A large gap (est >> market) that still lost = bad source signal.
+                estimation_error = est_prob - mkt_prob  # our estimate vs market consensus
 
-    conn.commit()
+                if abs(estimation_error) > 0.30:
+                    loss_type = "bad_source"
+                    detail = (f"Estimated {est_prob:.0%} probability but lost. "
+                             f"Sources: {strategy}. Major estimation failure.")
+                elif edge is not None and abs(edge) < 0.07:
+                    # Fee calculation: exit slippage + price-dependent round-trip fees
+                    fee_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(mkt_prob)
+                    if edge > 0 and edge < fee_cost:
+                        loss_type = "fee_erosion"
+                        detail = (f"Edge of {edge:.1%} was below fee cost ~{fee_cost:.1%}. "
+                                 f"Would need >{fee_cost:.1%} edge to be profitable after fees.")
+                    else:
+                        loss_type = "efficient_market"
+                        detail = (f"Edge was only {edge:.1%}. Market was approximately correct. "
+                                 f"Our estimate {est_prob:.2f} vs market {mkt_prob:.2f}.")
+                elif est_prob is not None and est_prob > 0.55:
+                    # We were fairly confident but still lost — could be adverse selection
+                    loss_type = "adverse_selection"
+                    detail = (f"Confident estimate ({est_prob:.0%}) but lost. "
+                             f"Possible informed traders on other side or stale data.")
+                else:
+                    loss_type = "bad_source"
+                    detail = f"Estimate {est_prob:.2f}, edge {edge:.1%}. Sources: {strategy}"
+            else:
+                loss_type = "unknown"
+                detail = "Missing estimation data for analysis"
+
+            conn.execute("""INSERT INTO loss_postmortems
+                (recorded_at, order_id, ticker, category, loss_type, source_combo,
+                 estimated_prob, market_prob, edge_at_entry, price_at_settlement, detail)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (now_str, oid, ticker, cat, loss_type, strategy,
+                 est_prob, mkt_prob, edge, settle_price, detail))
+            classified += 1
 
     # Print summary
     if classified > 0:
@@ -4236,46 +4338,45 @@ def record_pipeline_health(conn):
     """Record this run's pipeline health stats and detect degradations."""
     now_str = datetime.now(timezone.utc).isoformat()
 
-    for source, stats in _PIPELINE_STATS.items():
-        attempted = stats["attempted"]
-        returned = stats["returned"]
-        errors = stats["errors"]
-        latencies = stats["latencies"]
-        avg_latency = sum(latencies) / len(latencies) if latencies else 0
-        error_rate = errors / attempted if attempted > 0 else 0
+    with db_write_ctx(conn):
+        for source, stats in _PIPELINE_STATS.items():
+            attempted = stats["attempted"]
+            returned = stats["returned"]
+            errors = stats["errors"]
+            latencies = stats["latencies"]
+            avg_latency = sum(latencies) / len(latencies) if latencies else 0
+            error_rate = errors / attempted if attempted > 0 else 0
 
-        # Determine status
-        if attempted == 0:
-            status = "idle"
-        elif error_rate > 0.5:
-            status = "degraded"
-        elif returned == 0 and attempted > 0:
-            status = "broken"
-        else:
-            status = "healthy"
+            # Determine status
+            if attempted == 0:
+                status = "idle"
+            elif error_rate > 0.5:
+                status = "degraded"
+            elif returned == 0 and attempted > 0:
+                status = "broken"
+            else:
+                status = "healthy"
 
-        detail = ""
-        # Compare to historical health for this source
-        prev = conn.execute("""
-            SELECT markets_attempted, markets_returned, status
-            FROM pipeline_health
-            WHERE source = ? ORDER BY id DESC LIMIT 1
-        """, (source,)).fetchone()
+            detail = ""
+            # Compare to historical health for this source
+            prev = conn.execute("""
+                SELECT markets_attempted, markets_returned, status
+                FROM pipeline_health
+                WHERE source = ? ORDER BY id DESC LIMIT 1
+            """, (source,)).fetchone()
 
-        if prev and prev[2] == "healthy" and status in ("degraded", "broken"):
-            detail = f"ALERT: {source} degraded from healthy → {status}"
-            print(f"[pipeline] ⚠️  {detail}")
-        elif prev and prev[1] and prev[1] > 5 and returned == 0:
-            detail = f"ALERT: {source} returned 0 results (was {prev[1]} last run)"
-            print(f"[pipeline] ⚠️  {detail}")
+            if prev and prev[2] == "healthy" and status in ("degraded", "broken"):
+                detail = f"ALERT: {source} degraded from healthy → {status}"
+                print(f"[pipeline] ⚠️  {detail}")
+            elif prev and prev[1] and prev[1] > 5 and returned == 0:
+                detail = f"ALERT: {source} returned 0 results (was {prev[1]} last run)"
+                print(f"[pipeline] ⚠️  {detail}")
 
-        conn.execute("""INSERT INTO pipeline_health
-            (recorded_at, source, status, markets_attempted, markets_returned,
-             avg_latency_ms, error_rate, detail)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (now_str, source, status, attempted, returned, avg_latency, error_rate, detail))
-
-    conn.commit()
+            conn.execute("""INSERT INTO pipeline_health
+                (recorded_at, source, status, markets_attempted, markets_returned,
+                 avg_latency_ms, error_rate, detail)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (now_str, source, status, attempted, returned, avg_latency, error_rate, detail))
     _PIPELINE_STATS.clear()
 
     # Print summary
@@ -4323,40 +4424,39 @@ def check_edge_convergence(conn):
 
     checked = 0
     convergences = []
-    for oid, ticker, side, est_prob, mkt_prob, trade_ts, entry_price in trades:
-        # Fetch current market price for this ticker
-        try:
-            mkt = api_get(f"/markets/{ticker}")
-            current_yes = float(mkt.get("yes_ask") or mkt.get("yes_ask_dollars") or mkt.get("last_price") or mkt.get("last_price_dollars") or 0)
-            if current_yes > 1:
-                current_yes /= 100
-        except Exception:
-            continue
+    with db_write_ctx(conn):
+        for oid, ticker, side, est_prob, mkt_prob, trade_ts, entry_price in trades:
+            # Fetch current market price for this ticker
+            try:
+                mkt = api_get(f"/markets/{ticker}")
+                current_yes = float(mkt.get("yes_ask") or mkt.get("yes_ask_dollars") or mkt.get("last_price") or mkt.get("last_price_dollars") or 0)
+                if current_yes > 1:
+                    current_yes /= 100
+            except Exception:
+                continue
 
-        if current_yes <= 0 or mkt_prob is None or est_prob is None:
-            continue
+            if current_yes <= 0 or mkt_prob is None or est_prob is None:
+                continue
 
-        entry_price_frac = (entry_price / 100) if entry_price and entry_price > 1 else (entry_price or 0)
+            entry_price_frac = (entry_price / 100) if entry_price and entry_price > 1 else (entry_price or 0)
 
-        # Did the market move toward our estimate?
-        original_gap = abs(est_prob - mkt_prob)
-        current_gap = abs(est_prob - current_yes)
+            # Did the market move toward our estimate?
+            original_gap = abs(est_prob - mkt_prob)
+            current_gap = abs(est_prob - current_yes)
 
-        if original_gap > 0.01:  # only check if we had meaningful edge
-            convergence_pct = (original_gap - current_gap) / original_gap
-            converged = 1 if convergence_pct > 0.1 else 0  # >10% closer = convergence
+            if original_gap > 0.01:  # only check if we had meaningful edge
+                convergence_pct = (original_gap - current_gap) / original_gap
+                converged = 1 if convergence_pct > 0.1 else 0  # >10% closer = convergence
 
-            conn.execute("""INSERT INTO edge_convergence
-                (recorded_at, ticker, side, our_estimate, market_price_at_entry,
-                 market_price_after_24h, converged, convergence_pct)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (now_str, ticker, side, est_prob, mkt_prob, current_yes,
-                 converged, convergence_pct))
+                conn.execute("""INSERT INTO edge_convergence
+                    (recorded_at, ticker, side, our_estimate, market_price_at_entry,
+                     market_price_after_24h, converged, convergence_pct)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (now_str, ticker, side, est_prob, mkt_prob, current_yes,
+                     converged, convergence_pct))
 
-            convergences.append(convergence_pct)
-            checked += 1
-
-    conn.commit()
+                convergences.append(convergence_pct)
+                checked += 1
 
     if convergences:
         avg_conv = sum(convergences) / len(convergences)
@@ -4410,27 +4510,26 @@ def record_timing_data(conn):
         return 0
 
     recorded = 0
-    for oid, ticker, won, profit, trade_ts, strategy, edge in rows:
-        try:
-            dt = datetime.fromisoformat(trade_ts.replace("Z", "+00:00"))
-        except Exception:
-            continue
+    with db_write_ctx(conn):
+        for oid, ticker, won, profit, trade_ts, strategy, edge in rows:
+            try:
+                dt = datetime.fromisoformat(trade_ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
 
-        hour_utc = dt.hour
-        dow = dt.weekday()  # 0=Monday
-        cat = categorize_market(ticker, "")
+            hour_utc = dt.hour
+            dow = dt.weekday()  # 0=Monday
+            cat = categorize_market(ticker, "")
 
-        # Extract primary source from strategy string
-        sources = _parse_sources_from_strategy(strategy)
-        primary_source = sources[0] if sources else "unknown"
+            # Extract primary source from strategy string
+            sources = _parse_sources_from_strategy(strategy)
+            primary_source = sources[0] if sources else "unknown"
 
-        conn.execute("""INSERT INTO timing_patterns
-            (recorded_at, order_id, hour_utc, day_of_week, category, source, edge, won, profit_cents)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (now_str, oid, hour_utc, dow, cat, primary_source, edge, won, profit))
-        recorded += 1
-
-    conn.commit()
+            conn.execute("""INSERT INTO timing_patterns
+                (recorded_at, order_id, hour_utc, day_of_week, category, source, edge, won, profit_cents)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (now_str, oid, hour_utc, dow, cat, primary_source, edge, won, profit))
+            recorded += 1
 
     # Analyze timing patterns if we have enough data
     if recorded > 0:
@@ -4513,44 +4612,43 @@ def record_shadow_evaluations(conn, result):
     if not opps:
         return
 
-    for opp in opps:
-        ticker = opp.get("ticker", "")
-        contracts = opp.get("contracts", 0)
-        price_cents = opp.get("price_cents", 50)
-        indep_prob = opp.get("independent_prob")
-        edge = opp.get("edge")
+    with db_write_ctx(conn):
+        for opp in opps:
+            ticker = opp.get("ticker", "")
+            contracts = opp.get("contracts", 0)
+            price_cents = opp.get("price_cents", 50)
+            indep_prob = opp.get("independent_prob")
+            edge = opp.get("edge")
 
-        if not indep_prob or not price_cents:
-            continue
-
-        # Shadow Kelly fractions
-        for shadow_kelly in SHADOW_PARAMS.get("kelly_fraction", []):
-            # Recompute Kelly with shadow value
-            market_prob = price_cents / 100
-            edge_val = indep_prob - market_prob
-            if edge_val <= 0:
+            if not indep_prob or not price_cents:
                 continue
-            b = (100 - price_cents) / price_cents
-            q = 1 - indep_prob
-            kelly_raw = (b * indep_prob - q) / b
-            if kelly_raw <= 0:
-                continue
-            # Use the first session balance as reference
-            bal_row = conn.execute(
-                "SELECT balance_cents FROM sessions ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            balance = bal_row[0] if bal_row else 10000
-            shadow_stake = kelly_raw * shadow_kelly * (balance / 100)
-            shadow_contracts = max(1, int(shadow_stake / (price_cents / 100)))
 
-            conn.execute("""INSERT INTO hyperparam_shadow
-                (recorded_at, param_name, current_value, shadow_value,
-                 ticker, actual_contracts, shadow_contracts, actual_profit, shadow_profit)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (now_str, "kelly_fraction", KELLY_FRACTION, shadow_kelly,
-                 ticker, contracts, shadow_contracts, None, None))
+            # Shadow Kelly fractions
+            for shadow_kelly in SHADOW_PARAMS.get("kelly_fraction", []):
+                # Recompute Kelly with shadow value
+                market_prob = price_cents / 100
+                edge_val = indep_prob - market_prob
+                if edge_val <= 0:
+                    continue
+                b = (100 - price_cents) / price_cents
+                q = 1 - indep_prob
+                kelly_raw = (b * indep_prob - q) / b
+                if kelly_raw <= 0:
+                    continue
+                # Use the first session balance as reference
+                bal_row = conn.execute(
+                    "SELECT balance_cents FROM sessions ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                balance = bal_row[0] if bal_row else 10000
+                shadow_stake = kelly_raw * shadow_kelly * (balance / 100)
+                shadow_contracts = max(1, int(shadow_stake / (price_cents / 100)))
 
-    conn.commit()
+                conn.execute("""INSERT INTO hyperparam_shadow
+                    (recorded_at, param_name, current_value, shadow_value,
+                     ticker, actual_contracts, shadow_contracts, actual_profit, shadow_profit)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (now_str, "kelly_fraction", KELLY_FRACTION, shadow_kelly,
+                     ticker, contracts, shadow_contracts, None, None))
 
 def analyze_shadow_performance(conn):
     """After settlements, compare actual vs shadow performance.
@@ -4585,30 +4683,29 @@ def analyze_shadow_performance(conn):
         groups[key]["shadow_profit"] += per_contract_profit * shadow_c
         groups[key]["n"] += 1
 
-    for (pname, shadow_val), stats in groups.items():
-        if stats["n"] < 10:
-            continue
-        actual = stats["actual_profit"]
-        shadow = stats["shadow_profit"]
-        improvement = (shadow - actual) / abs(actual) if actual != 0 else 0
+    with db_write_ctx(conn):
+        for (pname, shadow_val), stats in groups.items():
+            if stats["n"] < 10:
+                continue
+            actual = stats["actual_profit"]
+            shadow = stats["shadow_profit"]
+            improvement = (shadow - actual) / abs(actual) if actual != 0 else 0
 
-        if abs(improvement) > 0.10:  # >10% difference
-            direction = "better" if improvement > 0 else "worse"
-            print(f"[shadow] {pname}={shadow_val} would be {abs(improvement):.0%} {direction} "
-                  f"than current {stats['current_val']} (n={stats['n']})")
+            if abs(improvement) > 0.10:  # >10% difference
+                direction = "better" if improvement > 0 else "worse"
+                print(f"[shadow] {pname}={shadow_val} would be {abs(improvement):.0%} {direction} "
+                      f"than current {stats['current_val']} (n={stats['n']})")
 
-            if improvement > 0.15 and stats["n"] >= 20:
-                # Strong evidence for change — log recommendation
-                conn.execute("""INSERT INTO strategy_journal
-                    (timestamp, entry_type, category, title, detail, metric_value, metric_name)
-                    VALUES (?,?,?,?,?,?,?)""",
-                    (now_str, "hyperparam_recommendation", pname,
-                     f"Consider changing {pname} from {stats['current_val']} to {shadow_val}",
-                     f"Shadow testing over {stats['n']} trades shows {improvement:.0%} improvement. "
-                     f"Actual profit: {actual:.0f}¢, shadow profit: {shadow:.0f}¢.",
-                     improvement, f"shadow_{pname}"))
-
-    conn.commit()
+                if improvement > 0.15 and stats["n"] >= 20:
+                    # Strong evidence for change — log recommendation
+                    conn.execute("""INSERT INTO strategy_journal
+                        (timestamp, entry_type, category, title, detail, metric_value, metric_name)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (now_str, "hyperparam_recommendation", pname,
+                         f"Consider changing {pname} from {stats['current_val']} to {shadow_val}",
+                         f"Shadow testing over {stats['n']} trades shows {improvement:.0%} improvement. "
+                         f"Actual profit: {actual:.0f}¢, shadow profit: {shadow:.0f}¢.",
+                         improvement, f"shadow_{pname}"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5568,27 +5665,26 @@ def track_fills(conn):
         print(f"[fills] Could not fetch orders: {e}"); return
 
     filled = partial = unfilled = 0
-    for o in orders:
-        oid = o.get("order_id", "")
-        status = o.get("status", "")
-        if not oid:
-            continue
-        if status in ("executed", "filled"):
-            filled += 1
-        elif status == "partial":
-            partial += 1
-        elif status in ("canceled", "cancelled", "expired"):
-            unfilled += 1
-        else:
-            continue
+    with db_write_ctx(conn):
+        for o in orders:
+            oid = o.get("order_id", "")
+            status = o.get("status", "")
+            if not oid:
+                continue
+            if status in ("executed", "filled"):
+                filled += 1
+            elif status == "partial":
+                partial += 1
+            elif status in ("canceled", "cancelled", "expired"):
+                unfilled += 1
+            else:
+                continue
 
-        # Update our trades table with fill status
-        # Allow promotion: partial → filled/executed (no IS NULL restriction)
-        conn.execute(
-            "UPDATE trades SET fill_status=? WHERE order_id=?",
-            (status, oid))
-
-    conn.commit()
+            # Update our trades table with fill status
+            # Allow promotion: partial → filled/executed (no IS NULL restriction)
+            conn.execute(
+                "UPDATE trades SET fill_status=? WHERE order_id=?",
+                (status, oid))
     total = filled + partial + unfilled
     if total > 0:
         fill_rate = (filled + partial) / total
@@ -6023,7 +6119,8 @@ def generate_performance_report(conn, result):
     except Exception as e:
         print(f"[report] Failed to write report: {e}")
 
-    conn.commit()
+    with db_write_ctx(conn):
+        pass  # no-op commit preserved from prior semantics
     return report_text
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6053,19 +6150,19 @@ _SC_MAX_HOURS_TO_EXPIRY = 168  # don't lock up capital > 7 days
 
 def _init_sc_table(conn):
     """Create safe_compounder_orders table for tracking."""
-    conn.execute("""CREATE TABLE IF NOT EXISTS safe_compounder_orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT,
-        ticker TEXT,
-        no_price_cents INTEGER,
-        contracts INTEGER,
-        equity_cents INTEGER,
-        order_id TEXT,
-        status TEXT DEFAULT 'posted',
-        settled INTEGER DEFAULT 0,
-        settlement_pnl_cents INTEGER DEFAULT 0,
-        error TEXT)""")
-    conn.commit()
+    with db_write_ctx(conn):
+        conn.execute("""CREATE TABLE IF NOT EXISTS safe_compounder_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            ticker TEXT,
+            no_price_cents INTEGER,
+            contracts INTEGER,
+            equity_cents INTEGER,
+            order_id TEXT,
+            status TEXT DEFAULT 'posted',
+            settled INTEGER DEFAULT 0,
+            settlement_pnl_cents INTEGER DEFAULT 0,
+            error TEXT)""")
 
 
 def safe_compounder_scan(conn, markets, balance_cents, portfolio_value):
@@ -6194,13 +6291,14 @@ def safe_compounder_scan(conn, markets, balance_cents, portfolio_value):
 
         # Edge calculation: our "edge" is (1 - yes_price) - no_ask
         # If YES is at 10¢, fair NO is ~90¢. If NO ask is 85¢, edge = 5¢.
+        # round(), not int(): float*100 can underflow by 1¢ (CLAUDE.md §5).
         implied_no_fair = 1.0 - yes_indicator
         no_ask_price = no_ask
-        edge_cents = int((implied_no_fair - no_ask_price) * 100)
+        edge_cents = round((implied_no_fair - no_ask_price) * 100)
 
         # Require at least 3¢ edge after estimated fees (use canonical formula)
         from bot.core.money import kalshi_maker_fee
-        est_fee = kalshi_maker_fee(1, int(no_ask * 100))  # per-contract fee at this price
+        est_fee = kalshi_maker_fee(1, round(no_ask * 100))  # per-contract fee at this price
         net_edge = edge_cents - est_fee
         if net_edge < 3:
             log_opportunity(conn, ticker, "safe_compounder", "skip_edge", side="no",
@@ -6236,60 +6334,62 @@ def safe_compounder_scan(conn, markets, balance_cents, portfolio_value):
           f"{slots_available} slots available")
 
     orders_placed = 0
-    for c in candidates[:slots_available]:
-        ticker = c["ticker"]
-        no_ask_cents = int(c["no_ask"] * 100)
+    with db_write_ctx(conn):
+        for c in candidates[:slots_available]:
+            ticker = c["ticker"]
+            # round(), not int(): float*100 underflows 28.999... → 28 vs 29
+            # (known bug pattern #5, also causes mispriced orders that won't fill).
+            no_ask_cents = round(c["no_ask"] * 100)
 
-        # Size: max_per_position / no_ask_cents, min 1 contract
-        contracts = max(1, min(50, max_per_position // no_ask_cents))
+            # Size: max_per_position / no_ask_cents, min 1 contract
+            contracts = max(1, min(50, max_per_position // no_ask_cents))
 
-        # Sanity cap: don't exceed 50% of orderbook depth
-        try:
-            book = api_get(f"/markets/{ticker}/orderbook")
-            no_bids = book.get("orderbook", {}).get("no", [])
-            depth = sum(int(level[1]) for level in no_bids) if no_bids else 999
-            contracts = min(contracts, max(1, depth // 2))
-        except Exception:
-            pass  # if we can't check depth, use calculated size
-
-        print(f"  {ticker}: YES={c['yes_price']:.0%}  NO_ask={no_ask_cents}¢  "
-              f"edge={c['net_edge']}¢  vol={c['volume']:.0f}  "
-              f"expiry={c['hours_to_expiry']:.0f}h  [{c['category']}] → "
-              f"BUY NO x{contracts}")
-
-        order_id = None
-        error = None
-        if not SC_DRY_RUN:  # SC has its own dry-run flag (separate from MM and directional)
+            # Sanity cap: don't exceed 50% of orderbook depth
             try:
-                client_id = f"mm_sc_{ticker.replace('.', '_')}_{int(time.time())}"
-                resp = api_post("/portfolio/orders", {
-                    "ticker": ticker,
-                    "side": "no",
-                    "type": "limit",
-                    "count": contracts,
-                    "no_price": no_ask_cents,
-                    "action": "buy",
-                    "expiration_ts": int(time.time() + 3600),  # 1h to fill
-                    "client_order_id": client_id,
-                })
-                order_id = resp.get("order", {}).get("order_id", "")
-                print(f"    ✓ order {order_id[:12]}")
-                orders_placed += 1
-            except Exception as e:
-                error = str(e)
-                print(f"    ✗ {error}")
-        else:
-            print(f"    [DRY] would buy NO x{contracts} @ {no_ask_cents}¢")
-            orders_placed += 1
+                book = api_get(f"/markets/{ticker}/orderbook")
+                no_bids = book.get("orderbook", {}).get("no", [])
+                depth = sum(int(level[1]) for level in no_bids) if no_bids else 999
+                contracts = min(contracts, max(1, depth // 2))
+            except Exception:
+                pass  # if we can't check depth, use calculated size
 
-        # Record
-        conn.execute("""INSERT INTO safe_compounder_orders
-            (timestamp, ticker, no_price_cents, contracts, equity_cents,
-             order_id, status, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (now.isoformat(), ticker, no_ask_cents, contracts,
-             total_equity_cents, order_id, "posted" if order_id else "dry_run", error))
-        conn.commit()
+            print(f"  {ticker}: YES={c['yes_price']:.0%}  NO_ask={no_ask_cents}¢  "
+                  f"edge={c['net_edge']}¢  vol={c['volume']:.0f}  "
+                  f"expiry={c['hours_to_expiry']:.0f}h  [{c['category']}] → "
+                  f"BUY NO x{contracts}")
+
+            order_id = None
+            error = None
+            if not SC_DRY_RUN:  # SC has its own dry-run flag (separate from MM and directional)
+                try:
+                    client_id = f"mm_sc_{ticker.replace('.', '_')}_{int(time.time())}"
+                    resp = api_post("/portfolio/orders", {
+                        "ticker": ticker,
+                        "side": "no",
+                        "type": "limit",
+                        "count": contracts,
+                        "no_price": no_ask_cents,
+                        "action": "buy",
+                        "expiration_ts": int(time.time() + 3600),  # 1h to fill
+                        "client_order_id": client_id,
+                    })
+                    order_id = resp.get("order", {}).get("order_id", "")
+                    print(f"    ✓ order {order_id[:12]}")
+                    orders_placed += 1
+                except Exception as e:
+                    error = str(e)
+                    print(f"    ✗ {error}")
+            else:
+                print(f"    [DRY] would buy NO x{contracts} @ {no_ask_cents}¢")
+                orders_placed += 1
+
+            # Record
+            conn.execute("""INSERT INTO safe_compounder_orders
+                (timestamp, ticker, no_price_cents, contracts, equity_cents,
+                 order_id, status, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (now.isoformat(), ticker, no_ask_cents, contracts,
+                 total_equity_cents, order_id, "posted" if order_id else "dry_run", error))
 
     stats["orders_placed"] = orders_placed
     print(f"[sc] Safe Compounder: {orders_placed} orders placed "
@@ -6441,13 +6541,17 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             "convergence_rate": active_feedback["convergence_rate"],
             "strategy_stats": active_feedback.get("strategy_stats", {}),
         }
-        # Apply edge multiplier from convergence + loss analysis
+        # Apply edge multiplier from convergence + loss analysis. Derive from
+        # the phase-applied effective_limits (not current globals) so the
+        # multiplication cannot compound across daemon cycles. See T0.1 notes
+        # on apply_phase_limits.
         if active_feedback["edge_multiplier"] != 1.0:
-            MIN_EDGE *= active_feedback["edge_multiplier"]
-            SINGLE_SOURCE_EDGE *= active_feedback["edge_multiplier"]
+            fb_mult = active_feedback["edge_multiplier"]
+            MIN_EDGE = effective_limits["min_edge"] * fb_mult
+            SINGLE_SOURCE_EDGE = effective_limits["single_source_edge"] * fb_mult
             print(f"[feedback] Adjusted MIN_EDGE to {MIN_EDGE:.3f}, "
                   f"SINGLE_SOURCE_EDGE to {SINGLE_SOURCE_EDGE:.3f} "
-                  f"(multiplier={active_feedback['edge_multiplier']:.2f})")
+                  f"(multiplier={fb_mult:.2f})")
 
         # Check if current hour should be skipped
         current_hour = datetime.now(timezone.utc).hour
@@ -6564,14 +6668,20 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
         # including within-cycle accumulation from accepted candidates.
         from bot.core.exposure import (
             compute_family_exposures,
+            compute_expiry_exposures,
             size_trade_against_family_cap,
+            size_trade_against_expiry_cap,
         )
-        from bot.config import MAX_FAMILY_EXPOSURE_RATIO
+        from bot.config import MAX_FAMILY_EXPOSURE_RATIO, MAX_EXPIRY_EXPOSURE_RATIO
         family_exposures = compute_family_exposures(existing_pos)
+        expiry_exposures = compute_expiry_exposures(existing_pos)
         total_equity_cents = initial_balance + portfolio_value
         if family_exposures:
             print(f"[family_cap] Existing exposure by family (cents): "
                   f"{dict(sorted(family_exposures.items(), key=lambda kv: -kv[1])[:5])}")
+        if expiry_exposures:
+            print(f"[expiry_cap] Existing exposure by expiry (cents): "
+                  f"{dict(sorted(expiry_exposures.items(), key=lambda kv: -kv[1])[:5])}")
 
         filtered_candidates = []
         for c in candidates:
@@ -6761,13 +6871,41 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                 print(f"  → {ticker}: family cap reduced {contracts}→{_fam_contracts}")
                 contracts = _fam_contracts
                 order_cost_cents = contracts * price_cents
-            # Update running family accumulator so the next candidate in this
-            # cycle sees what we just committed to.
-            from bot.core.exposure import family_from_ticker as _fam_of
+
+            # Per-settlement-event cap: bounds one-FOMC or one-weather-date
+            # concentration where family-cap pools unrelated settle dates.
+            # Runs after family cap so the tighter of the two binds.
+            _exp_contracts, _exp_skip = size_trade_against_expiry_cap(
+                ticker=ticker,
+                proposed_contracts=contracts,
+                price_cents=price_cents,
+                expiry_exposures=expiry_exposures,
+                total_equity_cents=total_equity_cents,
+                max_expiry_ratio=MAX_EXPIRY_EXPOSURE_RATIO,
+            )
+            if _exp_skip is not None:
+                print(f"  → {ticker}: SKIP — {_exp_skip} "
+                      f"(cap={MAX_EXPIRY_EXPOSURE_RATIO:.1%} of equity)")
+                continue
+            if _exp_contracts < contracts:
+                print(f"  → {ticker}: expiry cap reduced {contracts}→{_exp_contracts}")
+                contracts = _exp_contracts
+                order_cost_cents = contracts * price_cents
+            # Update running accumulators so the next candidate in this
+            # cycle sees what we just committed to (both family + expiry).
+            from bot.core.exposure import (
+                family_from_ticker as _fam_of,
+                expiry_from_ticker as _exp_of,
+            )
             _fam_key = _fam_of(ticker)
             if _fam_key:
                 family_exposures[_fam_key] = (
                     family_exposures.get(_fam_key, 0) + order_cost_cents
+                )
+            _exp_key = _exp_of(ticker)
+            if _exp_key:
+                expiry_exposures[_exp_key] = (
+                    expiry_exposures.get(_exp_key, 0) + order_cost_cents
                 )
 
             opp = {"ticker":ticker, "side":side, "strategy":strategy,
@@ -6814,11 +6952,16 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
 
             order_id = error = None
             if not DRY_RUN and _is_live_family and ticker:
+                # mm_dir_ prefix: fills writer's source_tagger routes this to
+                # `directional`. Periods stripped per Kalshi constraint
+                # (CLAUDE.md §Known Bug Pattern #1).
+                client_id = f"mm_dir_{ticker.replace('.', '_')}_{int(time.time())}"
                 order_body = {"ticker":ticker, "side":side, "type":"limit",
                     "count":contracts,
                     ("yes_price" if side=="yes" else "no_price"): price_cents,
                     "action":"buy",
-                    "expiration_ts": int(time.time() + ORDER_MAX_AGE_HOURS * 3600)}
+                    "expiration_ts": int(time.time() + ORDER_MAX_AGE_HOURS * 3600),
+                    "client_order_id": client_id}
                 try:
                     resp = api_post("/portfolio/orders", order_body)
                     order_id = resp.get("order",{}).get("order_id") or str(resp)
@@ -6832,13 +6975,13 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             else:
                 result["orders_placed"].append({"ticker":ticker,"contracts":contracts,"dry_run":True})
 
-            conn.execute("""INSERT INTO trades
-                (timestamp,ticker,side,action,score,reason,strategy,price_cents,contracts,
-                 volume,spread_cents,independent_prob,market_prob,edge,dry_run,order_id,error)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (now,ticker,side,"buy",score,detail,strategy,price_cents,contracts,
-                 volume,sc,indep_prob,mkt_prob,edge,int(DRY_RUN),order_id,error))
-            conn.commit()
+            with db_write_ctx(conn):
+                conn.execute("""INSERT INTO trades
+                    (timestamp,ticker,side,action,score,reason,strategy,price_cents,contracts,
+                     volume,spread_cents,independent_prob,market_prob,edge,dry_run,order_id,error)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now,ticker,side,"buy",score,detail,strategy,price_cents,contracts,
+                     volume,sc,indep_prob,mkt_prob,edge,int(DRY_RUN),order_id,error))
 
     # ── Phase 4sc: Safe Compounder ──────────────────────────────────────
     # Buy NO on near-certain outcomes (YES ≤ 20¢) for low-risk income.
@@ -6873,16 +7016,16 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
         print(f"[pipeline] Error recording: {e}")
 
     # ── Phase 5: Log session ──────────────────────────────────────────────
-    conn.execute("""INSERT INTO sessions
-        (timestamp,balance_cents,portfolio_cents,markets_scanned,opportunities_found,
-         orders_attempted,positions_managed,orders_pruned,dry_run,halted,halt_reason,patterns_avoided)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (now,initial_balance,portfolio_value,result["markets_scanned"],
-         len(result["opportunities"]),len(result["orders_placed"]),
-         result["positions_managed"],result["orders_pruned"],
-         int(DRY_RUN),int(result["halted"]),result["halt_reason"],
-         json.dumps(result["patterns_avoided"])))
-    conn.commit()
+    with db_write_ctx(conn):
+        conn.execute("""INSERT INTO sessions
+            (timestamp,balance_cents,portfolio_cents,markets_scanned,opportunities_found,
+             orders_attempted,positions_managed,orders_pruned,dry_run,halted,halt_reason,patterns_avoided)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now,initial_balance,portfolio_value,result["markets_scanned"],
+             len(result["opportunities"]),len(result["orders_placed"]),
+             result["positions_managed"],result["orders_pruned"],
+             int(DRY_RUN),int(result["halted"]),result["halt_reason"],
+             json.dumps(result["patterns_avoided"])))
 
     # ── Phase 6: Generate human-readable performance report ──────────────
     try:

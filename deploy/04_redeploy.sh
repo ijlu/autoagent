@@ -29,6 +29,7 @@ rsync -avz --progress \
     --include='tests/' --include='tests/***' \
     --include='context/' --include='context/***' \
     --include='deploy/' --include='deploy/***' \
+    --include='scripts/' --include='scripts/***' \
     --include='*.py' \
     --include='.env' \
     --exclude='*' \
@@ -79,6 +80,35 @@ from bot.daemon.poller_base import Poller
 from bot.daemon.scheduler import Scheduler
 from bot.daemon.cycle_runner import CycleRunner
 from bot.daemon.main import main as daemon_main
+# T1.1 canonical station registry
+from bot.daemon.stations import STATION_BY_SERIES, STATIONS
+# T1.2 requote triggers + handler synthetic path
+from bot.daemon.requote_triggers import (
+    TimeDecayDriver, ForecastChangeDriver,
+    REASON_METAR_CHANGE, REASON_TIME_DECAY, REASON_FORECAST_CHANGE,
+    VALID_REASONS,
+)
+from bot.daemon.weather_handler import WeatherChangeHandler
+# T2 bakeoff reporter
+from bot.learning.bakeoff import render_bakeoff_report, compute_bakeoff
+from bot.learning.mm_promotion import (
+    evaluate_mm_promotion, evaluate_mm_kill_switch, evaluate_mm_graduation,
+    _attribute_live_fills_to_shadow_rows,
+)
+from bot.config import (
+    MM_CANARY_MIN_PNL_PER_FILL_CENTS,
+    MM_GRADUATION_MIN_PAIRED_N,
+    MM_GRADUATION_MIN_PNL_RATIO,
+)
+# T3.3 reader migration: regime detector + backtest now read fills from
+# fills_ledger rather than the now-writer-less mm_processed_fills.
+from bot.signals.regime import detect_regime
+from bot.learning.alpha_log import log_decision, DecisionType, DecisionOutcome
+# T3.1 canonical fills ledger + dual-run validator
+from bot.daemon.fills_writer import FillsWriter
+from bot.learning.fills_validator import (
+    compare_last_n_days, format_report, ValidationReport, Divergence, TickerSideStats,
+)
 # Phase 2 weather expansion
 from bot.signals.sources.nws_point import get_nws_point_estimate
 from bot.signals.sources.ndfd_nbm import get_nbm_estimate
@@ -97,7 +127,49 @@ assert len(STATIONS) >= 3, 'Station config check failed'
 assert METARPoller().interval_s == 30.0, 'METARPoller interval regression'
 # Verify family router is prefix-registered
 assert route_family('KXFED-26JUL', {}) is None, 'router should skip unknown prefixes'
-print('bot/ imports OK — Phase 2 weather expansion + Phase 3 econ sources wired')
+# T1.1 — canonical registry: NY primary must be KNYC not KJFK, KJFK demoted to backup
+assert STATION_BY_SERIES['KXHIGHNY'].icao == 'KNYC', 'T1.1 registry regression: KXHIGHNY primary not KNYC'
+assert 'KJFK' in STATION_BY_SERIES['KXHIGHNY'].backups, 'T1.1 registry regression: KJFK not in KXHIGHNY.backups'
+assert 'KJFK' not in STATIONS, 'T1.1 registry regression: KJFK leaked back into primary STATIONS map'
+# T1.2 — valid trigger-reason frozenset locked to 3 labels
+assert VALID_REASONS == frozenset({REASON_METAR_CHANGE, REASON_TIME_DECAY, REASON_FORECAST_CHANGE}), \
+    'T1.2 trigger-reason contract regression'
+# T3.1 — FillsWriter must expose ingest_page + sync_since; column tuple is
+# the canonical schema, guard against accidental rename.
+assert hasattr(FillsWriter, 'ingest_page'), 'T3.1 regression: FillsWriter.ingest_page missing'
+assert hasattr(FillsWriter, 'sync_since'), 'T3.1 regression: FillsWriter.sync_since missing'
+assert 'trade_id' in FillsWriter._COLUMNS, 'T3.1 regression: FillsWriter._COLUMNS lost trade_id PK'
+# T3.1 validator surface — public API frozen until T3.3 reader migration
+_report = ValidationReport(n_days=7, since_unix=0.0, reference_name='x',
+                            ledger_contracts=0, reference_contracts=0)
+assert _report.is_clean and not _report.is_meaningful, 'T3.1 validator semantics regression'
+# B+D (2026-04-21) — two-gate MM promotion + canary graduation. The
+# Apr-17 _safe_cents bug auto-promoted two families on fake fills; if
+# these knobs or the graduation surface go missing, the single-criterion
+# rule sneaks back in.
+assert MM_CANARY_MIN_PNL_PER_FILL_CENTS > 0, 'B+D regression: canary P&L floor must be positive'
+assert MM_GRADUATION_MIN_PAIRED_N >= 10, 'B+D regression: graduation N too low'
+assert 0.0 < MM_GRADUATION_MIN_PNL_RATIO <= 1.0, 'B+D regression: graduation ratio out of range'
+assert callable(evaluate_mm_graduation), 'B+D regression: evaluate_mm_graduation missing'
+# T3.3 (2026-04-21) — reader migration from mm_processed_fills to
+# fills_ledger, plus the live_pnl_cents annotator that makes the
+# graduation gate actually fireable. Without the attribution helper the
+# gate's live_pnl_cents IS NOT NULL filter matches zero rows forever.
+assert callable(_attribute_live_fills_to_shadow_rows), 'T3.3 regression: live-fill attributor missing'
+assert callable(detect_regime), 'T3.3 regression: regime detector import failed (fills_ledger switch)'
+# Post-mortem follow-on #2 — shadow data-integrity monitor. Would have
+# caught the Apr-17 zero-book corruption within minutes instead of 4 days.
+from bot.daemon.shadow_integrity import (
+    check_shadow_data_integrity,
+    run_shadow_integrity_check,
+    IntegrityFinding,
+    MIN_ROWS_FOR_SIGNAL,
+    DEFAULT_WINDOW_S,
+)
+assert callable(check_shadow_data_integrity), 'shadow_integrity regression: check function missing'
+assert MIN_ROWS_FOR_SIGNAL >= 10, 'shadow_integrity regression: signal threshold too low (false-positive risk)'
+assert DEFAULT_WINDOW_S >= 3600, 'shadow_integrity regression: window too short'
+print('bot/ imports OK — Phase 2 weather expansion + Phase 3 econ sources + T1.1/T1.2/T3.1/T3.3/B+D/shadow_integrity wired')
 \""
 echo "  bot/ OK"
 
