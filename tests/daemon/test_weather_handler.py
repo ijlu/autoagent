@@ -125,18 +125,11 @@ class TestLiveMode:
         kwargs = quoter.requote_city.call_args.kwargs
         assert kwargs["old_temp_f"] == 70.0
         assert kwargs["new_temp_f"] == 72.0
-        assert kwargs["order_size_multiplier"] == 1.0  # LIVE_FULL
-
-    def test_canary_passes_half_multiplier(self, quoter, fcache):
-        c = init_db(":memory:")
-        set_mm_live_state(c, "KXHIGHNY", LiveState.LIVE_CANARY)
-        h = WeatherChangeHandler(
-            quoter=quoter, forecast_cache=fcache, live=True, conn=c,
-        )
-        h([_make_change()])
-        kwargs = quoter.requote_city.call_args.kwargs
-        assert kwargs["order_size_multiplier"] == 0.5
-        c.close()
+        # Multiplier is Thompson-sampled from shadow P&L posterior; with no
+        # seeded data it falls back to 0.0 (insufficient_n). The precise
+        # multiplier math is covered in test_sizing.py and test_mm_promotion.
+        assert isinstance(kwargs["order_size_multiplier"], float)
+        assert kwargs["order_size_multiplier"] >= 0.0
 
     def test_env_off_forces_shadow_even_when_series_live(
         self, quoter, fcache, live_conn,
@@ -257,3 +250,144 @@ class TestDefaultSmartGate:
         assert isinstance(should_quote, bool)
         assert isinstance(reason, str)
         assert isinstance(mult, float)
+
+
+class TestDispatcherIntegration:
+    """T0.3 — when wired with a dispatcher, the handler hands off to
+    per-series worker threads instead of invoking the quoter inline on the
+    poller thread. This keeps METAR polling cadence independent of
+    downstream Kalshi latency."""
+
+    def test_dispatcher_path_returns_before_quoter_runs(self, fcache):
+        """Handler __call__ must return before the slow quoter finishes."""
+        import threading
+        from bot.daemon.dispatcher import AsyncEventDispatcher
+
+        quoter = MagicMock()
+        gate = threading.Event()
+        done = threading.Event()
+
+        def slow_shadow(**_):
+            gate.wait(timeout=2.0)
+            done.set()
+            return []
+
+        quoter.shadow_requote_city.side_effect = slow_shadow
+
+        dispatcher = AsyncEventDispatcher(name="test")
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=False,
+            dispatcher=dispatcher,
+        )
+        try:
+            t0 = time.time()
+            h([_make_change()])
+            elapsed = time.time() - t0
+            # Handler returned; worker is still blocked in slow_shadow.
+            assert elapsed < 0.1, (
+                f"handler blocked for {elapsed:.3f}s — should have handed off"
+            )
+            assert not done.is_set(), "quoter ran synchronously on caller thread"
+            gate.set()
+            assert done.wait(timeout=2.0), "worker never ran the callback"
+        finally:
+            dispatcher.shutdown(timeout=2.0)
+
+    def test_dispatcher_path_parallelizes_across_series(self, fcache):
+        """Two changes for different series must run concurrently on their
+        own worker threads."""
+        import threading
+        from bot.daemon.dispatcher import AsyncEventDispatcher
+
+        started = threading.Semaphore(0)
+        release = threading.Event()
+        call_keys: list[str] = []
+        call_lock = threading.Lock()
+
+        def slow_shadow(*, series, **_):
+            with call_lock:
+                call_keys.append(series)
+            started.release()
+            release.wait(timeout=3.0)
+            return []
+
+        quoter = MagicMock()
+        quoter.shadow_requote_city.side_effect = slow_shadow
+
+        dispatcher = AsyncEventDispatcher(name="test")
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=False,
+            dispatcher=dispatcher,
+        )
+        try:
+            h([
+                _make_change(series="KXHIGHNY", station="KJFK"),
+                _make_change(series="KXHIGHAUS", station="KJFK"),
+            ])
+            # Both workers should be running concurrently — each released
+            # one semaphore ticket.
+            assert started.acquire(timeout=1.0), "first series never started"
+            assert started.acquire(timeout=1.0), (
+                "second series did not run in parallel with first — "
+                "cross-series blocking detected"
+            )
+            release.set()
+        finally:
+            dispatcher.shutdown(timeout=3.0)
+
+        assert set(call_keys) == {"KXHIGHNY", "KXHIGHAUS"}
+
+    def test_dispatcher_serializes_same_series(self, fcache):
+        """Repeated events for the same series must never run concurrently —
+        the WeatherQuoter assumes only one cancel-replace per city at a time."""
+        import threading
+        from bot.daemon.dispatcher import AsyncEventDispatcher
+
+        in_flight = 0
+        max_concurrent = 0
+        gate = threading.Event()
+        lock = threading.Lock()
+
+        def tracked_shadow(**_):
+            nonlocal in_flight, max_concurrent
+            with lock:
+                in_flight += 1
+                if in_flight > max_concurrent:
+                    max_concurrent = in_flight
+            gate.wait(timeout=0.1)  # overlap window
+            with lock:
+                in_flight -= 1
+            return []
+
+        quoter = MagicMock()
+        quoter.shadow_requote_city.side_effect = tracked_shadow
+
+        dispatcher = AsyncEventDispatcher(name="test")
+        # Cooldown=0 so both changes dispatch. The dispatcher's size-1 slot
+        # means the second one queues behind the first — we expect one to
+        # run, then the other.
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=False,
+            dispatcher=dispatcher, cooldown_s=0.0,
+        )
+        try:
+            h([_make_change(series="KXHIGHNY")])
+            time.sleep(0.02)  # let first enter tracked_shadow
+            h([_make_change(series="KXHIGHNY", new_temp=75.0)])
+            gate.set()
+        finally:
+            dispatcher.shutdown(timeout=3.0)
+
+        assert max_concurrent == 1, (
+            f"same-series work overlapped ({max_concurrent} concurrent) — "
+            "per-series serialization broken"
+        )
+
+    def test_no_dispatcher_is_synchronous(self, quoter, fcache):
+        """Backwards-compat path: no dispatcher → inline call on caller thread."""
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=fcache, live=False,
+        )
+        h([_make_change()])
+        # Synchronous path → quoter was called before h() returned.
+        quoter.shadow_requote_city.assert_called_once()

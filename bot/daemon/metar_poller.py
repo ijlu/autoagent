@@ -267,7 +267,8 @@ class METARPoller(Poller):
                 wind_dir = int(wdir)
             wspd = raw.get("wspd")
             if wspd is not None:
-                wind_speed = int(float(wspd))
+                # round() per CLAUDE.md §5 fixed-point convention
+                wind_speed = round(float(wspd))
         except (TypeError, ValueError):
             pass
 
@@ -294,7 +295,7 @@ class METARPoller(Poller):
         for primary_id, cfg in STATIONS.items():
             if primary_id in readings:
                 continue
-            for backup_id in cfg.get("backups", []):
+            for backup_id in cfg.backups:
                 backup_reading = readings.get(backup_id)
                 if backup_reading is not None:
                     # Create a synthetic reading tagged as the primary station
@@ -348,8 +349,8 @@ class METARPoller(Poller):
                 cfg = STATIONS[station_id]
                 changes.append(TemperatureChange(
                     station=station_id,
-                    city=cfg["city"],
-                    series=cfg["series"],
+                    city=cfg.city,
+                    series=cfg.series,
                     old_temp_f=old_temp,
                     new_temp_f=reading.temp_f,
                     running_high_f=self._states[station_id].running_high_f,
@@ -456,6 +457,6 @@ class METARPoller(Poller):
     def _get_lst_now(station: str) -> datetime:
         """Current datetime in the station's LOCAL STANDARD TIME (fixed offset)."""
         cfg = STATIONS.get(station)
-        offset_hours = cfg["lst_offset"] if cfg else -5
+        offset_hours = cfg.lst_offset if cfg else -5
         lst_tz = timezone(timedelta(hours=offset_hours))
         return datetime.now(lst_tz)

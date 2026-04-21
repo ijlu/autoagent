@@ -83,7 +83,7 @@ class ForecastCache:
 
         refreshed = 0
         for station_id, cfg in STATIONS.items():
-            lat, lon = cfg["lat"], cfg["lon"]
+            lat, lon = cfg.lat, cfg.lon
             url = (
                 f"https://api.open-meteo.com/v1/forecast?"
                 f"latitude={lat}&longitude={lon}"

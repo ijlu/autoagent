@@ -76,8 +76,8 @@ class ForecastCache:
         refreshed = 0
         new_values: dict[str, float] = {}
         for station_id, cfg in STATIONS.items():
-            lat = cfg.get("lat")
-            lon = cfg.get("lon")
+            lat = cfg.lat
+            lon = cfg.lon
             if lat is None or lon is None:
                 continue
             try:

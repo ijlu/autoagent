@@ -7,22 +7,29 @@ either the shadow or live path of :class:`WeatherQuoter`.
 
 Per-series shadow-vs-live gate (Phase 1 step 10, option A.7):
 :func:`bot.learning.mm_promotion.is_mm_live` / ``get_mm_order_size_multiplier``
-decide per series whether to post real orders, at what fraction of
-``MM_ORDER_SIZE``. SHADOW=0.0 (log only), LIVE_CANARY=0.5, LIVE_FULL=1.0.
-The legacy env-wide ``WEATHER_MM_LIVE`` is the operator-override master
-switch: when false, every series is forced into shadow mode regardless of
-its kv state.
+decide per series whether to post real orders, and at what fraction of
+``MM_ORDER_SIZE``. SHADOW → 0.0 (log only); LIVE → a Thompson-sampled
+multiplier in [0, ``MM_SIZING_CAP_MULTIPLIER``] drawn from the posterior
+over realized shadow P&L. The legacy env-wide ``WEATHER_MM_LIVE`` is the
+operator-override master switch: when false, every series is forced into
+shadow mode regardless of its kv state.
 """
 from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from bot.config import WEATHER_MM_LIVE
+from bot.daemon.dispatcher import AsyncEventDispatcher
 from bot.daemon.forecast_cache import ForecastCache
 from bot.daemon.metar_poller import TemperatureChange
+from bot.daemon.requote_triggers import (
+    REASON_METAR_CHANGE,
+    VALID_REASONS,
+)
 from bot.daemon.smart_gates import evaluate_all_gates
+from bot.daemon.stations import STATION_BY_SERIES
 from bot.daemon.weather_quoter import WeatherQuoter
 from bot.learning.mm_promotion import (
     get_mm_order_size_multiplier,
@@ -105,6 +112,9 @@ class WeatherChangeHandler:
         cooldown_s: float = DEFAULT_COOLDOWN_S,
         live: Optional[bool] = None,
         conn=None,
+        dispatcher: Optional[AsyncEventDispatcher] = None,
+        poller=None,
+        on_fire: Optional[Callable[[str, float], None]] = None,
     ) -> None:
         self.quoter = quoter
         self.forecast_cache = forecast_cache
@@ -116,6 +126,19 @@ class WeatherChangeHandler:
         # Connection used for kv-state lookups. Falls back to quoter.conn
         # (shared daemon connection) when not explicitly wired.
         self.conn = conn if conn is not None else getattr(quoter, "conn", None)
+        # Per-series dispatcher — pushes ``_handle_one`` off the poller
+        # thread so slow requotes don't delay METAR polling for other
+        # cities. None = synchronous dispatch (test-friendly default).
+        self.dispatcher = dispatcher
+        # Poller handle for enqueue_synthetic — we need current running-high
+        # and trajectory snapshots to synthesize a TemperatureChange when
+        # the time-decay or forecast-change drivers fire.
+        self.poller = poller
+        # Called with (series, ts) on every successful requote regardless of
+        # reason. Used by TimeDecayDriver to reset its cadence clock so a
+        # fresh METAR change doesn't produce a redundant time-decay fire
+        # moments later.
+        self.on_fire = on_fire
         self._last_requote: dict[str, float] = {}
         self.stats: dict[str, int] = {
             "changes_seen": 0,
@@ -124,6 +147,9 @@ class WeatherChangeHandler:
             "markets_shadowed": 0,
             "markets_quoted": 0,
             "markets_skipped": 0,
+            "synthetic_enqueued": 0,
+            "synthetic_rejected_no_state": 0,
+            "synthetic_rejected_cooldown": 0,
             "errors": 0,
         }
 
@@ -149,22 +175,46 @@ class WeatherChangeHandler:
     # ------------------------------------------------------------------
 
     def __call__(self, changes: list[TemperatureChange] | None) -> None:
-        """Entry point used as ``METARPoller(on_result=handler)``."""
+        """Entry point used as ``METARPoller(on_result=handler)``.
+
+        When a dispatcher is wired, each change is handed off to a
+        per-series worker thread (size-1 coalescing) so the poller
+        returns in microseconds. Without a dispatcher we fall back to
+        synchronous dispatch — fine for tests, but in production the
+        daemon should always supply one.
+        """
         if not changes:
             return
+        if self.dispatcher is None:
+            for change in changes:
+                self._handle_one(change)
+            return
         for change in changes:
-            self._handle_one(change)
+            # Bind ``change`` into a no-arg closure so the worker has
+            # everything it needs; ``_handle_one`` is thread-safe
+            # because the per-key worker serializes same-series work.
+            self.dispatcher.dispatch(
+                change.series, lambda c=change: self._handle_one(c)
+            )
 
-    def _handle_one(self, change: TemperatureChange) -> None:
+    def _handle_one(
+        self,
+        change: TemperatureChange,
+        reason: str = REASON_METAR_CHANGE,
+    ) -> None:
         self.stats["changes_seen"] += 1
+        if reason not in VALID_REASONS:
+            logger.warning("[wx-handler] invalid reason %r, coercing to %r",
+                           reason, REASON_METAR_CHANGE)
+            reason = REASON_METAR_CHANGE
 
         now = time.time()
         last = self._last_requote.get(change.series, 0.0)
         if now - last < self.cooldown_s:
             self.stats["changes_throttled"] += 1
             logger.debug(
-                "[wx-handler] cooldown %s (%.1fs since last)",
-                change.series, now - last,
+                "[wx-handler] cooldown %s reason=%s (%.1fs since last)",
+                change.series, reason, now - last,
             )
             return
 
@@ -180,12 +230,12 @@ class WeatherChangeHandler:
 
         logger.info(
             "[wx-handler] %s %s  %s°F→%.0f°F  high=%.0f  fc=%.0f  "
-            "traj=%+.1f°F/hr  hrs_left=%.1f  mode=%s  mult=%.2f",
+            "traj=%+.1f°F/hr  hrs_left=%.1f  mode=%s  mult=%.2f  reason=%s",
             change.series, change.station,
             "?" if change.old_temp_f is None else f"{change.old_temp_f:.0f}",
             change.new_temp_f, change.running_high_f, forecast_high,
             change.trajectory_f_per_hr, change.hours_left,
-            "LIVE" if series_live else "SHADOW", mult,
+            "LIVE" if series_live else "SHADOW", mult, reason,
         )
 
         try:
@@ -201,6 +251,7 @@ class WeatherChangeHandler:
                     order_size_multiplier=mult,
                     old_temp_f=change.old_temp_f,
                     new_temp_f=change.new_temp_f,
+                    trigger_reason=reason,
                 )
                 quoted = sum(1 for r in results if not r.skipped)
                 skipped = sum(1 for r in results if r.skipped)
@@ -217,6 +268,7 @@ class WeatherChangeHandler:
                     smart_gates=self.smart_gate,
                     old_temp_f=change.old_temp_f,
                     new_temp_f=change.new_temp_f,
+                    trigger_reason=reason,
                 )
                 self.stats["markets_shadowed"] += len(results)
         except Exception as exc:
@@ -228,4 +280,137 @@ class WeatherChangeHandler:
             return
 
         self.stats["requotes_dispatched"] += 1
-        self._last_requote[change.series] = time.time()
+        fired_at = time.time()
+        self._last_requote[change.series] = fired_at
+        # Notify the time-decay driver so its cadence clock resets — keeps a
+        # fresh METAR fire from producing a redundant time-decay fire moments
+        # later (or vice versa for forecast_change events).
+        if self.on_fire is not None:
+            try:
+                self.on_fire(change.series, fired_at)
+            except Exception as exc:  # pragma: no cover — on_fire should not fail
+                logger.warning("[wx-handler] on_fire callback failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Synthetic-event entry point — TimeDecayDriver / ForecastChangeDriver
+    # ------------------------------------------------------------------
+
+    def enqueue_synthetic(self, series: str, station: str, reason: str) -> bool:
+        """Dispatch a non-METAR requote for ``series``.
+
+        Called by :class:`TimeDecayDriver` and :class:`ForecastChangeDriver`
+        with one of the reason labels in :data:`VALID_REASONS`. Resolves the
+        current per-station state from the METAR poller + forecast cache,
+        synthesizes a :class:`TemperatureChange` payload, and dispatches it
+        through the same path used by real METAR events (so the cooldown,
+        dispatcher, and on_fire callback all behave identically).
+
+        Returns ``True`` when the event was successfully enqueued,
+        ``False`` when state was unavailable or cooldown blocked it —
+        drivers use the boolean to decide whether to advance their own
+        cadence clock.
+        """
+        if reason not in VALID_REASONS:
+            logger.warning(
+                "[wx-handler] enqueue_synthetic rejected bad reason=%r", reason,
+            )
+            return False
+        if self.poller is None:
+            logger.debug(
+                "[wx-handler] enqueue_synthetic rejected %s/%s: no poller wired",
+                series, station,
+            )
+            self.stats["synthetic_rejected_no_state"] += 1
+            return False
+
+        state = self.poller.get_state(station)
+        if state is None or state.last_temp_f is None:
+            self.stats["synthetic_rejected_no_state"] += 1
+            logger.debug(
+                "[wx-handler] enqueue_synthetic rejected %s/%s: no state",
+                series, station,
+            )
+            return False
+
+        # Cooldown check up front — drivers want fast feedback on whether
+        # the event would actually fire, before we bother synthesizing
+        # the payload or hitting the dispatcher.
+        now = time.time()
+        last = self._last_requote.get(series, 0.0)
+        if now - last < self.cooldown_s:
+            self.stats["synthetic_rejected_cooldown"] += 1
+            logger.debug(
+                "[wx-handler] enqueue_synthetic cooldown %s reason=%s (%.1fs)",
+                series, reason, now - last,
+            )
+            return False
+
+        # Recover the station's city + hours_left the same way the real
+        # poller computes them. Keep the registry as the single source.
+        station_cfg = STATION_BY_SERIES.get(series)
+        city = station_cfg.city if station_cfg is not None else ""
+
+        # hours_left: use the poller's LST helper if available (same formula
+        # the poller itself uses to fill TemperatureChange.hours_left) so
+        # synthetic and natural events are directly comparable. Fall back
+        # to the pure requote_triggers helper if the poller doesn't expose
+        # it (test stubs won't).
+        hours_left = 0.0
+        if hasattr(self.poller, "_get_hours_remaining"):
+            try:
+                hours_left = float(self.poller._get_hours_remaining(station))
+            except Exception:
+                hours_left = 0.0
+        if hours_left <= 0.0 and station_cfg is not None:
+            from bot.daemon.requote_triggers import _hours_left_for_station
+            hours_left = _hours_left_for_station(station_cfg, now)
+
+        # Trajectory: derive from the most recent readings window if the
+        # poller exposes it. Fall back to 0.0 — synthetic events don't
+        # know about warming rate themselves.
+        trajectory = 0.0
+        try:
+            trajectory = float(
+                getattr(state, "trajectory_f_per_hr", 0.0) or 0.0
+            )
+        except Exception:
+            trajectory = 0.0
+
+        # Use the most-recent StationReading as the `reading` attribute;
+        # fall back to a synthesized placeholder so downstream code
+        # (which only reads .temp_f / .obs_time defensively) still works.
+        reading = None
+        if state.readings:
+            reading = state.readings[-1]
+        if reading is None:
+            # Deferred import — avoids circular with metar_poller at module load
+            from bot.daemon.metar_poller import StationReading
+            reading = StationReading(
+                station=station,
+                temp_f=state.last_temp_f,
+                temp_c=(state.last_temp_f - 32.0) * 5.0 / 9.0,
+                obs_time="",
+                poll_time=now,
+            )
+
+        synthetic = TemperatureChange(
+            station=station,
+            city=city,
+            series=series,
+            old_temp_f=state.last_temp_f,  # no delta — old == new for synthetic
+            new_temp_f=state.last_temp_f,
+            running_high_f=state.running_high_f
+                if state.running_high_f > -900 else state.last_temp_f,
+            hours_left=hours_left,
+            trajectory_f_per_hr=trajectory,
+            reading=reading,
+        )
+
+        self.stats["synthetic_enqueued"] += 1
+        if self.dispatcher is None:
+            self._handle_one(synthetic, reason=reason)
+        else:
+            self.dispatcher.dispatch(
+                series, lambda c=synthetic, r=reason: self._handle_one(c, reason=r),
+            )
+        return True

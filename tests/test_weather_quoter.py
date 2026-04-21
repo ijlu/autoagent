@@ -713,7 +713,17 @@ class TestHelpers:
     """Test module-level helper functions."""
 
     def test_safe_cents_none(self):
-        assert _safe_cents(None) == 0
+        # None is "no observation" — must propagate as None so the matcher
+        # can distinguish it from a real 0¢ (which Kalshi never quotes).
+        assert _safe_cents(None) is None
+
+    def test_safe_cents_zero_becomes_none(self):
+        # Kalshi's minimum quoted price is 1¢; a reported 0 can only mean
+        # "missing side" and must be normalized to None so the shadow row
+        # column stays NULL rather than a fake-zero crossing price.
+        assert _safe_cents(0) is None
+        assert _safe_cents(0.0) is None
+        assert _safe_cents("0") is None
 
     def test_safe_cents_dollar_float(self):
         assert _safe_cents(0.50) == 50
@@ -731,7 +741,7 @@ class TestHelpers:
         assert _safe_cents("50") == 50
 
     def test_safe_cents_invalid(self):
-        assert _safe_cents("abc") == 0
+        assert _safe_cents("abc") is None
 
     def test_parse_threshold_above(self):
         t, above = _parse_threshold("KXHIGHNY-T75", "nyc high at or above 75")
@@ -771,6 +781,64 @@ class TestHelpers:
     def test_logistic_cdf_far_below(self):
         """Far below mu -> CDF near 0.0."""
         assert _logistic_cdf(0.0, 50.0, 1.0) < 0.01
+
+
+class TestParseMarketBook:
+    """_parse_market must pick up Kalshi's `yes_bid_dollars` / `yes_ask_dollars`
+    variant. The plain `yes_bid` keys are absent on the /markets list response;
+    reading only those returned None on every call, and the old
+    `_safe_cents(None) → 0` silently produced 20k all-zero shadow rows
+    (2026-04-21 B+D incident). Regression guard for the field-name fallback.
+    """
+
+    @staticmethod
+    def _base_mkt(ticker: str = "KXHIGHNY-26APR22-T65") -> dict:
+        return {
+            "ticker": ticker,
+            "title": "Will NYC high be 65° or above?",
+            "subtitle": "65° or above",
+            "yes_sub_title": "65° or above",
+        }
+
+    def test_reads_yes_bid_dollars_when_plain_absent(self):
+        m = self._base_mkt()
+        m["yes_bid_dollars"] = "0.4500"
+        m["yes_ask_dollars"] = "0.5500"
+        wm = WeatherQuoter._parse_market(m, "KXHIGHNY")
+        assert wm is not None
+        assert wm.yes_bid == 45
+        assert wm.yes_ask == 55
+
+    def test_plain_keys_preferred_when_present(self):
+        # When both present, the unsuffixed key wins (older API shape).
+        m = self._base_mkt()
+        m["yes_bid"] = 42
+        m["yes_ask"] = 58
+        m["yes_bid_dollars"] = "0.4500"
+        m["yes_ask_dollars"] = "0.5500"
+        wm = WeatherQuoter._parse_market(m, "KXHIGHNY")
+        assert wm is not None
+        assert wm.yes_bid == 42
+        assert wm.yes_ask == 58
+
+    def test_zero_dollar_string_becomes_none(self):
+        # Kalshi reports "0.0000" when a side has no resting book. Must map
+        # to None (not 0) so the matcher's zero-guard can ignore it.
+        m = self._base_mkt()
+        m["yes_bid_dollars"] = "0.0000"
+        m["yes_ask_dollars"] = "0.4800"
+        wm = WeatherQuoter._parse_market(m, "KXHIGHNY")
+        assert wm is not None
+        assert wm.yes_bid is None
+        assert wm.yes_ask == 48
+
+    def test_both_sides_missing_propagates_none(self):
+        m = self._base_mkt()
+        # No yes_bid, yes_ask, yes_bid_dollars, yes_ask_dollars keys at all.
+        wm = WeatherQuoter._parse_market(m, "KXHIGHNY")
+        assert wm is not None
+        assert wm.yes_bid is None
+        assert wm.yes_ask is None
 
     def test_logistic_cdf_overflow_protection(self):
         """Extreme inputs should not raise OverflowError."""

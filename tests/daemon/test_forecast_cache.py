@@ -67,27 +67,29 @@ class TestRefresh:
     def test_transient_failure_preserves_prior(self, mock_get):
         """A single failing station must not wipe prior values for others."""
         first_resp = _ok_response(80.0)
-        # Second refresh: KJFK fails, rest succeed
+        # Pick any station for the transient-failure test — KNYC (NY primary).
+        target_station = "KNYC"
+        target_lat_fragment = f"latitude={STATIONS[target_station].lat}"
+
         def side_effect(url, **kwargs):
-            # Identify station by lat — KJFK's lat=40.64.
-            if "latitude=40.64" in url:
+            if target_lat_fragment in url:
                 raise requests.ConnectionError("boom")
             return _ok_response(82.0)
 
         cache = ForecastCache()
         mock_get.return_value = first_resp
         cache.refresh()
-        assert cache.get("KJFK") == 80.0
+        assert cache.get(target_station) == 80.0
 
         mock_get.side_effect = side_effect
         mock_get.return_value = None  # side_effect wins
         cache.refresh()
 
-        # KJFK preserved from first refresh (merge, not replace)
-        assert cache.get("KJFK") == 80.0
+        # Target preserved from first refresh (merge, not replace)
+        assert cache.get(target_station) == 80.0
         # Other stations got the fresh value
         for sid in STATIONS:
-            if sid != "KJFK":
+            if sid != target_station:
                 assert cache.get(sid) == 82.0
 
     @patch("bot.daemon.forecast_cache.requests.get")

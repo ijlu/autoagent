@@ -15,16 +15,17 @@ from __future__ import annotations
 
 import logging
 
-from bot.daemon.stations import STATIONS
+from bot.daemon.stations import STATIONS, lst_offset_for_station
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Station LST offset lookup (re-exported from stations for convenience)
+# Station LST offset lookup — legacy alias kept for any external importer.
+# New code should call ``lst_offset_for_station()`` directly.
 # ---------------------------------------------------------------------------
 
 _STATION_LST_OFFSET: dict[str, int] = {
-    sid: cfg["lst_offset"] for sid, cfg in STATIONS.items()
+    sid: station.lst_offset for sid, station in STATIONS.items()
 }
 
 

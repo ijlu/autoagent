@@ -204,18 +204,21 @@ class TestStationsConfig(unittest.TestCase):
 
     def test_all_stations_have_required_fields(self):
         for station_id, cfg in STATIONS.items():
-            self.assertIn("city", cfg, f"{station_id} missing 'city'")
-            self.assertIn("series", cfg, f"{station_id} missing 'series'")
-            self.assertIn("lst_offset", cfg, f"{station_id} missing 'lst_offset'")
-            self.assertIn("lat", cfg, f"{station_id} missing 'lat'")
-            self.assertIn("lon", cfg, f"{station_id} missing 'lon'")
+            # Attribute access (post-T1.1 dataclass)
+            self.assertTrue(cfg.city, f"{station_id} missing 'city'")
+            self.assertTrue(cfg.series, f"{station_id} missing 'series'")
+            self.assertIsInstance(cfg.lst_offset, int)
+            self.assertIsInstance(cfg.lat, float)
+            self.assertIsInstance(cfg.lon, float)
+            # Dict-style access still works for backwards compatibility
+            self.assertEqual(cfg["city"], cfg.city)
 
     def test_station_count(self):
         self.assertGreaterEqual(len(STATIONS), 6)  # at least original 6
 
     def test_series_mapping_is_bijective(self):
         """Each station maps to a unique series."""
-        series_set = {cfg["series"] for cfg in STATIONS.values()}
+        series_set = {cfg.series for cfg in STATIONS.values()}
         self.assertEqual(len(series_set), len(STATIONS))
 
 

@@ -36,6 +36,7 @@ from bot.config import (
     MM_ORDER_TAG,
 )
 from bot.daemon.locks import DB_WRITE_LOCK
+from bot.db import db_write_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +56,8 @@ class WeatherMarket:
     threshold: Optional[float]  # None for bracket markets
     is_bracket: bool
     is_above: bool  # for threshold markets
-    yes_bid: int  # cents
-    yes_ask: int  # cents
+    yes_bid: Optional[int]  # cents; None when Kalshi returns no book on yes side
+    yes_ask: Optional[int]  # cents; None when Kalshi returns no book on yes side
     volume: int
     close_time: str
 
@@ -206,6 +207,7 @@ class WeatherQuoter:
         order_size_multiplier: float = 1.0,
         old_temp_f: Optional[float] = None,
         new_temp_f: Optional[float] = None,
+        trigger_reason: str = "metar_change",
     ) -> list[RequoteResult]:
         """Requote all open markets for a weather series.
 
@@ -240,6 +242,7 @@ class WeatherQuoter:
                     order_size_multiplier=order_size_multiplier,
                     old_temp_f=old_temp_f,
                     new_temp_f=new_temp_f,
+                    trigger_reason=trigger_reason,
                 )
                 results.append(result)
             except Exception as exc:
@@ -274,6 +277,7 @@ class WeatherQuoter:
         smart_gates: Optional[SmartGateFn] = None,
         old_temp_f: Optional[float] = None,
         new_temp_f: Optional[float] = None,
+        trigger_reason: str = "metar_change",
     ) -> list["ShadowResult"]:
         """Shadow sibling of ``requote_city``.
 
@@ -306,6 +310,7 @@ class WeatherQuoter:
                     smart_gates=smart_gates,
                     old_temp_f=old_temp_f,
                     new_temp_f=new_temp_f,
+                    trigger_reason=trigger_reason,
                 )
                 out.append(res)
             except Exception as exc:
@@ -326,6 +331,7 @@ class WeatherQuoter:
         smart_gates: Optional[SmartGateFn],
         old_temp_f: Optional[float],
         new_temp_f: Optional[float],
+        trigger_reason: str = "metar_change",
     ) -> "ShadowResult":
         t0 = time.monotonic()
         ticker = market.ticker
@@ -385,6 +391,7 @@ class WeatherQuoter:
             gate_spread_mult=spread_mult,
             latency_ms=latency_ms,
             live_mode=False,
+            trigger_reason=trigger_reason,
         )
 
         return ShadowResult(
@@ -415,8 +422,8 @@ class WeatherQuoter:
         bid_cents: int,
         ask_cents: int,
         half_spread_cents: int,
-        market_yes_bid: int,
-        market_yes_ask: int,
+        market_yes_bid: Optional[int],
+        market_yes_ask: Optional[int],
         inventory: int,
         gate_should_quote: bool,
         gate_reason: Optional[str],
@@ -426,6 +433,7 @@ class WeatherQuoter:
         live_order_id_bid: Optional[str] = None,
         live_order_id_ask: Optional[str] = None,
         order_size: Optional[int] = None,
+        trigger_reason: str = "metar_change",
     ) -> Optional[int]:
         """Insert one row into weather_mm_shadow. Returns rowid on success."""
         now = time.time()
@@ -435,7 +443,7 @@ class WeatherQuoter:
             if market_yes_bid and market_yes_ask else None
         )
         try:
-            with DB_WRITE_LOCK:
+            with db_write_ctx(self.conn):
                 cur = self.conn.execute(
                     """INSERT INTO weather_mm_shadow
                     (ts_unix, ts_iso, ticker, series, station,
@@ -445,8 +453,9 @@ class WeatherQuoter:
                      half_spread_cents, market_yes_bid, market_yes_ask, market_mid,
                      inventory, gate_should_quote, gate_reason, gate_spread_mult,
                      latency_ms, live_mode,
-                     live_order_id_bid, live_order_id_ask, order_size)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     live_order_id_bid, live_order_id_ask, order_size,
+                     trigger_reason)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         int(now), now_iso, ticker, series, station,
                         old_temp_f, new_temp_f, running_high_f, forecast_high_f,
@@ -456,10 +465,11 @@ class WeatherQuoter:
                         inventory, 1 if gate_should_quote else 0, gate_reason,
                         gate_spread_mult, latency_ms, 1 if live_mode else 0,
                         live_order_id_bid, live_order_id_ask, order_size,
+                        trigger_reason,
                     ),
                 )
-                self.conn.commit()
-                return cur.lastrowid
+                rowid = cur.lastrowid
+            return rowid
         except Exception as exc:
             logger.error("[wx-shadow] failed to insert shadow row for %s: %s", ticker, exc)
             return None
@@ -480,6 +490,7 @@ class WeatherQuoter:
         order_size_multiplier: float = 1.0,
         old_temp_f: Optional[float] = None,
         new_temp_f: Optional[float] = None,
+        trigger_reason: str = "metar_change",
     ) -> RequoteResult:
         """Cancel stale orders, compute new fair value, post fresh quotes."""
         t0 = time.monotonic()
@@ -682,9 +693,14 @@ class WeatherQuoter:
             if threshold is None:
                 return None
 
-        # Parse order book snapshot
-        yes_bid = _safe_cents(m.get("yes_bid"))
-        yes_ask = _safe_cents(m.get("yes_ask"))
+        # Parse order book snapshot. Kalshi's /markets list response returns
+        # book prices under the `_dollars` suffix (stringified decimal dollars,
+        # e.g. "0.4500"); the unsuffixed `yes_bid`/`yes_ask` keys are absent on
+        # this endpoint. `trade.py` has long carried the same fallback — the
+        # quoter used to rely on `_safe_cents(None) → 0`, which silently
+        # produced the 20k all-zero shadow rows (see 2026-04-21 B+D incident).
+        yes_bid = _safe_cents(m.get("yes_bid") or m.get("yes_bid_dollars"))
+        yes_ask = _safe_cents(m.get("yes_ask") or m.get("yes_ask_dollars"))
 
         return WeatherMarket(
             ticker=ticker,
@@ -929,25 +945,29 @@ class WeatherQuoter:
     # ------------------------------------------------------------------
 
     def _log_requote(self, result: RequoteResult) -> None:
-        """Log requote to the opportunity_log table (if it exists)."""
+        """Log requote to the opportunity_log table (if it exists).
+
+        Runs on the poller/worker thread — MUST go through db_write_ctx to
+        serialize with the cycle thread's writes.
+        """
         try:
-            self.conn.execute(
-                """INSERT OR IGNORE INTO opportunity_log
-                   (timestamp, ticker, action, data)
-                   VALUES (?, ?, ?, ?)""",
-                (
-                    datetime.now(timezone.utc).isoformat(),
-                    result.ticker,
-                    "wx_requote",
-                    str({
-                        "fair_value": result.fair_value_cents,
-                        "posted": result.orders_posted,
-                        "cancelled": result.orders_cancelled,
-                        "latency_ms": round(result.latency_ms, 1),
-                    }),
-                ),
-            )
-            self.conn.commit()
+            with db_write_ctx(self.conn):
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO opportunity_log
+                       (timestamp, ticker, action, data)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        result.ticker,
+                        "wx_requote",
+                        str({
+                            "fair_value": result.fair_value_cents,
+                            "posted": result.orders_posted,
+                            "cancelled": result.orders_cancelled,
+                            "latency_ms": round(result.latency_ms, 1),
+                        }),
+                    ),
+                )
         except Exception:
             # opportunity_log may not exist -- that is fine.
             pass
@@ -975,18 +995,29 @@ def _fee_floor_half_spread(fair_value_cents: int) -> int:
     return max(1, math.ceil(per_contract) + 1)
 
 
-def _safe_cents(val) -> int:
-    """Convert an API price field to integer cents, handling None / float / str."""
+def _safe_cents(val) -> Optional[int]:
+    """Convert an API price field to integer cents, or None if absent.
+
+    Kalshi's /markets list response omits yes_bid / yes_ask when a side has
+    no resting liquidity. Returning 0 for that case silently conflates
+    "no book" with "price is 0¢" — which poisons downstream fill-match
+    logic (a zero price compares favorably against every real bid). The
+    fix: propagate None all the way to the DB (columns are nullable) so
+    the matcher can distinguish "unknown" from "observed zero".
+
+    Kalshi's minimum quoted price is 1¢, so a legitimate observation can
+    never be 0; any input that parses to 0 is treated as missing too.
+    """
     if val is None:
-        return 0
+        return None
     try:
         v = float(val)
-        # Kalshi sometimes returns dollar amounts (0.50) vs cent amounts (50)
-        if 0 < v <= 1.0:
-            return int(round(v * 100))
-        return int(round(v))
     except (TypeError, ValueError):
-        return 0
+        return None
+    # Kalshi sometimes returns dollar amounts (0.50) vs cent amounts (50).
+    # Normalize to integer cents first.
+    cents = int(round(v * 100)) if 0 < v <= 1.0 else int(round(v))
+    return cents if cents > 0 else None
 
 
 def _parse_threshold(ticker: str, title: str) -> Tuple[Optional[float], bool]:
