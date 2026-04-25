@@ -289,6 +289,9 @@ def analyze_edge_vs_winrate(conn) -> dict:
     """).fetchall()
 
     # Also from MM: avg edge per ticker (not per fill — avoids counting same settlement N times)
+    # fv-mixed-side-ok: storage is P(YES) on both rows; AVG returns P(YES)
+    # which is what the per-ticker edge computation here expects
+    # (CLAUDE.md Known Bug Pattern #13).
     mm_rows = conn.execute("""
         SELECT AVG(m.fair_value_cents), AVG(m.price_cents), s.won, m.ticker
         FROM mm_orders m

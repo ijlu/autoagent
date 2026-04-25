@@ -17,6 +17,34 @@ from bot.config import SOURCE_WEIGHTS, CORRELATED_GROUPS, OPENAI_API_KEY, SOURCE
 from bot.db import db_write_ctx
 
 
+def _compute_n_effective(
+    source_names: set[str],
+    correlated_groups: dict[str, set[str]],
+) -> float:
+    """Effective independent source count, deduping across correlated groups.
+
+    Each correlated group contributes at most 1.0 to the total. A source that
+    appears in N groups is counted ONCE (claimed by the first group that owns
+    it). Sources not in any group each contribute 1.0.
+
+    Why "claimed by first group, not all groups": some sources sit in multiple
+    correlated groups (e.g. ``fred`` is in cpi/fed/nfp/gdp). The previous
+    implementation counted each membership separately, inflating n_effective
+    and weakening the edge-threshold scaling that depends on it. This is
+    pinned by ``tests/signals/test_correlated_double_count.py``.
+    """
+    claimed: set[str] = set()
+    n_effective = 0.0
+    for _, group_members in correlated_groups.items():
+        overlap = (source_names & group_members) - claimed
+        if overlap:
+            n_effective += 1.0
+            claimed |= overlap
+    ungrouped = source_names - claimed
+    n_effective += len(ungrouped)
+    return n_effective
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Family-aware source priority
 # ══════════════════════════════════════════════════════════════════════════════
@@ -448,19 +476,7 @@ def get_independent_estimate(
         base = s.split(":")[0] if ":" in s else s.split("_")[0]
         source_names.add(base.lower())
 
-    claimed_by_group = set()
-    n_effective = 0.0
-    for group_name, group_members in CORRELATED_GROUPS.items():
-        overlap = source_names & group_members
-        if len(overlap) >= 2:
-            n_effective += 1.0
-            claimed_by_group |= overlap
-        elif len(overlap) == 1:
-            n_effective += 1.0
-            claimed_by_group |= overlap
-    ungrouped = source_names - claimed_by_group
-    n_effective += len(ungrouped)
-    n_sources = max(1, round(n_effective))
+    n_sources = max(1, round(_compute_n_effective(source_names, CORRELATED_GROUPS)))
 
     # ── Calibration correction ──
     raw_prob = ensemble_prob

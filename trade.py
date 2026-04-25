@@ -892,10 +892,15 @@ def manage_positions(conn, dynamic_sizing=None):
 # INFORMATION LAYER — independent probability estimates from external sources
 # ══════════════════════════════════════════════════════════════════════════════
 import re, math
+from cachetools import TTLCache
 
-# Shared cache: {key: (value, timestamp)}
-_CACHE = {}
-CACHE_TTL = 60  # seconds
+# Shared cache: {key: (value, timestamp)} — bounded TTLCache so the long-running
+# daemon can't OOM via unbounded growth (CLAUDE.md Known Bug Pattern #12).
+# maxsize is generous; ttl here matches the longest manual-TTL check below
+# (60-min vol cache) so the cachetools layer is a backstop, not the primary
+# eviction mechanism (call sites still do their own time-since-write check).
+CACHE_TTL = 60  # seconds — primary TTL used by manual checks at call sites
+_CACHE = TTLCache(maxsize=4096, ttl=3600)
 
 # ── Persistent cache (SQLite) — canonical implementation in bot/db ──────
 import json as _json_mod  # kept for other uses in trade.py
@@ -3595,6 +3600,9 @@ def record_settlements(conn):
                     (now_str, ticker, est_prob, won, strat, None, bucket))
             elif mm_row and mm_row[0] is not None:
                 # MM trades: use AVG(fair_value_cents)/100 as estimated probability
+                # fv-mixed-side-ok: storage convention is P(YES) on both YES and NO
+                # rows, so AVG of identical values returns P(YES) — exactly what
+                # the calibration table needs (CLAUDE.md Known Bug Pattern #13).
                 mm_fv = conn.execute(
                     "SELECT AVG(fair_value_cents) FROM mm_orders WHERE ticker=? AND fill_qty > 0",
                     (ticker,)).fetchone()

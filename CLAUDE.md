@@ -366,23 +366,23 @@ RSA key for Kalshi API auth: `.kalshi_private_key.pem` (gitignored; MUST NOT be 
 
 ## Known Bug Patterns (Regression Watchlist)
 
-Fixed; re-check on every touch of the relevant code:
+Fixed; re-check on every touch of the relevant code. Each pattern is pinned by a test — if you change behavior here, update the test in the same PR.
 
-1. `client_order_id` containing periods → 400 Bad Request
-2. `_apply_trade()` short-close P&L using `(100 − avg_entry) − price` instead of `avg_entry − price`
-3. `record_settlements()` not subtracting `fee_cost`, or `won = revenue > 0` instead of `profit > 0`
-4. Any exit path zeroing inventory without confirmed settlement (original offender `mm_liquidate_expiring()` was removed; watch for recurrence in `manage_positions` or future exit policies)
-5. Fixed-point parsing with `int(float(...))` instead of `round(float(...))`
-6. `cancel_failed` orders excluded from exposure headroom
-7. Resting order exposure query silently swallowing exceptions (fail closed instead)
-8. Tomorrow.io forecasts beyond 7-day reliable horizon
-9. Correlated sources (weather+weather, FRED+BLS) counted as fully independent
-10. MM spread not checked against expected maker fees
-11. Any exit/settlement path not subtracting fees (original offender `mm_liquidate_expiring()` was removed; watch in `manage_positions` and `record_settlements`)
-12. Cache isolation: `trade.py._CACHE` vs `bot.api._CACHE` (daemon now shares a DB-backed cache where possible)
-13. `mm_orders.fair_value_cents` aggregated assuming per-side storage when it's actually P(YES) on both rows (caused the Apr 17 v1 backtest inversion). `opportunity_log.ensemble_prob` has the opposite convention (per-side) — check Conventions section before aggregating either.
-14. Daemon pollers writing to SQLite without holding `DB_WRITE_LOCK` (causes `database is locked` under contention)
-15. Any code path assuming the DB connection is process-local — daemon shares one connection across threads
+1. `client_order_id` containing periods → 400 Bad Request — `tests/test_client_order_id_coverage.py`, `tests/test_weather_quoter.py::test_client_order_id_no_periods`
+2. `_apply_trade()` short-close P&L using `(100 − avg_entry) − price` instead of `avg_entry − price` — `tests/test_money.py`
+3. `record_settlements()` not subtracting `fee_cost`, or `won = revenue > 0` instead of `profit > 0` — `tests/test_money.py`, `tests/test_settlement_certainty.py`
+4. Any exit path zeroing inventory without confirmed settlement (original offender `mm_liquidate_expiring()` was removed; watch for recurrence in `manage_positions` or future exit policies) — `tests/test_inventory_zero_settlement_only.py`
+5. Fixed-point parsing with `int(float(...))` instead of `round(float(...))` — `tests/test_fixed_point_parsing.py`
+6. `cancel_failed` orders excluded from exposure headroom — `tests/test_exposure.py`
+7. Resting order exposure query silently swallowing exceptions (fail closed instead) — `tests/test_exposure.py`
+8. Tomorrow.io forecasts beyond 7-day reliable horizon — `tests/signals/test_tomorrow_horizon.py`
+9. Correlated sources (weather+weather, FRED+BLS) counted as fully independent (also covers a single source like `fred` that sits in 4 correlated groups — must count once, not 4×) — `tests/signals/test_correlated_double_count.py`
+10. MM spread not checked against expected maker fees — `tests/test_mm_spread_fee_floor.py`
+11. Any exit/settlement path not subtracting fees (original offender `mm_liquidate_expiring()` was removed; watch in `manage_positions` and `record_settlements`) — `tests/test_money.py`, `tests/test_settlement_certainty.py`
+12. Cache isolation: `trade.py._CACHE` vs `bot.api._CACHE` (daemon now shares a DB-backed cache where possible; both module caches must be bounded `TTLCache`) — `tests/test_cache_bounded.py`, `tests/bot/test_api_concurrency.py`
+13. `mm_orders.fair_value_cents` aggregated assuming per-side storage when it's actually P(YES) on both rows (caused the Apr 17 v1 backtest inversion). Aggregations must declare their handling: single-side `WHERE`, `CASE WHEN side` normalisation, or an inline `# fv-mixed-side-ok` ack marker. `opportunity_log.ensemble_prob` has the opposite convention (per-side) — check Conventions section before aggregating either. — `tests/test_fair_value_cents_readers.py`
+14. Daemon pollers writing to SQLite without holding `DB_WRITE_LOCK` (causes `database is locked` under contention) — `tests/test_db_discipline.py`
+15. Any code path assuming the DB connection is process-local — daemon shares one connection across threads — `tests/test_db_discipline.py`, `tests/bot/test_db_wal.py`
 
 ## Audit History
 

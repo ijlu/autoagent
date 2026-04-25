@@ -478,6 +478,11 @@ def get_tomorrow_weather_estimate(ticker, market_data):
     day_idx = _determine_day_index(title, market_data, city_key)
     if day_idx is None:
         return None, None
+    # Clamp to Tomorrow.io's reliable forecast horizon. Their API may return
+    # data beyond day 7 but accuracy degrades sharply (CLAUDE.md Known Bug
+    # Pattern #8). Pinned by tests/signals/test_tomorrow_horizon.py.
+    if day_idx > 7:
+        return None, None
 
     forecast = get_tomorrow_forecast(city_key)
     if not forecast:
