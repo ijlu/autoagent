@@ -3465,6 +3465,8 @@ def record_settlements(conn):
     skipped_personal = 0
     skipped_dup = 0
     skipped_notours = 0
+    shadow_rows_annotated = 0  # Phase 1 weather-MM shadow annotation counter
+    shadow_tickers_annotated = 0
     _settlement_alerts = []  # large losses to alert on
     now_str = datetime.now(timezone.utc).isoformat()
 
@@ -3479,6 +3481,28 @@ def record_settlements(conn):
             if any(ticker_upper.startswith(pfx) for pfx in _PERSONAL_PREFIXES):
                 skipped_personal += 1
                 continue
+
+            # ─── Phase 1: annotate weather_mm_shadow for EVERY settled ticker ───
+            # Must run BEFORE the dup-skip and bot-position gate below: shadow-only
+            # tickers (WEATHER_MM_LIVE=false) never enter `settlements` nor `mm_orders`,
+            # so if we gate on those we never annotate any shadow rows and the
+            # promotion gate's `ts_settle_unix IS NOT NULL` filter never matches.
+            # annotate_shadow_pnl is idempotent (WHERE ts_settle_unix IS NULL) and
+            # no-ops for non-weather tickers, so running it unconditionally is safe.
+            result_early = s.get("market_result", "")
+            if result_early in ("yes", "no"):
+                try:
+                    from bot.learning.mm_promotion import annotate_shadow_pnl
+                    _n_annot = annotate_shadow_pnl(
+                        conn, ticker,
+                        won_yes=(result_early == "yes"),
+                        ts_settle_unix=time.time(),
+                    )
+                    if _n_annot:
+                        shadow_rows_annotated += int(_n_annot)
+                        shadow_tickers_annotated += 1
+                except Exception as e:
+                    print(f"[mm_promotion] annotate failed for {ticker}: {e}")
 
             # Use ticker as unique key (one settlement per ticker per account)
             if conn.execute("SELECT 1 FROM settlements WHERE ticker=? AND order_id LIKE 'settlement_%'",
@@ -3577,19 +3601,8 @@ def record_settlements(conn):
                 except Exception as e:
                     print(f"[alpha_log] fill failed for {ticker}: {e}")
 
-            # Phase 1 step 10: annotate matching weather_mm_shadow rows with P&L
-            # so the MM promotion gate has realized-spread-capture data.
-            # Only weather tickers have shadow rows; other families simply no-op.
-            if result in ("yes", "no"):
-                try:
-                    from bot.learning.mm_promotion import annotate_shadow_pnl
-                    annotate_shadow_pnl(
-                        conn, ticker,
-                        won_yes=(result == "yes"),
-                        ts_settle_unix=time.time(),
-                    )
-                except Exception as e:
-                    print(f"[mm_promotion] annotate failed for {ticker}: {e}")
+            # (Phase 1 shadow annotation moved above the bot-position gate so
+            # it runs for shadow-only tickers too — see comment on result_early.)
 
             # Record calibration data for directional trades with estimates
             if est_prob is not None:
@@ -3638,6 +3651,11 @@ def record_settlements(conn):
 
     print(f"[learn] Settlements: {recorded} recorded, {skipped_personal} personal (skipped), "
           f"{skipped_notours} not ours, {skipped_dup} already recorded")
+    # Phase 1: surface shadow annotation activity so a silent-zero regression
+    # (like the one diagnosed 2026-04-22) shows up in cron.log instead of only
+    # in the DB. Logged unconditionally — zero IS the signal we want visible.
+    print(f"[mm_promotion] shadow annotate: {shadow_rows_annotated} rows across "
+          f"{shadow_tickers_annotated} tickers")
 
     # Stash alerts for main() to pick up
     if _settlement_alerts:
@@ -3651,8 +3669,21 @@ def record_settlements(conn):
     return recorded
 
 def compute_avoid_filters(conn):
-    filters = {"low_volume_threshold": None, "wide_spread_threshold": None,
-               "avoided_strategies": set(), "avoided_prefixes": set(), "summary": []}
+    """Kept in-sync with ``bot/scoring/filters.py:compute_avoid_filters``.
+
+    **2026-04-22 audit fix:** prefix avoidance is now partitioned by
+    strategy (``avoided_by_strategy``) so MM losses on a prefix stop
+    vetoing that prefix for every other strategy. See the sibling
+    docstring in ``bot/scoring/filters.py`` for full rationale.
+    """
+    filters = {
+        "low_volume_threshold": None,
+        "wide_spread_threshold": None,
+        "avoided_strategies": set(),
+        "avoided_by_strategy": {},
+        "avoided_prefixes": set(),
+        "summary": [],
+    }
     rows = conn.execute(
         "SELECT volume, spread_cents, strategy, ticker, won FROM settlements WHERE recorded_at > datetime('now', '-30 days')"
     ).fetchall()
@@ -3676,22 +3707,29 @@ def compute_avoid_filters(conn):
             msg += f" → AVOID"
         filters["summary"].append(msg); print(msg)
 
-    strat_map, prefix_map = {}, {}
+    strat_map, strat_prefix_map = {}, {}
     for vol, sp, strat, tick, won in rows:
         if strat: strat_map.setdefault(strat, []).append(won)
-        if tick: prefix_map.setdefault(tick[:6], []).append(won)
+        if strat and tick:
+            strat_prefix_map.setdefault((strat, tick[:6]), []).append(won)
     for strat, outcomes in strat_map.items():
         if len(outcomes) < MIN_SAMPLE_SIZE: continue
         wr = sum(outcomes)/len(outcomes)
         msg = f"  strat[{strat[:20]}] wr={wr:.0%} n={len(outcomes)}"
         if wr < MIN_WIN_RATE: filters["avoided_strategies"].add(strat); msg += " → AVOID"
         filters["summary"].append(msg); print(msg)
-    for pfx, outcomes in prefix_map.items():
+    for (strat, pfx), outcomes in strat_prefix_map.items():
         if len(outcomes) < MIN_SAMPLE_SIZE: continue
         wr = sum(outcomes)/len(outcomes)
-        msg = f"  prefix[{pfx}] wr={wr:.0%} n={len(outcomes)}"
-        if wr < MIN_WIN_RATE: filters["avoided_prefixes"].add(pfx); msg += " → AVOID"
+        msg = f"  strat[{strat[:20]}] prefix[{pfx}] wr={wr:.0%} n={len(outcomes)}"
+        if wr < MIN_WIN_RATE:
+            filters["avoided_by_strategy"].setdefault(strat, set()).add(pfx)
+            msg += " → AVOID"
         filters["summary"].append(msg); print(msg)
+    # Derived legacy union for any un-migrated callers.
+    filters["avoided_prefixes"] = {
+        pfx for pfxs in filters["avoided_by_strategy"].values() for pfx in pfxs
+    }
 
     # ── Calibration analysis: are our probability estimates accurate? ──────
     # Group settled trades by estimated probability bucket and check if
@@ -5369,10 +5407,22 @@ STRATEGY_REGISTRY = [
 def score_market(m, adaptive_weights=None, calibration_corrections=None, category_edges=None,
                  disabled_sources=None, disabled_strategies=None, strategy_bandit=None):
     """
-    Returns (score, side, strategy, detail, volume, spread_cents,
-             independent_prob, market_prob, edge)
-    score=0 → no trade.
+    Returns a 10-tuple:
+    (score, side, strategy, detail, volume, spread_cents,
+     independent_prob, market_prob, edge, skip_reason)
+
+    ``score == 0`` → no trade. Trailing ``skip_reason`` is one of the
+    ``SKIP_*`` constants in ``bot.scoring.market_scorer`` when score == 0,
+    and ``""`` on success. Kept in sync with the canonical module copy.
+    2026-04-22 audit observability #2.
+
+    10-tuple is a known smell; migrate to a dataclass in a focused
+    refactor PR if the shape churn gets painful.
     """
+    from bot.scoring.market_scorer import (
+        SKIP_PRICE_BOUNDS, SKIP_VOLUME, SKIP_SPREAD_ZERO,
+        SKIP_NO_ENSEMBLE, SKIP_EDGE_BELOW_THRESHOLD, SKIP_NO_STRATEGY_FIRED,
+    )
     def _n(v, d=99):
         v = float(v or d); return v/100 if v > 1.0 else v
 
@@ -5385,15 +5435,16 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
     sc      = round(spread * 100, 1)
     ticker  = m.get("ticker", "")
 
-    EMPTY = (0.0, "", "", "", 0, 0, None, None, 0)
+    def _empty(reason):
+        return (0.0, "", "", "", 0, 0, None, None, 0, reason)
 
     # Skip very illiquid or very cheap markets
     if yes_ask <= 0.08 or yes_ask >= 0.92:
-        return EMPTY
+        return _empty(SKIP_PRICE_BOUNDS)
     if volume < 50:
-        return EMPTY
+        return _empty(SKIP_VOLUME)
     if spread <= 0:
-        return EMPTY
+        return _empty(SKIP_SPREAD_ZERO)
 
     # ── Get ensemble probability estimate (with adaptive weights + calibration) ─
     indep_prob, info_source, n_sources = get_independent_estimate(
@@ -5407,7 +5458,7 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
     # Market making and liquidity harvest removed — they had no real information edge.
     # Only trade when we have independent data that diverges from market price.
     if indep_prob is None or n_sources == 0:
-        return EMPTY
+        return _empty(SKIP_NO_ENSEMBLE)
 
     # Adaptive edge threshold: more sources → more confidence → lower threshold
     if n_sources >= 3:
@@ -5505,7 +5556,13 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
             print(f"[strategy] near_resolution error: {e}")
 
     if not candidates:
-        return EMPTY
+        # Split edge-below-threshold (tunable via MIN_EDGE / category
+        # multipliers) from "info_edge had enough edge but spread >= 0.08
+        # killed it and every other strategy stayed silent" — different
+        # fix surfaces entirely.
+        if fee_adjusted_edge_yes <= required_edge and fee_adjusted_edge_no <= required_edge:
+            return _empty(SKIP_EDGE_BELOW_THRESHOLD)
+        return _empty(SKIP_NO_STRATEGY_FIRED)
 
     # Weight each candidate's score by its Thompson Sampling posterior draw.
     # This means proven strategies get full credit while unproven ones are
@@ -5528,13 +5585,23 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
         strat_names = [c[2] for c in candidates]
         best_detail += f" [also: {', '.join(s for s in strat_names if s != best_strat)}]"
 
-    return best_score, best_side, best_strat, best_detail, volume, sc, best_ip, best_mp, best_edge
+    return (best_score, best_side, best_strat, best_detail, volume, sc,
+            best_ip, best_mp, best_edge, "")
 
 def passes_filters(ticker, strategy, volume, spread_cents, af):
+    """Kept in-sync with ``bot/scoring/market_scorer.py:passes_filters``.
+
+    2026-04-22 audit fix: prefix rejection is partitioned by strategy.
+    """
     vt = af.get("low_volume_threshold")
     if vt and volume < vt: return False, f"learned: vol {volume:.0f}<{vt}"
     if strategy in af.get("avoided_strategies", set()): return False, f"learned: strat '{strategy}'"
-    if ticker[:6] in af.get("avoided_prefixes", set()): return False, f"learned: prefix '{ticker[:6]}'"
+    by_strat = af.get("avoided_by_strategy")
+    if by_strat is not None:
+        if ticker[:6] in by_strat.get(strategy, set()):
+            return False, f"learned: strat '{strategy}' prefix '{ticker[:6]}'"
+    elif ticker[:6] in af.get("avoided_prefixes", set()):
+        return False, f"learned: prefix '{ticker[:6]}'"
     return True, ""
 
 def get_open_tickers():
@@ -6592,6 +6659,11 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
 
     markets = []  # populated in Phase 3; used by both Phase 4 (directional) and Phase 4a (MM)
 
+    # Funnel counters — initialised here so every code path (including
+    # halted / skip-hour) emits a (possibly zero-filled) funnel line.
+    from collections import defaultdict as _defdict
+    cycle_counters = _defdict(int)
+
     day_start = get_day_start_balance(conn)
     if day_start is None:
         day_start = initial_balance + portfolio_value  # first run of the day — use total equity
@@ -6630,28 +6702,56 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
         result["markets_scanned"] = len(markets)
         print(f"[trade.py] Scanned {len(markets)} markets total")
 
+        # ── Cycle funnel counters (2026-04-22 audit — observability #4) ──
+        # Bundled with the avoid-filter partition fix. Without this funnel
+        # there is no way to MEASURE whether the partitioning actually
+        # unblocks KXHIGH* directional candidates; every filter stage now
+        # increments a named counter that gets printed at end-of-cycle.
+        cycle_counters["markets_scanned"] = len(markets)
+
         candidates = []
         for m in markets:
             # Skip multi-leg parlay/combo markets — synthetic, not real tradeable markets
             _t = m.get("ticker", "")
             if "KXMVE" in _t or "MULTIGAME" in _t or m.get("mve_collection_ticker"):
+                cycle_counters["parlay_skipped"] += 1
                 continue
-            score, side, strategy, detail, volume, sc, indep_prob, mkt_prob, edge = score_market(
+            score, side, strategy, detail, volume, sc, indep_prob, mkt_prob, edge, _score_skip = score_market(
                 m, adaptive_weights=adaptive_weights,
                 calibration_corrections=calibration_corrections,
                 category_edges=category_edges,
                 disabled_sources=active_feedback.get("disabled_sources"),
                 disabled_strategies=active_feedback.get("disabled_strategies"),
                 strategy_bandit=active_feedback.get("strategy_bandit"))
-            if score <= 0: continue
+            if score <= 0:
+                # Partition score_zero by reason so the funnel reveals WHICH
+                # gate is eating the non-parlay universe. Six reasons map 1:1
+                # to score_market's six EMPTY exits. See bot/scoring/
+                # market_scorer.py SKIP_* constants.
+                cycle_counters[f"score_zero_{_score_skip or 'unknown'}"] += 1
+                continue
             ticker = m.get("ticker", "")
             ok_t, skip_reason = passes_filters(ticker, strategy, volume, sc, avoid_filters)
-            if not ok_t: print(f"  ⊘ {ticker}: {skip_reason}"); continue
+            if not ok_t:
+                # Partition by filter stage so we can see per-strategy prefix
+                # rejection rates separately from volume/strategy rejections.
+                if "vol " in skip_reason:
+                    cycle_counters["filter_volume"] += 1
+                elif "prefix" in skip_reason:
+                    cycle_counters[f"filter_prefix_{strategy}"] += 1
+                elif "strat" in skip_reason:
+                    cycle_counters["filter_strategy"] += 1
+                else:
+                    cycle_counters["filter_other"] += 1
+                print(f"  ⊘ {ticker}: {skip_reason}"); continue
+            cycle_counters["passed_filters"] += 1
             candidates.append((score, side, strategy, detail, volume, sc, indep_prob, mkt_prob, edge, m))
 
         # Dedup against open orders
         open_positions = get_open_tickers()
+        _pre_dedup = len(candidates)
         candidates = [c for c in candidates if (c[9].get("ticker",""), c[1]) not in open_positions]
+        cycle_counters["dedup_open_orders"] += _pre_dedup - len(candidates)
 
         # ── Correlation limits: max positions per risk category ───────
         category_counts = {}
@@ -6698,11 +6798,13 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             cat = categorize_market(cticker, ctitle)
             current = category_counts.get(cat, 0)
             if current >= MAX_PER_CATEGORY:
+                cycle_counters["category_full"] += 1
                 print(f"  ⊘ {cticker}: category '{cat}' full ({current}/{MAX_PER_CATEGORY})")
                 continue
             category_counts[cat] = current + 1
             filtered_candidates.append(c)
         candidates = filtered_candidates
+        cycle_counters["candidates_final"] = len(candidates)
 
         candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -7083,6 +7185,13 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
     print(f"[trade.py] Done → markets={result['markets_scanned']} opps={len(result['opportunities'])} "
           f"orders={len(result['orders_placed'])} positions_managed={result['positions_managed']} "
           f"pruned={result['orders_pruned']} settlements={result['settlements_recorded']}")
+    # Funnel line — ordered by scan-loop stage so a single grep on
+    # `cycle_funnel` shows where candidates are lost. Stash on result
+    # so daemon health logs can surface it too.
+    result["cycle_counters"] = dict(cycle_counters)
+    if cycle_counters:
+        _funnel = " ".join(f"{k}={v}" for k, v in sorted(cycle_counters.items()))
+        print(f"[cycle_funnel] {_funnel}")
     return result
 
 if __name__ == "__main__":

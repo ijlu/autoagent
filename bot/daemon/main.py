@@ -52,7 +52,10 @@ from bot.learning.mm_promotion import (
     match_shadow_fills,
     run_mm_promotion_sweep,
 )
+from bot.learning.settlement_backfill import backfill_from_catalog
+from bot.learning.shadow_calibration_bridge import bridge_shadow_to_calibration
 from bot.learning.shadow_promotion import run_promotion_sweep
+from bot.learning.weather_mos_materializer import materialize_due as mos_materialize_due
 from bot.observability.alerts import send_alert
 
 logger = logging.getLogger(__name__)
@@ -110,6 +113,32 @@ FILLS_VALIDATOR_WINDOW_DAYS = 7
 # minutes of first corrupt write, vs. the 4 days it took in reality.
 SHADOW_INTEGRITY_INTERVAL_S = 600
 SHADOW_INTEGRITY_WINDOW_S = 3600
+
+# Settlement back-fill poller (2026-04-22). Drives off /markets?status=settled
+# rather than /portfolio/settlements so alpha_backtest + weather_mm_shadow
+# rows for *shadow-only* tickers (we never held a position) get
+# ts_settle_unix stamped. Without this path, the Platt calibration feeding
+# the ensemble had been starved for weeks — root cause of the 2026-04-22
+# ensemble-calibration audit finding (Brier 0.37–0.52 vs market 0.03–0.06).
+#
+# 600s cadence: same as shadow_integrity. Settlement latency of 5–10 min
+# feeding the learning loop is negligible vs the 24h mm_promotion_sweep
+# downstream consumer.
+SETTLEMENT_BACKFILL_INTERVAL_S = 600
+
+# Weather MOS-bias materializer. Walks settled weather tickers in the past
+# 14 days, fetches IEM observed daily-high once per (city, date), writes one
+# row per canonical Gaussian source into weather_gaussian_snapshots_backfill.
+# Feeds the same EWMA fitter (tools/backfill_weather_effective_n.fit_mos_bias)
+# that the historical Open-Meteo backfill seeds. Covers nws_point + tomorrow
+# (no historical archive available) and every other Gaussian source going
+# forward.
+#
+# Hourly cadence: weather markets settle once per LST day, so per-tick
+# new-row volume is small. The eligibility window is 14 days, so a single
+# tick after a 13h outage backfills cleanly. One IEM fetch per (city, date)
+# pair, ~6 cities × 1 date = ~6 HTTP calls per tick worst case.
+MOS_MATERIALIZE_INTERVAL_S = 3600
 
 
 def _configure_logging() -> None:
@@ -181,25 +210,22 @@ def _run_fills_sync(
     start time — per scoping doc §2, we deliberately do NOT back-fill
     historical mm_processed_fills rows.
 
-    Never raises — the live trading loop must not crash on a fills
-    fetch error. ``sync_since`` already returns 0 on API failure; this
-    wrapper's try/except is belt-and-braces for unexpected DB errors
-    (e.g. connection abruptly closed mid-shutdown).
+    Exceptions propagate to the scheduler, which catches, logs, and
+    increments ``error_count`` on the task. Swallowing them here would
+    make the scheduler's health counter lie — this is the exact failure
+    shape that hid the 2026-04-20 shadow corruption for four days.
     """
-    try:
-        row = conn.execute(
-            "SELECT MAX(fill_ts_unix) FROM fills_ledger"
-        ).fetchone()
-        max_ts = row[0] if row and row[0] is not None else daemon_start_unix
-        since = max(0.0, max_ts - FILLS_SYNC_OVERLAP_S)
-        inserted = writer.sync_since(since, live_mode=WEATHER_MM_LIVE)
-        if inserted:
-            logger.info(
-                "[fills_sync] inserted=%d new rows (since_unix=%.0f)",
-                inserted, since,
-            )
-    except Exception as exc:  # pragma: no cover — defensive only
-        logger.exception("[fills_sync] unexpected failure: %s", exc)
+    row = conn.execute(
+        "SELECT MAX(fill_ts_unix) FROM fills_ledger"
+    ).fetchone()
+    max_ts = row[0] if row and row[0] is not None else daemon_start_unix
+    since = max(0.0, max_ts - FILLS_SYNC_OVERLAP_S)
+    inserted = writer.sync_since(since, live_mode=WEATHER_MM_LIVE)
+    if inserted:
+        logger.info(
+            "[fills_sync] inserted=%d new rows (since_unix=%.0f)",
+            inserted, since,
+        )
 
 
 def _run_fills_validator(conn) -> None:
@@ -212,21 +238,93 @@ def _run_fills_validator(conn) -> None:
       add a second reference source.
     - Meaningful + divergent: WARNING log + Telegram alert. This is the
       signal the T3.3 reader-migration gate cares about.
-    """
-    try:
-        report = compare_last_n_days(
-            conn, n_days=FILLS_VALIDATOR_WINDOW_DAYS,
-        )
-    except Exception as exc:  # pragma: no cover — defensive only
-        logger.exception("[fills_validator] run failed: %s", exc)
-        return
 
+    Exceptions propagate to the scheduler. The wrapper's previous
+    try/except swallowed them, which made the scheduler's per-task
+    ``error_count`` report zero even when every run raised
+    ``no such column: side`` against the legacy production schema
+    (2026-04-22 audit finding).
+    """
+    report = compare_last_n_days(
+        conn, n_days=FILLS_VALIDATOR_WINDOW_DAYS,
+    )
     text = format_report(report)
     if report.is_meaningful and not report.is_clean:
         logger.warning(text)
         send_alert(text, level="warning")
     else:
         logger.info(text)
+
+
+def _run_mos_materializer(conn) -> None:
+    """Walks settled weather tickers and writes per-source forecast/observed
+    pairs into the MOS-bias backfill table.
+
+    Exceptions propagate to the scheduler — same rationale as fills_sync /
+    settlement_backfill: silent error counters hid the April shadow corruption
+    for four days. Loud failures, even at 3600s cadence, are the bar.
+    """
+    stats = mos_materialize_due(conn)
+    if stats["rows_written"] or stats["iem_misses"] or stats["tickers_unresolved_city"]:
+        logger.info(
+            "[mos_materializer] eligible=%d city_dates=%d iem_calls=%d "
+            "iem_misses=%d rows_written=%d unresolved_city=%d",
+            stats["tickers_eligible"], stats["city_dates_eligible"],
+            stats["iem_calls"], stats["iem_misses"],
+            stats["rows_written"], stats["tickers_unresolved_city"],
+        )
+    else:
+        logger.debug(
+            "[mos_materializer] eligible=%d no new rows",
+            stats["tickers_eligible"],
+        )
+
+
+def _run_settlement_backfill(conn) -> None:
+    """Catalog-driven settlement back-fill.
+
+    Fills ``alpha_backtest.ts_settle_unix`` and ``weather_mm_shadow``
+    settlement columns for tickers we shadowed but didn't hold positions
+    in — which ``record_settlements()``'s portfolio-driven loop can't
+    reach. Unblocks the Platt calibration loop that feeds the ensemble.
+
+    Exceptions propagate to the scheduler — we deliberately don't
+    swallow them here for the same reason noted on ``_run_fills_sync``:
+    silent error counters hid the April shadow corruption for four days.
+    """
+    summary = backfill_from_catalog(conn)
+    if summary["tickers_settled"] or summary["catalog_errors"]:
+        logger.info(
+            "[settlement_backfill] series_scanned=%d tickers_settled=%d "
+            "alpha_rows_filled=%d shadow_rows_annotated=%d catalog_errors=%d",
+            summary["series_scanned"], summary["tickers_settled"],
+            summary["alpha_rows_filled"], summary["shadow_rows_annotated"],
+            summary["catalog_errors"],
+        )
+    else:
+        logger.debug(
+            "[settlement_backfill] series_scanned=%d no new settlements",
+            summary["series_scanned"],
+        )
+
+    # Inline the shadow→calibration bridge here so newly-annotated
+    # weather_mm_shadow rows flow into the Platt training set on the
+    # same cadence as settlement back-fill. The bridge is a cheap
+    # no-op when the watermark is caught up; chaining them here avoids
+    # any race between the annotator writing ticker_settled_yes and a
+    # separate scheduler task trying to read it.
+    try:
+        cal_summary = bridge_shadow_to_calibration(conn)
+    except Exception as exc:
+        logger.exception("[shadow_cal_bridge] bridge failed: %s", exc)
+        return
+    if cal_summary["rows_bridged"]:
+        logger.info(
+            "[shadow_cal_bridge] rows_bridged=%d tickers_touched=%d "
+            "watermark=%d skipped_invalid=%d",
+            cal_summary["rows_bridged"], cal_summary["tickers_touched"],
+            cal_summary["watermark_after"], cal_summary["skipped_invalid"],
+        )
 
 
 def _run_mm_fill_match(conn) -> None:
@@ -382,6 +480,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     # attributes after construction.
     metar_poller = METARPoller(on_result=None)  # on_result set below
     metar_poller.interval_s = METAR_POLL_INTERVAL_S
+    seeded = metar_poller.seed_running_high(conn)
+    if seeded:
+        logger.info(
+            "[daemon] seeded running_high for %d station(s) from kv_cache: %s",
+            len(seeded),
+            ", ".join(f"{s}={v:.1f}°F" for s, v in seeded.items()),
+        )
 
     weather_handler = WeatherChangeHandler(
         quoter=weather_quoter,
@@ -490,6 +595,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_mm_fill_match(conn),
         interval_s=MM_FILL_MATCH_INTERVAL_S,
         initial_delay_s=120.0,  # first pass after a full quote-lifetime has elapsed
+    )
+    scheduler.register(
+        "settlement_backfill",
+        lambda: _run_settlement_backfill(conn),
+        interval_s=SETTLEMENT_BACKFILL_INTERVAL_S,
+        # 180s gives the first cycle time to populate alpha_backtest so
+        # the series-discovery query has something to iterate. First tick
+        # is typically a no-op; by tick 2 (+600s) real back-fill work
+        # starts landing.
+        initial_delay_s=180.0,
+    )
+    scheduler.register(
+        "mos_materializer",
+        lambda: _run_mos_materializer(conn),
+        interval_s=MOS_MATERIALIZE_INTERVAL_S,
+        # Wait 30 min after boot so weather_forecast_snapshots has rows for
+        # at least a few cycles, AND so the first eligible-ticker query
+        # doesn't fire while the schema is still being migrated by an
+        # in-flight init_db. First useful tick is the second one (~+90 min).
+        initial_delay_s=1800.0,
     )
     scheduler.register(
         "mm_promotion_sweep",

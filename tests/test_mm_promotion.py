@@ -1055,3 +1055,158 @@ class TestRunMMPromotionSweep:
         assert len(summary["promoted"]) == 0
         assert (get_mm_live_state(conn, "KXHIGHNY").state
                 == LiveState.SHADOW)
+
+
+# ── Regression: record_settlements() annotates shadow rows for
+#    shadow-only tickers (no bot position on the ticker). ────────────────
+# This guards the 2026-04-22 structural bug where annotate_shadow_pnl was
+# placed after the "this ticker wasn't traded by the bot" early-`continue`
+# gate, making it unreachable for weather tickers under WEATHER_MM_LIVE=false.
+class TestRecordSettlementsShadowAnnotation:
+    def _canned_settlement(self, ticker: str, market_result: str = "yes") -> dict:
+        return {
+            "ticker": ticker,
+            "market_result": market_result,
+            "revenue": 0,
+            "yes_count_fp": "0",
+            "no_count_fp": "0",
+            "yes_total_cost_dollars": "0",
+            "no_total_cost_dollars": "0",
+            "fee_cost": 0,
+        }
+
+    def test_shadow_only_ticker_gets_annotated(self, conn, monkeypatch):
+        import trade  # imported lazily so sqlite/bot.db path resolves first
+
+        ticker = "KXHIGHNY-26APR22-T64"
+        rid = _insert_shadow_row(
+            conn, ticker=ticker, series="KXHIGHNY",
+            ts_unix=time.time() - 3600,
+            proposed_bid=45, proposed_ask=55,
+            market_yes_bid=47, market_yes_ask=53,
+        )
+        # simulate bid side filled during the lifetime window
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_bid_filled=1 WHERE id=?",
+            (rid,),
+        )
+        conn.commit()
+
+        # No mm_orders, no trades, no safe_compounder_orders rows for this
+        # ticker — this is the "shadow-only" case. Pre-fix, record_settlements
+        # would hit `continue` at the bot-position gate and never annotate.
+        monkeypatch.setattr(
+            trade, "api_get",
+            lambda path: {"settlements": [self._canned_settlement(ticker, "yes")]}
+            if path.startswith("/portfolio/settlements") else {},
+        )
+
+        recorded = trade.record_settlements(conn)
+
+        # The settlement itself won't be inserted (skipped_notours), but
+        # the shadow row MUST be annotated.
+        assert recorded == 0, (
+            "settlement should be skipped as not-ours — this test is about "
+            "annotation, not settlement recording"
+        )
+        row = conn.execute(
+            "SELECT ticker_settled_yes, ts_settle_unix, shadow_pnl_cents "
+            "FROM weather_mm_shadow WHERE id=?",
+            (rid,),
+        ).fetchone()
+        assert row is not None
+        settled_yes, ts_settle, shadow_pnl = row
+        assert settled_yes == 1, "settled_yes should reflect market_result=yes"
+        assert ts_settle is not None, (
+            "ts_settle_unix must be non-null — this is the column the "
+            "promotion gate filters on; NULL here = shadow data invisible "
+            "to evaluate_mm_promotion"
+        )
+        # bid filled @ 45c, YES wins → +55c per contract × MM_ORDER_SIZE
+        assert shadow_pnl is not None
+        assert shadow_pnl > 0, (
+            f"expected positive shadow P&L for filled-bid-wins-yes, "
+            f"got {shadow_pnl}"
+        )
+
+    def test_no_side_fill_still_stamps_settle_ts(self, conn, monkeypatch):
+        """Unfilled rows also need ts_settle_unix so the graduation gate
+        can count them in denominators (fill-rate, gate-pass rate)."""
+        import trade
+
+        ticker = "KXHIGHCHI-26APR22-T58"
+        rid = _insert_shadow_row(
+            conn, ticker=ticker, series="KXHIGHCHI",
+            ts_unix=time.time() - 3600,
+            proposed_bid=30, proposed_ask=40,
+            market_yes_bid=32, market_yes_ask=38,
+        )
+        # no fills — bid_f=0, ask_f=0
+        monkeypatch.setattr(
+            trade, "api_get",
+            lambda path: {"settlements": [self._canned_settlement(ticker, "no")]}
+            if path.startswith("/portfolio/settlements") else {},
+        )
+
+        trade.record_settlements(conn)
+
+        ts_settle = conn.execute(
+            "SELECT ts_settle_unix FROM weather_mm_shadow WHERE id=?", (rid,),
+        ).fetchone()[0]
+        assert ts_settle is not None
+
+    def test_idempotent_across_sweeps(self, conn, monkeypatch):
+        """Kalshi's /portfolio/settlements returns the same rows for hours
+        until they roll off. Re-annotating must be a no-op, not a
+        double-write — annotate_shadow_pnl guards this with
+        WHERE ts_settle_unix IS NULL."""
+        import trade
+
+        ticker = "KXHIGHMIA-26APR22-T81"
+        rid = _insert_shadow_row(
+            conn, ticker=ticker, series="KXHIGHMIA",
+            ts_unix=time.time() - 3600,
+            proposed_bid=50, proposed_ask=60,
+            market_yes_bid=52, market_yes_ask=58,
+        )
+        conn.execute(
+            "UPDATE weather_mm_shadow SET shadow_bid_filled=1 WHERE id=?",
+            (rid,),
+        )
+        conn.commit()
+        monkeypatch.setattr(
+            trade, "api_get",
+            lambda path: {"settlements": [self._canned_settlement(ticker, "yes")]}
+            if path.startswith("/portfolio/settlements") else {},
+        )
+
+        trade.record_settlements(conn)
+        first_ts = conn.execute(
+            "SELECT ts_settle_unix FROM weather_mm_shadow WHERE id=?", (rid,),
+        ).fetchone()[0]
+        assert first_ts is not None
+
+        # Re-run — ts_settle_unix must NOT change.
+        trade.record_settlements(conn)
+        second_ts = conn.execute(
+            "SELECT ts_settle_unix FROM weather_mm_shadow WHERE id=?", (rid,),
+        ).fetchone()[0]
+        assert first_ts == second_ts, (
+            "second sweep rewrote ts_settle_unix — the "
+            "`WHERE ts_settle_unix IS NULL` guard is not holding"
+        )
+
+    def test_personal_trade_skipped_before_annotation(self, conn, monkeypatch):
+        """Personal prefixes (NBA/NCAA/NFL/etc) bail out before annotation —
+        no shadow row would exist for them anyway, but make sure we don't
+        insert spurious ones or raise."""
+        import trade
+
+        monkeypatch.setattr(
+            trade, "api_get",
+            lambda path: {"settlements": [
+                self._canned_settlement("KXNBAGAME-26APR22-LAL", "yes")
+            ]} if path.startswith("/portfolio/settlements") else {},
+        )
+        # Should not raise, should not print annotate-fail.
+        trade.record_settlements(conn)

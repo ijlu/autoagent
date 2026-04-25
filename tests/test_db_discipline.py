@@ -92,9 +92,11 @@ def test_no_connection_row_factory_mutation():
     violations: list[str] = []
     for path in _python_files():
         rel = path.relative_to(REPO_ROOT).as_posix()
-        # diagnose_sources.py / eval_bot.py open their own connection and never
-        # thread it — exempt them explicitly.
+        # diagnose_sources.py / eval_bot.py / tools/* open their own connection
+        # and never thread it — exempt them explicitly.
         if rel in {"diagnose_sources.py", "eval_bot.py"}:
+            continue
+        if rel.startswith("tools/"):
             continue
         if rel.startswith("tests/"):
             continue

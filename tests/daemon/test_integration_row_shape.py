@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from bot.daemon.dispatcher import AsyncEventDispatcher
@@ -22,6 +23,21 @@ from bot.daemon.metar_poller import StationReading, TemperatureChange
 from bot.daemon.weather_handler import WeatherChangeHandler
 from bot.daemon.weather_quoter import WeatherMarket, WeatherQuoter
 from bot.db import init_db
+
+
+def _today_close_time() -> str:
+    """Close-time anchored to KJFK's LST (EST, UTC-5) so the quoter's
+    ``_is_today_market`` check passes regardless of what hour of UTC the
+    test is run. Using UTC-today here would fail at night UTC (0:00-5:00
+    UTC) when LST is still on the previous date."""
+    lst_tz = timezone(timedelta(hours=-5))
+    today_lst = datetime.now(lst_tz).date()
+    # 12:00 LST is safely inside the LST day; convert to UTC for the ISO.
+    noon_lst = datetime(
+        today_lst.year, today_lst.month, today_lst.day,
+        12, 0, 0, tzinfo=lst_tz,
+    )
+    return noon_lst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _make_bracket_market() -> WeatherMarket:
@@ -37,7 +53,7 @@ def _make_bracket_market() -> WeatherMarket:
         yes_bid=30,
         yes_ask=35,
         volume=100,
-        close_time="2026-04-20T04:00:00Z",
+        close_time=_today_close_time(),
     )
 
 

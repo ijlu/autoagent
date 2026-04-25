@@ -146,9 +146,39 @@ def _aggregate_ledger(
     }
 
 
+_MM_PROCESSED_FILLS_REQUIRED_COLS = ("side", "contracts", "price_cents", "recorded_at")
+
+
+def _mm_processed_fills_is_comparable(conn: sqlite3.Connection) -> bool:
+    """Return True when the production schema has the columns the
+    aggregator needs.
+
+    Historically ``mm_processed_fills`` shipped as
+    ``(fill_id, processed_at, fee_cents, order_id, ticker)``. ``init_db``
+    later declared a superset schema with ``side``, ``contracts``,
+    ``price_cents``, ``recorded_at`` but there is no migration for those
+    columns — production DBs created under the old schema never gain
+    them. When any required column is absent we cannot aggregate at all;
+    the validator treats this as ``is_meaningful=False`` rather than
+    raising a schema error on every scheduled run.
+    """
+    try:
+        cols = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(mm_processed_fills)"
+            ).fetchall()
+        }
+    except sqlite3.Error:
+        return False
+    return all(c in cols for c in _MM_PROCESSED_FILLS_REQUIRED_COLS)
+
+
 def _aggregate_mm_processed_fills(
     conn: sqlite3.Connection, since_iso: str,
 ) -> dict[tuple[str, str], TickerSideStats]:
+    if not _mm_processed_fills_is_comparable(conn):
+        return {}
     rows = conn.execute(
         "SELECT ticker, side, "
         "       SUM(contracts), "

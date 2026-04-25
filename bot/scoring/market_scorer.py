@@ -78,6 +78,20 @@ except ImportError:
 _CACHE: dict[str, tuple] = {}
 
 
+# ---------------------------------------------------------------------------
+# Skip-reason constants — surface *why* score_market returned 0 so the
+# daemon's cycle-funnel counters can partition score_zero into actionable
+# buckets. Each constant maps 1:1 to one early-exit in score_market.
+# 2026-04-22 audit observability #2.
+# ---------------------------------------------------------------------------
+SKIP_PRICE_BOUNDS = "price_bounds"                # yes_ask in (0.08, 0.92)
+SKIP_VOLUME = "volume"                             # volume < 50
+SKIP_SPREAD_ZERO = "spread_zero"                   # yes_ask - yes_bid <= 0
+SKIP_NO_ENSEMBLE = "no_ensemble"                   # ensemble returned None / 0 sources
+SKIP_EDGE_BELOW_THRESHOLD = "edge_below_threshold" # info_edge below MIN_EDGE on both sides
+SKIP_NO_STRATEGY_FIRED = "no_strategy_fired"       # edge fine but spread/other strategy gates killed it
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Shared helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -540,9 +554,16 @@ def score_market(m: dict, adaptive_weights=None, calibration_corrections=None,
                  category_edges=None, disabled_sources=None, disabled_strategies=None,
                  strategy_bandit=None):
     """
-    Returns (score, side, strategy, detail, volume, spread_cents,
-             independent_prob, market_prob, edge)
-    score=0 -> no trade.
+    Returns a 10-tuple:
+    (score, side, strategy, detail, volume, spread_cents,
+     independent_prob, market_prob, edge, skip_reason)
+
+    ``score == 0`` -> no trade. The trailing ``skip_reason`` is one of
+    the ``SKIP_*`` constants when ``score == 0`` and ``""`` on success.
+    It exists so the daemon's cycle-funnel counters can attribute each
+    zero-score market to the specific gate that fired (2026-04-22
+    audit observability #2). 10-tuple is a known smell; migrate to a
+    dataclass in a focused refactor PR if the shape churn gets painful.
     """
     def _n(v, d=99):
         v = float(v or d); return v/100 if v > 1.0 else v
@@ -556,15 +577,17 @@ def score_market(m: dict, adaptive_weights=None, calibration_corrections=None,
     sc      = round(spread * 100, 1)
     ticker  = m.get("ticker", "")
 
-    EMPTY = (0.0, "", "", "", 0, 0, None, None, 0)
+    def _empty(reason: str):
+        """Produce the 10-tuple EMPTY with a named skip_reason."""
+        return (0.0, "", "", "", 0, 0, None, None, 0, reason)
 
     # Skip very illiquid or very cheap markets
     if yes_ask <= 0.08 or yes_ask >= 0.92:
-        return EMPTY
+        return _empty(SKIP_PRICE_BOUNDS)
     if volume < 50:
-        return EMPTY
+        return _empty(SKIP_VOLUME)
     if spread <= 0:
-        return EMPTY
+        return _empty(SKIP_SPREAD_ZERO)
 
     # -- Get ensemble probability estimate (with adaptive weights + calibration) --
     indep_prob, info_source, n_sources = get_independent_estimate(
@@ -578,7 +601,7 @@ def score_market(m: dict, adaptive_weights=None, calibration_corrections=None,
     # Market making and liquidity harvest removed -- they had no real information edge.
     # Only trade when we have independent data that diverges from market price.
     if indep_prob is None or n_sources == 0:
-        return EMPTY
+        return _empty(SKIP_NO_ENSEMBLE)
 
     # Adaptive edge threshold: more sources -> more confidence -> lower threshold
     if n_sources >= 3:
@@ -676,7 +699,13 @@ def score_market(m: dict, adaptive_weights=None, calibration_corrections=None,
             print(f"[strategy] near_resolution error: {e}")
 
     if not candidates:
-        return EMPTY
+        # Diagnose info_edge rejection vs. other-strategy silence so the
+        # cycle funnel can split "MIN_EDGE is too tight" (tunable) from
+        # "info_edge would have fired but spread >= 0.08 killed it, and
+        # no other strategy spoke up" (different fix surface entirely).
+        if fee_adjusted_edge_yes <= required_edge and fee_adjusted_edge_no <= required_edge:
+            return _empty(SKIP_EDGE_BELOW_THRESHOLD)
+        return _empty(SKIP_NO_STRATEGY_FIRED)
 
     # Weight each candidate's score by its Thompson Sampling posterior draw.
     # This means proven strategies get full credit while unproven ones are
@@ -699,7 +728,8 @@ def score_market(m: dict, adaptive_weights=None, calibration_corrections=None,
         strat_names = [c[2] for c in candidates]
         best_detail += f" [also: {', '.join(s for s in strat_names if s != best_strat)}]"
 
-    return best_score, best_side, best_strat, best_detail, volume, sc, best_ip, best_mp, best_edge
+    return (best_score, best_side, best_strat, best_detail, volume, sc,
+            best_ip, best_mp, best_edge, "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -713,12 +743,24 @@ def passes_filters(ticker: str, strategy: str, volume: float, spread_cents: floa
     *af* is the dict returned by :func:`bot.scoring.filters.compute_avoid_filters`.
     Returns ``(True, "")`` when the market is acceptable, or
     ``(False, reason)`` when it should be skipped.
+
+    **2026-04-22 audit fix:** prefix rejection now checks
+    ``avoided_by_strategy[strategy]`` rather than a global
+    ``avoided_prefixes`` set. The old behaviour vetoed every
+    ``KXHIGH*`` directional candidate because MM had lost money on that
+    prefix — even though the directional signal on those families
+    passed Phase 0 by 4–8×. ``avoided_prefixes`` is consulted only as a
+    fallback when the partitioned dict is absent (legacy state).
     """
     vt = af.get("low_volume_threshold")
     if vt and volume < vt:
         return False, f"learned: vol {volume:.0f}<{vt}"
     if strategy in af.get("avoided_strategies", set()):
         return False, f"learned: strat '{strategy}'"
-    if ticker[:6] in af.get("avoided_prefixes", set()):
+    by_strat = af.get("avoided_by_strategy")
+    if by_strat is not None:
+        if ticker[:6] in by_strat.get(strategy, set()):
+            return False, f"learned: strat '{strategy}' prefix '{ticker[:6]}'"
+    elif ticker[:6] in af.get("avoided_prefixes", set()):
         return False, f"learned: prefix '{ticker[:6]}'"
     return True, ""

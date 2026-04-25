@@ -94,6 +94,11 @@ EXPECTED_INSERT_WRITERS: dict[str, set[str]] = {
     "calibration": {
         "trade.py",
         "bot/learning/populate_from_alpha.py",
+        # Shadow-to-calibration bridge (2026-04-22): turns settled
+        # weather_mm_shadow rows into calibration training samples so the
+        # Platt fitter doesn't have to wait for alpha_backtest accumulation.
+        # Tagged with source_desc='weather_mm_shadow'; watermark-dedup'd.
+        "bot/learning/shadow_calibration_bridge.py",
     },
     "timing_patterns": {
         "trade.py",
@@ -117,6 +122,9 @@ EXPECTED_INSERT_WRITERS: dict[str, set[str]] = {
     "kv_cache": {
         "bot/db.py",
         "bot/learning/calibration.py",
+        # Shadow bridge writes its watermark key directly into kv_cache to
+        # survive restarts and avoid re-bridging the same rows.
+        "bot/learning/shadow_calibration_bridge.py",
     },
 }
 

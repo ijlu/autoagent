@@ -412,3 +412,24 @@ class TestRunFillsValidator:
                         fee_cents=5, recorded_at_unix=now)
         main_module._run_fills_validator(conn)
         assert alerts == []
+
+    def test_exception_propagates_to_scheduler(self, monkeypatch):
+        """Regression test for the 2026-04-22 audit finding: the wrapper
+        used to ``try/except Exception`` around ``compare_last_n_days``
+        and return normally, so the scheduler's per-task error_count
+        stayed at 0 even when every run crashed with
+        ``no such column: side`` against the legacy production schema.
+
+        The wrapper must not catch. The scheduler's own try/except is
+        the single place that owns logging + counting + rescheduling."""
+        import pytest as _pytest
+        from bot.daemon import main as main_module
+
+        def _boom(conn, n_days):
+            raise RuntimeError("simulated validator failure")
+
+        monkeypatch.setattr(main_module, "compare_last_n_days", _boom)
+
+        conn = init_db(":memory:")
+        with _pytest.raises(RuntimeError, match="simulated validator failure"):
+            main_module._run_fills_validator(conn)

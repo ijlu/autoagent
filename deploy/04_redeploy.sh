@@ -30,6 +30,7 @@ rsync -avz --progress \
     --include='context/' --include='context/***' \
     --include='deploy/' --include='deploy/***' \
     --include='scripts/' --include='scripts/***' \
+    --include='tools/' --include='tools/***' \
     --include='*.py' \
     --include='.env' \
     --exclude='*' \
@@ -169,7 +170,26 @@ from bot.daemon.shadow_integrity import (
 assert callable(check_shadow_data_integrity), 'shadow_integrity regression: check function missing'
 assert MIN_ROWS_FOR_SIGNAL >= 10, 'shadow_integrity regression: signal threshold too low (false-positive risk)'
 assert DEFAULT_WINDOW_S >= 3600, 'shadow_integrity regression: window too short'
-print('bot/ imports OK — Phase 2 weather expansion + Phase 3 econ sources + T1.1/T1.2/T3.1/T3.3/B+D/shadow_integrity wired')
+# 2026-04-22 — catalog-driven settlement back-fill poller. Fixes the
+# portfolio-vs-catalog gap that was starving Platt calibration for weeks.
+from bot.learning.settlement_backfill import (
+    backfill_from_catalog, fetch_settled_markets, _parse_close_ts,
+    _distinct_unsettled_series, DEFAULT_MAX_PAGES,
+)
+assert callable(backfill_from_catalog), 'settlement_backfill regression: entrypoint missing'
+assert DEFAULT_MAX_PAGES >= 5, 'settlement_backfill regression: pagination cap too low'
+assert _parse_close_ts('2026-04-21T20:00:00Z') is not None, 'settlement_backfill regression: Zulu ISO parse broken'
+# 2026-04-22 — shadow→calibration bridge. Converts settled weather_mm_shadow
+# rows into calibration training data so the Platt fit has per-family signal
+# without waiting for fresh alpha_backtest accumulation (Platt starvation
+# root cause — 27K+ shadow rows settled but never reached the fitter).
+from bot.learning.shadow_calibration_bridge import (
+    bridge_shadow_to_calibration, WATERMARK_KEY, SOURCE_DESC,
+)
+assert callable(bridge_shadow_to_calibration), 'shadow_cal_bridge regression: entrypoint missing'
+assert WATERMARK_KEY == 'shadow_cal_bridge_watermark', 'shadow_cal_bridge regression: watermark key changed (would silently reset dedup on deploy)'
+assert SOURCE_DESC == 'weather_mm_shadow', 'shadow_cal_bridge regression: source_desc changed (breaks downstream audit filters)'
+print('bot/ imports OK — Phase 2 weather expansion + Phase 3 econ sources + T1.1/T1.2/T3.1/T3.3/B+D/shadow_integrity/settlement_backfill/shadow_cal_bridge wired')
 \""
 echo "  bot/ OK"
 

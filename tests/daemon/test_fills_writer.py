@@ -698,10 +698,12 @@ class TestRunFillsSync:
         expected_since = int(ledger_max - FILLS_SYNC_OVERLAP_S)
         assert f"min_ts={expected_since}" in api.paths[0]
 
-    def test_never_raises_on_db_error(self, caplog):
-        """If something exotic breaks (e.g. ``MAX(fill_ts_unix)`` raises
-        because the connection is closed), the wrapper must log and
-        return — not propagate up into the scheduler."""
+    def test_propagates_db_error_to_scheduler(self):
+        """The wrapper must NOT swallow DB errors. The scheduler's own
+        try/except around ``task.fn()`` handles logging and increments
+        ``error_count``; a defensive wrapper here would make the
+        scheduler's per-task health counter lie — the same silent-failure
+        shape that hid the 2026-04-22 fills_validator schema bug."""
         from bot.daemon.main import _run_fills_sync
 
         class _BoomConn:
@@ -713,11 +715,10 @@ class TestRunFillsSync:
         real_conn = init_db(":memory:")
         api = _FakeApi(pages=[])
         writer = FillsWriter(real_conn, api_get=api)
-        with caplog.at_level(logging.ERROR, logger="bot.daemon.main"):
+        with pytest.raises(RuntimeError, match="db gone"):
             _run_fills_sync(writer, _BoomConn(), 1_776_700_000.0)
         # API was never reached because the max(fill_ts) read failed.
         assert api.paths == []
-        assert any("unexpected failure" in r.getMessage() for r in caplog.records)
 
     def test_live_mode_env_flag_propagates(self, monkeypatch):
         """``WEATHER_MM_LIVE`` at import time of bot.daemon.main determines
