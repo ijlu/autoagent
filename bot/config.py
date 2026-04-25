@@ -50,6 +50,10 @@ MM_DRY_RUN = os.environ.get("MM_DRY_RUN", "true").lower() in ("true", "1", "yes"
 # Phase 1 shadow-to-live gate for weather MM. Default false — shadow mode only.
 # Flipped to true only once the step-9 shadow backtest proves out.
 WEATHER_MM_LIVE = os.environ.get("WEATHER_MM_LIVE", "false").lower() in ("true", "1", "yes")
+# A6: route WeatherQuoter fair-value through `weather_ensemble_v2.predict_v2` instead
+# of the v1 METAR-only logistic CDF. Shadow-first: flag toggles the FV path, live
+# posting is still gated by WEATHER_MM_LIVE. Falls back to v1 on v2 errors / None.
+WEATHER_ENSEMBLE_V2 = os.environ.get("WEATHER_ENSEMBLE_V2", "false").lower() in ("true", "1", "yes")
 
 # Directional families hard-blocked from trading regardless of
 # per-family shadow-to-live flags. Anti-calibrated in Phase 0 backtests:

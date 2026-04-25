@@ -17,6 +17,7 @@ from bot.api import cached_get
 from bot.config import TOMORROW_API_KEY
 from bot.daemon.stations import STATION_BY_CITY, STATION_BY_SERIES
 from bot.db import get_connection, kv_get, kv_set
+from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -248,6 +249,79 @@ def get_weather_forecast(city_key):
     return cached_get(f"weather_{city_key}", url, timeout=5)
 
 
+def _open_meteo_sigma_for_day(day_idx: int) -> float:
+    """Open-Meteo (vanilla, no model override) sigma in °F.
+
+    Roughly: 2°F at day 0, +0.6°F per day out. Slightly looser than NBM
+    because Open-Meteo's default blend averages multiple models without
+    NOAA's NBM bias-correction step. A3 replaces this with fitted σ.
+    """
+    return 2.0 + day_idx * 0.6
+
+
+def get_weather_gaussian(ticker, market_data):
+    """Return Open-Meteo's temperature distribution for the settlement day.
+
+    Threshold/bracket-independent; ensemble projects per-market.
+    """
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = ticker.upper() if ticker else ""
+
+    is_weather = any(kw in title for kw in _WEATHER_KEYWORDS) or "KXHIGH" in ticker_upper
+    if not is_weather:
+        return None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None
+
+    threshold, _ = _parse_threshold(ticker, title)
+    if threshold is None or threshold < -40 or threshold > 140:
+        return None
+
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None:
+        return None
+
+    forecast = get_weather_forecast(city_key)
+    if not forecast:
+        return None
+
+    daily = forecast.get("daily", {})
+    temps_max = daily.get("temperature_2m_max", [])
+    dates = daily.get("time", [])
+    if day_idx >= len(temps_max):
+        return None
+    forecast_high = temps_max[day_idx]
+    if forecast_high is None:
+        return None
+
+    # Persist today's forecast high for METAR comparison (same as v1)
+    if day_idx == 0:
+        _station = _CITY_STATION_MAP.get(city_key)
+        if _station:
+            try:
+                _conn = get_connection()
+                _offset = _CITY_LST_OFFSET.get(city_key, -5)
+                _lst_date = datetime.now(timezone(timedelta(hours=_offset))).strftime("%Y-%m-%d")
+                kv_set(_conn, f"metar_forecast_high_{_station}_{_lst_date}", forecast_high, 86400)
+            except Exception:
+                pass
+
+    tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
+    date_label = dates[day_idx] if day_idx < len(dates) else "?"
+    sigma_f = _open_meteo_sigma_for_day(day_idx)
+    horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
+
+    return GaussianForecast(
+        mean_f=float(forecast_high),
+        sigma_f=sigma_f,
+        horizon_hours=horizon_hours,
+        source_name="weather",
+        source_tag=f"weather:{city_key}_{date_label}",
+    )
+
+
 def get_weather_estimate(ticker, market_data):
     """Open-Meteo weather source: estimate probability for weather markets.
 
@@ -311,7 +385,7 @@ def get_weather_estimate(ticker, market_data):
 
     # Forecast error model: accuracy degrades with forecast horizon
     # Day 0 (today): ~2F error, Day 1: ~3F, Day 3: ~4.5F, Day 7: ~6F
-    forecast_sigma = 2.0 + day_idx * 0.6  # linear increase in uncertainty
+    forecast_sigma = _open_meteo_sigma_for_day(day_idx)  # linear increase in uncertainty
 
     # Check if this is a bracket market (-B suffix) -- needs CDF(upper) - CDF(lower)
     is_bracket = "-B" in ticker_upper if ticker_upper else False
@@ -438,6 +512,84 @@ def get_tomorrow_forecast(city_key):
         return None
 
 
+def _tomorrow_sigma_for_day(day_idx: int) -> float:
+    """Tomorrow.io per-day sigma. Same schedule as Open-Meteo for now;
+    they're at similar skill levels on daily highs. A3 will fit separate σ's."""
+    return 2.0 + day_idx * 0.6
+
+
+def get_tomorrow_gaussian(ticker, market_data):
+    """Return Tomorrow.io's temperature distribution for the settlement day."""
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = ticker.upper() if ticker else ""
+
+    is_weather = any(kw in title for kw in _WEATHER_KEYWORDS) or "KXHIGH" in ticker_upper
+    if not is_weather:
+        return None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None
+
+    # Same threshold-parsing pattern as v1 to keep "when does this source fire"
+    # unchanged — we're adding a Gaussian sibling, not changing source scope.
+    temp_match = re.search(
+        r'(at or above|at or below|above|below|over|under|at least|exceed)\s+(\d+\.?\d*)', title
+    )
+    if not temp_match:
+        tick_match = re.search(r'-[TB](-?\d+\.?\d*)', ticker)
+        if tick_match:
+            threshold = float(tick_match.group(1))
+        else:
+            return None
+    else:
+        threshold = float(temp_match.group(2))
+    if threshold < -40 or threshold > 140:
+        return None
+
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None:
+        return None
+
+    forecast = get_tomorrow_forecast(city_key)
+    if not forecast:
+        return None
+
+    daily = forecast.get("daily", {})
+    temps_max = daily.get("temperature_2m_max", [])
+    dates = daily.get("time", [])
+    if day_idx >= len(temps_max):
+        return None
+    forecast_high = temps_max[day_idx]
+    if forecast_high is None:
+        return None
+
+    # Persist today's forecast high for METAR comparison (same as v1)
+    if day_idx == 0:
+        _station = _CITY_STATION_MAP.get(city_key)
+        if _station:
+            try:
+                _conn = get_connection()
+                _offset = _CITY_LST_OFFSET.get(city_key, -5)
+                _lst_date = datetime.now(timezone(timedelta(hours=_offset))).strftime("%Y-%m-%d")
+                kv_set(_conn, f"metar_forecast_high_{_station}_{_lst_date}", forecast_high, 86400)
+            except Exception:
+                pass
+
+    tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
+    date_label = dates[day_idx] if day_idx < len(dates) else "?"
+    sigma_f = _tomorrow_sigma_for_day(day_idx)
+    horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
+
+    return GaussianForecast(
+        mean_f=float(forecast_high),
+        sigma_f=sigma_f,
+        horizon_hours=horizon_hours,
+        source_name="tomorrow",
+        source_tag=f"tomorrow:{city_key}_{date_label}",
+    )
+
+
 def get_tomorrow_weather_estimate(ticker, market_data):
     """Tomorrow.io weather source -- same logic as Open-Meteo but different data provider.
     Acts as redundant backup + cross-validation for weather markets.
@@ -498,7 +650,7 @@ def get_tomorrow_weather_estimate(ticker, market_data):
 
     forecast_high = temps_max[day_idx]
     forecast_low = temps_min[day_idx]
-    forecast_sigma = 2.0 + day_idx * 0.6
+    forecast_sigma = _tomorrow_sigma_for_day(day_idx)
 
     # Defense 4: Persist today's forecast high for METAR comparison (same as Open-Meteo)
     if day_idx == 0:

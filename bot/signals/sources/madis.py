@@ -38,6 +38,7 @@ from bot.signals.sources.weather import (
     _parse_threshold,
     _determine_day_index,
 )
+from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
 _MADIS_CACHE_TTL = 300  # 5 min — observations refresh every 5-15 min
@@ -107,6 +108,83 @@ def _obs_temp_f(obs: dict) -> Optional[float]:
         return None
 
 
+def _madis_expected_high_and_sigma(
+    temps_f: list[float], now_local: datetime
+) -> tuple[float, float]:
+    """Shared computation of (expected_eventual_high, sigma) for MADIS basket.
+
+    Centralized so the v1 probability path and the v2 Gaussian path stay in
+    lock-step: any refinement to the spatial-ensemble model lands in both.
+    """
+    median_temp = statistics.median(temps_f)
+    spread = max(temps_f) - min(temps_f)
+    # Expected daily high = current median + remaining warming potential.
+    # Assume peak is at 3pm LST; if we're before 3pm, likely more warming.
+    # Cap the warming headroom at 8°F.
+    if now_local.hour < 15:
+        warming = min(8.0, (15 - now_local.hour) * 1.5)
+    else:
+        warming = 0.0
+    expected_high = median_temp + warming
+    # Sigma: basket spread + time-of-day uncertainty
+    sigma = max(1.5, spread / 2.0 + (0.5 if now_local.hour >= 15 else 2.0))
+    return expected_high, sigma
+
+
+def get_madis_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
+    """Return MADIS spatial-basket distribution for the settlement day.
+
+    Only fires for today (day_idx=0): MADIS is observation-based and has no
+    utility as a next-day forecast source.
+    """
+    if market_data is None:
+        return None
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = (ticker or "").upper()
+    is_weather = "KXHIGH" in ticker_upper or any(
+        kw in title for kw in ("temperature", "temp", "°f", "degrees", "high")
+    )
+    if not is_weather:
+        return None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None
+
+    basket = _CITY_STATION_BASKET.get(city_key)
+    if not basket:
+        return None
+
+    threshold, _ = _parse_threshold(ticker, title)
+    if threshold is None or threshold < -40 or threshold > 140:
+        return None
+
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None or day_idx != 0:
+        return None
+
+    obs_list = _fetch_madis_basket(basket)
+    if not obs_list:
+        return None
+    temps_f = [t for obs in obs_list if (t := _obs_temp_f(obs)) is not None]
+    if len(temps_f) < 2:
+        return None
+
+    tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
+    lst_tz = timezone(timedelta(hours=tz_offset))
+    now_local = datetime.now(lst_tz)
+    expected_high, sigma = _madis_expected_high_and_sigma(temps_f, now_local)
+    horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
+
+    return GaussianForecast(
+        mean_f=float(expected_high),
+        sigma_f=float(sigma),
+        horizon_hours=horizon_hours,
+        source_name="madis",
+        source_tag=f"madis:{city_key}_n{len(temps_f)}",
+    )
+
+
 def get_madis_estimate(ticker: str, market_data: dict) -> tuple:
     """Dense-basket current-temperature estimate for KXHIGH markets.
 
@@ -154,27 +232,16 @@ def get_madis_estimate(ticker: str, market_data: dict) -> tuple:
         # Need at least 2 stations for a spatial ensemble
         return None, None
 
-    median_temp = statistics.median(temps_f)
-    spread = max(temps_f) - min(temps_f)
-
     # How much warmer the daily high might still get depends on time of day.
     # Use the existing metar module's LST offset model.
     tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
     lst_tz = timezone(timedelta(hours=tz_offset))
-    hours_left = max(0.0, (24 - datetime.now(lst_tz).hour - datetime.now(lst_tz).minute / 60))
-
-    # Expected daily high = current median + remaining warming potential.
-    # Assume peak is at 3pm LST; if we're before 3pm, likely more warming.
-    # Cap the warming headroom at 8°F.
     now_local = datetime.now(lst_tz)
-    if now_local.hour < 15:
-        warming = min(8.0, (15 - now_local.hour) * 1.5)
-    else:
-        warming = 0.0
-    expected_high = median_temp + warming
-
-    # Sigma: basket spread + time-of-day uncertainty
-    sigma = max(1.5, spread / 2.0 + (0.5 if now_local.hour >= 15 else 2.0))
+    hours_left = max(0.0, (24 - now_local.hour - now_local.minute / 60))
+    # Shared model with v2 Gaussian path — do NOT duplicate.
+    expected_high, sigma = _madis_expected_high_and_sigma(temps_f, now_local)
+    median_temp = statistics.median(temps_f)  # for logging parity with v1
+    spread = max(temps_f) - min(temps_f)
 
     is_bracket = "-B" in ticker_upper
     if is_bracket:

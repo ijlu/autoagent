@@ -11,6 +11,17 @@ non-trivial compilation headaches on a 1GB VPS.
 HRRR only covers the first 18-48 hours, so this source returns None for day_idx >= 2.
 
 Free, no auth.
+
+Contract
+--------
+This module exports two entry points:
+
+* ``get_hrrr_gaussian(ticker, market_data) -> GaussianForecast | None`` — the
+  underlying temperature distribution. Used by ``weather_ensemble_v2`` for
+  precision-weighted combining.
+* ``get_hrrr_estimate(ticker, market_data) -> tuple[prob, tag]`` — back-compat
+  shim for v1 callers. Projects the Gaussian onto the specific market's
+  threshold/bracket via ``probability_for_market``.
 """
 
 from __future__ import annotations
@@ -30,6 +41,11 @@ from bot.signals.sources.weather import (
     _detect_city,
     _parse_threshold,
     _determine_day_index,
+)
+from bot.signals.weather_forecast import (
+    GaussianForecast,
+    hours_until_settlement_end,
+    probability_for_market,
 )
 
 
@@ -92,7 +108,87 @@ def _daily_high_from_hourly_hrrr(
     return max(highs) if highs else None
 
 
+def _hrrr_sigma_for_day(day_idx: int) -> float:
+    """HRRR per-day forecast sigma in °F.
+
+    Fixed schedule from the v1 model: 1.2°F at day 0, +0.5°F per day out.
+    A3 will replace this with a skill-curve lookup fitted from snapshots;
+    the magic number stays here until the learned sigma is fresher and
+    demonstrably better.
+    """
+    return 1.2 + day_idx * 0.5
+
+
+def get_hrrr_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
+    """Return HRRR's temperature distribution for the daily-high settlement.
+
+    Independent of any specific bucket's threshold or bracket — all Gaussian
+    sources on the same (city, settlement_date) share one distribution, and
+    per-ticker probability is projected at combine time.
+
+    Returns ``None`` if the market isn't weather-type, the city isn't in the
+    HRRR catalog, the forecast day is beyond HRRR's 18–48h horizon
+    (``day_idx > 1``), or the API fetch failed.
+    """
+    if market_data is None:
+        return None
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = (ticker or "").upper()
+    is_weather = "KXHIGH" in ticker_upper or any(
+        kw in title for kw in ("temperature", "temp", "°f", "degrees", "high")
+    )
+    if not is_weather:
+        return None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None
+
+    # Threshold parsing is just used for the weather-market sanity gate here;
+    # the actual probability projection happens downstream in the ensemble.
+    threshold, _ = _parse_threshold(ticker, title)
+    if threshold is None or threshold < -40 or threshold > 140:
+        return None
+
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None or day_idx > 1:
+        # HRRR only covers today + tomorrow
+        return None
+
+    tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
+    lst_tz = timezone(timedelta(hours=tz_offset))
+    target_date = (datetime.now(lst_tz) + timedelta(days=day_idx)).strftime("%Y-%m-%d")
+
+    forecast = _fetch_hrrr_forecast(city_key)
+    if not forecast:
+        return None
+
+    forecast_high = _daily_high_from_hourly_hrrr(forecast, target_date)
+    if forecast_high is None:
+        return None
+
+    sigma_f = _hrrr_sigma_for_day(day_idx)
+    horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
+
+    return GaussianForecast(
+        mean_f=float(forecast_high),
+        sigma_f=sigma_f,
+        horizon_hours=horizon_hours,
+        source_name="hrrr",
+        source_tag=f"hrrr:{city_key}_{target_date}",
+    )
+
+
 def get_hrrr_estimate(ticker: str, market_data: dict) -> tuple:
+    """V1 probability entry point — logistic CDF, unchanged.
+
+    We intentionally do NOT route this through ``probability_for_market``
+    (which uses Normal CDF). Normal vs logistic differ by ~10pp at ±1σ,
+    so swapping would silently shift v1 Brier scores. The new Gaussian
+    contract (``get_hrrr_gaussian``) uses Normal as the correct
+    distributional assumption; A3 will fit empirical σ's that match it.
+    Until then v1 callers keep v1 behaviour.
+    """
     if market_data is None:
         return None, None
     title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
@@ -113,7 +209,6 @@ def get_hrrr_estimate(ticker: str, market_data: dict) -> tuple:
 
     day_idx = _determine_day_index(title, market_data, city_key)
     if day_idx is None or day_idx > 1:
-        # HRRR only covers today + tomorrow
         return None, None
 
     tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
@@ -128,8 +223,7 @@ def get_hrrr_estimate(ticker: str, market_data: dict) -> tuple:
     if forecast_high is None:
         return None, None
 
-    # HRRR is the most accurate short-range model — tight sigma.
-    forecast_sigma = 1.2 + day_idx * 0.5
+    forecast_sigma = _hrrr_sigma_for_day(day_idx)
 
     is_bracket = "-B" in ticker_upper
     if is_bracket:

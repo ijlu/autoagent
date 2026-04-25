@@ -27,10 +27,18 @@ EXPECTED_OWNERS: dict[str, set[str]] = {
     # have posted. Readers (mm_promotion, match_shadow_fills) are read-only.
     "weather_mm_shadow": {"bot/daemon/weather_quoter.py"},
 
-    # Forecast snapshot table — only the weather-ensemble stitcher drops
-    # snapshots. Anything else writing here corrupts the snapshot stream
-    # used for calibration + backtests.
-    "weather_forecast_snapshots": {"bot/signals/weather_ensemble.py"},
+    # Forecast snapshot table — both the v1 probability-space stitcher
+    # (weather_ensemble.py) and the v2 Gaussian-first stitcher
+    # (weather_ensemble_v2.py) log here. v1 logs (prob, forecast_high_f);
+    # v2 additionally populates (sigma_f, hours_out) and writes rows
+    # under source="combined_v2"/"afd_bias" that don't overlap with v1's
+    # per-source rows. Feature-flag-gated (WEATHER_ENSEMBLE_V2) so in
+    # practice only one writer fires per cycle; the table is append-only
+    # so steady-state dual-writing during comparison runs is also safe.
+    "weather_forecast_snapshots": {
+        "bot/signals/weather_ensemble.py",
+        "bot/signals/weather_ensemble_v2.py",
+    },
 
     # Four-factor decision log — single-owner by design. Other decision
     # paths log to `strategy_journal` instead.

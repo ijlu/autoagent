@@ -183,57 +183,136 @@ def _afd_llm_adjustment(text: str, city_key: str) -> Optional[float]:
     return None
 
 
-def get_afd_estimate(ticker: str, market_data: dict) -> tuple:
-    """AFD-based estimate. Uses NBM as the baseline and applies a forecaster
-    adjustment from AFD text. Returns (prob, source) or (None, None).
+def _afd_core(ticker: str, market_data: dict):
+    """Shared AFD pipeline: gate, city/WFO resolution, NBM baseline, bias extraction.
+
+    Returns a dict with keys:
+        city_key, wfo, threshold, is_above, day_idx,
+        baseline_high, adj, llm_used, text_sample
+    or ``None`` if any gate fails. Both ``get_afd_estimate`` (v1 projected
+    probability) and ``get_afd_bias`` (v2 bias-space output) are thin
+    wrappers over this.
     """
     if market_data is None:
-        return None, None
+        return None
     title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
     ticker_upper = (ticker or "").upper()
     is_weather = "KXHIGH" in ticker_upper or any(
         kw in title for kw in ("temperature", "temp", "°f", "degrees", "high")
     )
     if not is_weather:
-        return None, None
+        return None
 
     city_key = _detect_city(ticker_upper, title)
     if not city_key:
-        return None, None
+        return None
     wfo = _CITY_WFO_MAP.get(city_key)
     if not wfo:
-        return None, None
+        return None
 
     threshold, is_above = _parse_threshold(ticker, title)
     if threshold is None or threshold < -40 or threshold > 140:
-        return None, None
+        return None
 
     day_idx = _determine_day_index(title, market_data, city_key)
     # AFD covers short-range only; past day-1 the discussion goes vague
     if day_idx is None or day_idx > 1:
-        return None, None
+        return None
 
-    # Need an NBM baseline to adjust. We import lazily to avoid circular import.
     from bot.signals.sources.ndfd_nbm import _fetch_nbm_forecast
 
     baseline = _fetch_nbm_forecast(city_key)
     if not baseline:
-        return None, None
+        return None
     highs = baseline.get("daily", {}).get("temperature_2m_max", [])
     if day_idx >= len(highs):
-        return None, None
+        return None
     baseline_high = highs[day_idx]
     if baseline_high is None:
-        return None, None
+        return None
 
     text = _fetch_latest_afd(wfo)
     if not text:
-        return None, None
+        return None
 
     adj = _afd_llm_adjustment(text, city_key)
     llm_used = adj is not None
     if adj is None:
         adj = _afd_keyword_adjustment(text)
+
+    return {
+        "city_key": city_key,
+        "wfo": wfo,
+        "threshold": threshold,
+        "is_above": is_above,
+        "day_idx": day_idx,
+        "baseline_high": baseline_high,
+        "adj": adj,
+        "llm_used": llm_used,
+    }
+
+
+def get_afd_bias(ticker: str, market_data: dict):
+    """Return (bias_f, confidence, source_tag) or (None, None, None).
+
+    Bias-space contract for weather_ensemble_v2: AFD's internal representation
+    is a signed temperature adjustment (°F) applied to NBM's baseline high.
+    v2 ensemble consumes this as ``combined_gaussian.shifted(bias_f)`` after
+    the precision-weighted combine — avoiding the v1 re-projection through a
+    logistic that discards threshold-agnostic information.
+
+    Confidence is in [0, 1]. The LLM path produces a real-valued adjustment
+    from the full forecast text, so we treat it as higher-confidence (0.7).
+    The keyword path integrates at most a handful of matches and is noisier,
+    so it gets lower confidence (0.35 per absolute degree, capped at 0.5).
+    v2 ensemble applies ``effective_bias = bias_f * confidence`` so low-
+    confidence keyword reads don't overpower the Gaussian combine.
+
+    Returns (None, None, None) when the AFD pipeline can't produce a bias
+    (non-weather ticker, unknown city/WFO, missing NBM baseline, missing
+    AFD text). Crucially, a bias of 0.0 with positive confidence is a
+    valid return — it means "AFD saw nothing material to adjust" and the
+    ensemble should treat that as a real signal (pulls toward no-shift)
+    rather than "AFD unavailable" (no vote).
+    """
+    core = _afd_core(ticker, market_data)
+    if core is None:
+        return None, None, None
+
+    bias_f = float(core["adj"])
+    if core["llm_used"]:
+        confidence = 0.7
+    else:
+        # Keyword path: more matches → higher confidence, capped below LLM.
+        confidence = min(0.5, 0.35 * abs(bias_f))
+        # Zero-bias keyword reads still count (forecaster's silence is data),
+        # but at low confidence.
+        if bias_f == 0.0:
+            confidence = 0.15
+
+    method = "llm" if core["llm_used"] else "keyword"
+    tag = f"afd:{core['city_key']}_{core['wfo']}_{method}"
+    return bias_f, confidence, tag
+
+
+def get_afd_estimate(ticker: str, market_data: dict) -> tuple:
+    """AFD-based estimate. Uses NBM as the baseline and applies a forecaster
+    adjustment from AFD text. Returns (prob, source) or (None, None).
+    """
+    core = _afd_core(ticker, market_data)
+    if core is None:
+        return None, None
+
+    city_key = core["city_key"]
+    wfo = core["wfo"]
+    threshold = core["threshold"]
+    is_above = core["is_above"]
+    day_idx = core["day_idx"]
+    baseline_high = core["baseline_high"]
+    adj = core["adj"]
+    llm_used = core["llm_used"]
+    ticker_upper = (ticker or "").upper()
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
 
     adjusted_high = baseline_high + adj
     # AFD-adjusted estimate widens sigma slightly to reflect forecaster

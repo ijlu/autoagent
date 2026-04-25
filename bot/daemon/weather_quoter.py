@@ -16,13 +16,15 @@ the FV + smart-gate + bid/ask math with the live path but never call
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional, Tuple
 
 from bot.api import api_get, api_post, api_delete
@@ -34,8 +36,10 @@ from bot.config import (
     MM_MAX_INVENTORY,
     MM_SKEW_PER_10,
     MM_ORDER_TAG,
+    WEATHER_ENSEMBLE_V2,
 )
 from bot.daemon.locks import DB_WRITE_LOCK
+from bot.daemon.stations import STATIONS
 from bot.db import db_write_ctx
 
 logger = logging.getLogger(__name__)
@@ -60,6 +64,10 @@ class WeatherMarket:
     yes_ask: Optional[int]  # cents; None when Kalshi returns no book on yes side
     volume: int
     close_time: str
+    # A6: raw Kalshi /markets payload, retained so `_compute_fair_value` can feed
+    # `weather_ensemble_v2.predict_v2` without re-fetching. Default empty so legacy
+    # test fixtures that don't pass it still land on the v1 path.
+    raw: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -110,19 +118,29 @@ def _logistic_cdf(x: float, mu: float, sigma: float) -> float:
 
 
 def _sigma_for_hours(hours_left: float) -> float:
-    """Compute uncertainty sigma based on hours remaining in settlement day."""
+    """Compute uncertainty sigma based on hours remaining in settlement day.
+
+    v2: 3-4x larger than original. Prior schedule (σ=0.3-2°F) was ~5x too
+    narrow — afternoon temperature variance is 4-8°F so pricing near the
+    threshold was overconfident. Physical reasoning: σ should approximate
+    the std-dev of (actual_high - current_running_high) over the remaining
+    hours. Validated via shadow calibration (re-calibrate after 2 weeks
+    of shadow data using tools/backtest_sigma.py).
+    """
     if hours_left <= 0:
-        return 0.1
+        return 0.5
     elif hours_left < 1:
-        return 0.3
+        return 1.0
     elif hours_left < 2:
-        return 0.5 + (hours_left - 1.0) * 0.3
-    elif hours_left < 6:
-        return 0.8 + (hours_left - 2.0) * 0.175
-    elif hours_left < 12:
-        return 1.5 + (hours_left - 6.0) * 0.083
-    else:
         return 2.0
+    elif hours_left < 4:
+        return 3.5
+    elif hours_left < 6:
+        return 5.0
+    elif hours_left < 12:
+        return 6.5
+    else:
+        return 8.0
 
 
 def _blended_mu(
@@ -230,6 +248,11 @@ class WeatherQuoter:
             return results
 
         for market in markets:
+            if not self._is_today_market(market, station):
+                logger.debug(
+                    "[wx-quoter] skipping next-day market %s", market.ticker
+                )
+                continue
             try:
                 result = self._requote_single(
                     market=market,
@@ -299,6 +322,11 @@ class WeatherQuoter:
             return out
 
         for market in markets:
+            if not self._is_today_market(market, station):
+                logger.debug(
+                    "[wx-shadow] skipping next-day market %s", market.ticker
+                )
+                continue
             try:
                 res = self._shadow_requote_single(
                     market=market,
@@ -349,6 +377,14 @@ class WeatherQuoter:
                 hours_left,
                 trajectory_f_per_hr,
             )
+
+        # Market price bounds — same filter as score_market's price_bounds check.
+        # Log the row (so we can see the disagreement), but mark gate=0.
+        if (market.yes_ask is not None and market.yes_ask <= 8) or (
+            market.yes_bid is not None and market.yes_bid >= 92
+        ):
+            gate_should_quote = False
+            gate_reason = (gate_reason or "") + ";market_price_bounds"
 
         fair_value_cents = self._compute_fair_value(
             market, running_high_f, forecast_high_f, hours_left,
@@ -520,6 +556,22 @@ class WeatherQuoter:
                     latency_ms=_ms_since(t0),
                 )
 
+        # -- Market price bounds (mirrors score_market price_bounds filter) --
+        # Skip markets where the market itself has near-certain pricing.
+        # Our FV disagreeing with a 1-2¢ market means adverse selection, not edge.
+        if (market.yes_ask is not None and market.yes_ask <= 8) or (
+            market.yes_bid is not None and market.yes_bid >= 92
+        ):
+            return RequoteResult(
+                ticker=ticker,
+                fair_value_cents=0,
+                orders_posted=0,
+                orders_cancelled=0,
+                skipped=True,
+                skip_reason="market_price_bounds",
+                latency_ms=_ms_since(t0),
+            )
+
         # -- Compute fair value --
         fair_value_cents = self._compute_fair_value(
             market, running_high_f, forecast_high_f, hours_left,
@@ -621,6 +673,30 @@ class WeatherQuoter:
     # Market fetching
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_today_market(market: WeatherMarket, station: str) -> bool:
+        """Return True if this market settles on today's LST date.
+
+        Weather quoter receives today's running_high and today's forecast.
+        Pricing next-day markets with that data is wrong: tomorrow's expected
+        high may be 10°F warmer, and running_high is irrelevant for tomorrow.
+        Skip any market whose close_time falls on a different LST day.
+        """
+        if not market.close_time:
+            return True  # no date info — don't block
+        try:
+            close_dt = datetime.fromisoformat(
+                market.close_time.replace("Z", "+00:00")
+            )
+            cfg = STATIONS.get(station)
+            lst_offset = cfg.lst_offset if cfg else -5
+            lst_tz = timezone(timedelta(hours=lst_offset))
+            close_lst_date = close_dt.astimezone(lst_tz).date()
+            today_lst_date = datetime.now(lst_tz).date()
+            return close_lst_date == today_lst_date
+        except Exception:
+            return True  # on parse failure, don't skip
+
     def _fetch_weather_markets(self, series: str) -> list[WeatherMarket]:
         """Fetch open weather markets for a series from the Kalshi API.
 
@@ -688,8 +764,46 @@ class WeatherQuoter:
             if bracket_floor is None or bracket_cap is None:
                 return None  # cannot determine bracket bounds
         else:
-            # Threshold market
-            threshold, is_above = _parse_threshold(ticker, title)
+            # Threshold market. Direction (`is_above`) is authoritatively
+            # encoded by which strike Kalshi sets on the payload:
+            #   cap_strike present, floor_strike None  → "high < cap"  (is_above=False)
+            #   floor_strike present, cap_strike None  → "high > floor" (is_above=True)
+            # Previously this fell through a title regex that did not match
+            # Kalshi's literal "<"/">" titles and defaulted to is_above=True
+            # on parse failure, silently inverting every below-threshold
+            # market's fair value (2026-04-22 sign-flip fix — poisoned 27k
+            # shadow rows and produced the 0.9-1.0 bucket pathology where
+            # avg_est=0.967 but yes_rate=0.103).
+            api_floor = m.get("floor_strike")
+            api_cap = m.get("cap_strike")
+            parsed_from_api = False
+            if api_cap is not None and api_floor is None:
+                try:
+                    threshold = float(api_cap)
+                    is_above = False
+                    parsed_from_api = True
+                except (ValueError, TypeError):
+                    pass
+            elif api_floor is not None and api_cap is None:
+                try:
+                    threshold = float(api_floor)
+                    is_above = True
+                    parsed_from_api = True
+                except (ValueError, TypeError):
+                    pass
+            if not parsed_from_api:
+                # Defensive fallback: title regex. Log so we can detect
+                # API coverage gaps — in steady state this should never fire.
+                threshold, is_above = _parse_threshold(ticker, title)
+                if threshold is not None:
+                    logger.warning(
+                        "[wx-quoter] %s: strikes missing from payload "
+                        "(floor=%r cap=%r); fell back to title regex "
+                        "(threshold=%s is_above=%s). "
+                        "Title=%r",
+                        ticker, api_floor, api_cap,
+                        threshold, is_above, title,
+                    )
             if threshold is None:
                 return None
 
@@ -715,11 +829,40 @@ class WeatherQuoter:
             yes_ask=yes_ask,
             volume=int(m.get("volume", 0) or 0),
             close_time=m.get("close_time") or m.get("expiration_time") or "",
+            raw=m,
         )
 
     # ------------------------------------------------------------------
     # Fair value computation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_fair_value_v2(market: "WeatherMarket") -> Optional[int]:
+        """Call ``weather_ensemble_v2.predict_v2`` and convert prob→cents.
+
+        Returns ``None`` on any error (module import, source fetch failure,
+        unparseable market, extreme prob) so the caller can fall back to v1.
+        Clamped to [2, 98] — same bounds the v1 path enforces.
+        """
+        try:
+            from bot.signals.weather_ensemble_v2 import predict_v2
+
+            prob, tag = predict_v2(market.ticker, market.raw)
+            if prob is None:
+                return None
+            cents = int(round(max(0.02, min(0.98, float(prob))) * 100))
+            cents = max(2, min(98, cents))
+            logger.info(
+                "[wx-quoter] v2 FV %s: p=%.3f → %d¢  tag=%s",
+                market.ticker, prob, cents, tag,
+            )
+            return cents
+        except Exception as exc:
+            logger.warning(
+                "[wx-quoter] v2 FV failed for %s, falling back to v1: %s",
+                market.ticker, exc,
+            )
+            return None
 
     def _compute_fair_value(
         self,
@@ -730,8 +873,18 @@ class WeatherQuoter:
     ) -> int:
         """Compute fair value in cents (2-98) for a weather market.
 
-        Uses the logistic CDF model from metar_observations.py.
+        When ``WEATHER_ENSEMBLE_V2`` is enabled and the raw Kalshi payload is
+        attached to the ``WeatherMarket``, delegate to
+        ``weather_ensemble_v2.predict_v2`` — the precision-weighted multi-source
+        Gaussian combine (A1–A5). Any error or ``None`` return falls back to
+        the v1 METAR-only logistic CDF below so a broken v2 read can never
+        leave us without a fair value.
         """
+        if WEATHER_ENSEMBLE_V2 and market.raw:
+            v2_cents = self._compute_fair_value_v2(market)
+            if v2_cents is not None:
+                return v2_cents
+
         mu = _blended_mu(running_high_f, forecast_high_f, hours_left)
         sigma = _sigma_for_hours(hours_left)
 
@@ -945,31 +1098,54 @@ class WeatherQuoter:
     # ------------------------------------------------------------------
 
     def _log_requote(self, result: RequoteResult) -> None:
-        """Log requote to the opportunity_log table (if it exists).
+        """Log requote to the ``opportunity_log`` table.
 
-        Runs on the poller/worker thread — MUST go through db_write_ctx to
-        serialize with the cycle thread's writes.
+        Writes against the canonical schema declared in ``bot/db.py``
+        (matches the ``trade.log_opportunity`` pattern). Before the
+        2026-04-22 audit fix this targeted a legacy
+        ``(timestamp, ticker, action, data)`` shape that was dropped
+        during the MM-deletion pivot — every insert raised
+        ``no such column: timestamp`` and a blanket ``except: pass``
+        swallowed the error, silently nuking the event path's audit
+        trail.
+
+        Runs on the poller/worker thread — MUST go through
+        ``db_write_ctx`` to serialize with the cycle thread's writes.
+
+        ``side=None`` because a requote event touches both sides of the
+        book; the per-side bid/ask prices + counts are in
+        ``sources_json`` so downstream queries can still reconstruct.
         """
+        payload = json.dumps({
+            "fair_value_cents": result.fair_value_cents,
+            "posted": result.orders_posted,
+            "cancelled": result.orders_cancelled,
+            "latency_ms": round(result.latency_ms, 1),
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+        })
         try:
             with db_write_ctx(self.conn):
                 self.conn.execute(
-                    """INSERT OR IGNORE INTO opportunity_log
-                       (timestamp, ticker, action, data)
-                       VALUES (?, ?, ?, ?)""",
+                    """INSERT INTO opportunity_log
+                       (ticker, strategy, action, side, ensemble_prob,
+                        sources_json, skip_reason)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        datetime.now(timezone.utc).isoformat(),
                         result.ticker,
+                        "weather_mm",
                         "wx_requote",
-                        str({
-                            "fair_value": result.fair_value_cents,
-                            "posted": result.orders_posted,
-                            "cancelled": result.orders_cancelled,
-                            "latency_ms": round(result.latency_ms, 1),
-                        }),
+                        None,
+                        result.fair_value_cents / 100.0,
+                        payload,
+                        result.skip_reason,
                     ),
                 )
-        except Exception:
-            # opportunity_log may not exist -- that is fine.
+        except sqlite3.IntegrityError:
+            # UNIQUE / FK constraint — tolerated (e.g. concurrent duplicate
+            # on a retry). Any other sqlite3.Error or unexpected exception
+            # must propagate so schema drift fails loudly instead of
+            # silently eating the audit trail again.
             pass
 
 
@@ -1023,7 +1199,17 @@ def _safe_cents(val) -> Optional[int]:
 def _parse_threshold(ticker: str, title: str) -> Tuple[Optional[float], bool]:
     """Extract temperature threshold and direction from market title or ticker.
 
-    Returns ``(threshold, is_above)`` or ``(None, True)`` on failure.
+    Returns ``(threshold, is_above)`` or ``(None, False)`` on failure.
+
+    **Call path note (2026-04-22):** `_parse_market` now reads direction
+    authoritatively from `floor_strike`/`cap_strike` on the Kalshi payload
+    and only falls back to this regex when the API doesn't provide them
+    (should never happen in steady state). This function is also used
+    directly by tests. Do NOT add a hardcoded-direction fallback to this
+    function — an earlier version returned `(threshold, True)` from a
+    ticker-regex fallback, which silently inverted every Kalshi "<"-title
+    market's fair value (poisoned 27k calibration rows). The ticker alone
+    (e.g. `-T75`) does not encode direction.
     """
     # Pattern 1: direction keyword BEFORE number
     temp_match = re.search(
@@ -1047,12 +1233,17 @@ def _parse_threshold(ticker: str, title: str) -> Tuple[Optional[float], bool]:
         is_above = direction in ("or above", "and above")
         return threshold, is_above
 
-    # Try ticker: -T75
-    tick_match = re.search(r'-[Tt](-?\d+\.?\d*)', ticker)
-    if tick_match:
-        return float(tick_match.group(1)), True
+    # Pattern 3: bare "<N" or ">N" (Kalshi's literal-character titles).
+    lt_match = re.search(r'<\s*(\d+\.?\d*)', title)
+    if lt_match:
+        return float(lt_match.group(1)), False
+    gt_match = re.search(r'>\s*(\d+\.?\d*)', title)
+    if gt_match:
+        return float(gt_match.group(1)), True
 
-    return None, True
+    # No direction information recoverable. Ticker -T75 carries the
+    # threshold value but NOT the direction, so we must not guess.
+    return None, False
 
 
 def clear_market_cache() -> None:

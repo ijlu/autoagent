@@ -240,6 +240,57 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         sigma_f REAL,
         hours_out INTEGER)""")
 
+    # A2.5 — backfill table populated by tools/backfill_weather_effective_n.py.
+    # Each row is one historical forecast observation: "at `lead_hours`
+    # before settlement of (city, settlement_date), source `source` would
+    # have emitted forecast mean/sigma, and the realized observed daily
+    # high was `observed_high_f`". Rows are used to fit per-source bias,
+    # RMSE, sigma calibration, and eventually within-group correlation for
+    # the effective-N discount in weather_ensemble_v2.
+    #
+    # Kept separate from weather_forecast_snapshots because: (a) this table
+    # is populated retroactively from archive APIs (not per-cycle), (b) it
+    # carries the `observed_high_f` ground-truth column the live snapshot
+    # table doesn't, and (c) the analysis workflows join against
+    # settlements OR NWS CLI archive (not the live Kalshi market
+    # population) so mixing them would complicate both readers.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_gaussian_snapshots_backfill (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        city TEXT NOT NULL,
+        settlement_date TEXT NOT NULL,
+        lead_hours INTEGER,
+        forecast_mean_f REAL,
+        forecast_sigma_f REAL,
+        observed_high_f REAL,
+        UNIQUE(source, city, settlement_date, lead_hours))""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_backfill_source_city
+                    ON weather_gaussian_snapshots_backfill(source, city)""")
+
+    # ── A4: per-(station, LST hour) METAR hourly archive ──
+    #
+    # Row semantics: "at LST hour `lst_hour` on `lst_date` at `station`, the
+    # observed 2m temperature was `temp_f`, and the eventual LST-day daily
+    # high was `daily_high_f`". The fitter regresses daily_high_f on temp_f
+    # within each (station, lst_hour) cell to produce α_h + β_h·T(h)
+    # predictors + their RMSE, persisted to kv_cache for
+    # `metar_observations.get_metar_gaussian`.
+    #
+    # Separate from `weather_gaussian_snapshots_backfill` because the unit
+    # of analysis is an hourly observation, not a daily forecast snapshot.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_metar_hourly_backfill (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        station TEXT NOT NULL,
+        lst_date TEXT NOT NULL,
+        lst_hour INTEGER NOT NULL,
+        temp_f REAL NOT NULL,
+        daily_high_f REAL,
+        UNIQUE(station, lst_date, lst_hour))""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_metar_hourly_station_hour
+                    ON weather_metar_hourly_backfill(station, lst_hour)""")
+
     # ── Decision log (full audit trail per decision) ──
     conn.execute("""CREATE TABLE IF NOT EXISTS decision_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

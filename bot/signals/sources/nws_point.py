@@ -34,6 +34,7 @@ from bot.signals.sources.weather import (
     _parse_threshold,
     _determine_day_index,
 )
+from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
 _NWS_USER_AGENT = "KalshiTradingBot/1.0 (contact: joshlu@a16z.com)"
@@ -140,6 +141,68 @@ def _daily_high_from_hourly(
     return max(highs) if highs else None
 
 
+def _nws_point_sigma_for_day(day_idx: int) -> float:
+    """NWS point-forecast sigma. Same schedule as Open-Meteo — both ingest
+    similar model data. A3 replaces with fitted σ."""
+    return 2.0 + day_idx * 0.6
+
+
+def get_nws_point_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
+    """Return NWS hourly forecast's temperature distribution for the
+    settlement day. Threshold/bracket-independent."""
+    if market_data is None:
+        return None
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = (ticker or "").upper()
+
+    is_weather = "KXHIGH" in ticker_upper or any(
+        kw in title for kw in ("temperature", "temp", "°f", "degrees", "high")
+    )
+    if not is_weather:
+        return None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None
+    city = WEATHER_CITIES.get(city_key)
+    if not city:
+        return None
+
+    threshold, _ = _parse_threshold(ticker, title)
+    if threshold is None or threshold < -40 or threshold > 140:
+        return None
+
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None:
+        return None
+
+    tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
+    lst_tz = timezone(timedelta(hours=tz_offset))
+    target_date = (datetime.now(lst_tz) + timedelta(days=day_idx)).strftime("%Y-%m-%d")
+
+    forecast_url = _resolve_grid_url(city["lat"], city["lon"])
+    if forecast_url is None:
+        return None
+    periods = _fetch_hourly_forecast(forecast_url)
+    if not periods:
+        return None
+
+    forecast_high = _daily_high_from_hourly(periods, target_date, tz_offset)
+    if forecast_high is None:
+        return None
+
+    sigma_f = _nws_point_sigma_for_day(day_idx)
+    horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
+
+    return GaussianForecast(
+        mean_f=float(forecast_high),
+        sigma_f=sigma_f,
+        horizon_hours=horizon_hours,
+        source_name="nws_point",
+        source_tag=f"nws_point:{city_key}_{target_date}",
+    )
+
+
 def get_nws_point_estimate(ticker: str, market_data: dict) -> tuple:
     """Probability estimate for Kalshi high-temp markets using NWS hourly forecast.
 
@@ -189,7 +252,7 @@ def get_nws_point_estimate(ticker: str, market_data: dict) -> tuple:
 
     # NWS hourly forecast uncertainty is roughly the same as Open-Meteo's
     # (both ingest similar model data). Widen with lead time.
-    forecast_sigma = 2.0 + day_idx * 0.6
+    forecast_sigma = _nws_point_sigma_for_day(day_idx)
 
     is_bracket = "-B" in ticker_upper
     if is_bracket:

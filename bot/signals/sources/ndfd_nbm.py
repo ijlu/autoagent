@@ -31,6 +31,7 @@ from bot.signals.sources.weather import (
     _parse_threshold,
     _determine_day_index,
 )
+from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
 _NBM_CACHE_TTL = 1800  # 30 min
@@ -78,6 +79,69 @@ def _fetch_nbm_forecast(city_key: str) -> Optional[dict]:
         return None
 
 
+def _nbm_sigma_for_day(day_idx: int) -> float:
+    """NBM per-day forecast sigma in °F. 1.8°F at day 0, +0.5°F per day.
+
+    Empirically NBM is slightly noisier than HRRR for short range but
+    extends cleanly through 7 days. A3 will replace these with fitted σ's.
+    """
+    return 1.8 + day_idx * 0.5
+
+
+def get_nbm_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
+    """Return NBM's temperature distribution for the settlement day.
+
+    Threshold/bracket-independent; the ensemble projects per-market.
+    """
+    if market_data is None:
+        return None
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+    ticker_upper = (ticker or "").upper()
+    is_weather = "KXHIGH" in ticker_upper or any(
+        kw in title for kw in ("temperature", "temp", "°f", "degrees", "high")
+    )
+    if not is_weather:
+        return None
+
+    city_key = _detect_city(ticker_upper, title)
+    if not city_key:
+        return None
+
+    threshold, _ = _parse_threshold(ticker, title)
+    if threshold is None or threshold < -40 or threshold > 140:
+        return None
+
+    day_idx = _determine_day_index(title, market_data, city_key)
+    if day_idx is None:
+        return None
+
+    forecast = _fetch_nbm_forecast(city_key)
+    if not forecast:
+        return None
+
+    daily = forecast.get("daily", {})
+    highs = daily.get("temperature_2m_max", [])
+    dates = daily.get("time", [])
+    if day_idx >= len(highs):
+        return None
+    forecast_high = highs[day_idx]
+    if forecast_high is None:
+        return None
+
+    tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
+    date_label = dates[day_idx] if day_idx < len(dates) else "?"
+    sigma_f = _nbm_sigma_for_day(day_idx)
+    horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
+
+    return GaussianForecast(
+        mean_f=float(forecast_high),
+        sigma_f=sigma_f,
+        horizon_hours=horizon_hours,
+        source_name="nbm",
+        source_tag=f"nbm:{city_key}_{date_label}",
+    )
+
+
 def get_nbm_estimate(ticker: str, market_data: dict) -> tuple:
     if market_data is None:
         return None, None
@@ -113,7 +177,7 @@ def get_nbm_estimate(ticker: str, market_data: dict) -> tuple:
     if forecast_high is None:
         return None, None
 
-    forecast_sigma = 1.8 + day_idx * 0.5  # NBM slightly more skillful than raw Open-Meteo
+    forecast_sigma = _nbm_sigma_for_day(day_idx)  # NBM slightly more skillful than raw Open-Meteo
 
     is_bracket = "-B" in ticker_upper
     if is_bracket:
