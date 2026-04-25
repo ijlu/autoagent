@@ -143,9 +143,11 @@ MM_SIZING_CAP_MULTIPLIER = float(
     os.environ.get("MM_SIZING_CAP_MULTIPLIER", "1.0"))
 
 # Minimum settled filled rows required to sample from the posterior. Below
-# this, multiplier = 0 (equivalent to SHADOW). 5 is enough to establish a
-# non-degenerate sample variance without being so high it stalls ramp-up.
-MM_SIZING_MIN_N = int(os.environ.get("MM_SIZING_MIN_N", "5"))
+# this, multiplier = 0 (equivalent to SHADOW). 15 fills is enough to bound
+# the canary blowup tail (~$40/family/day at 0.5× sizing) before the next
+# decision interval, without stalling ramp-up — at typical weather-MM
+# cadence ~5 days from cohort launch to first canary eval.
+MM_SIZING_MIN_N = int(os.environ.get("MM_SIZING_MIN_N", "15"))
 
 # Cache TTL for the sampled multiplier. Between sweeps the quoter reads a
 # stable value; on cache miss the next call re-samples from the posterior.
@@ -159,21 +161,22 @@ MM_SIZING_CACHE_TTL_S = int(os.environ.get("MM_SIZING_CACHE_TTL_S", "300"))
 # a canary phase before scaling to full Thompson sizing (step D).
 
 # Minimum realized per-fill shadow P&L (cents, net of maker fees) required
-# for SHADOW → CANARY. 1¢ is intentionally low — the gate is about "is the
-# shadow model showing positive P&L *at all*", not about target edge. The
-# earlier +4.7¢ markout target belongs to FULL-state Thompson sizing, not
-# promotion gating. Setting this = 0 would let the pre-fix spurious fills
-# (weather-bracket YES at 1¢ that always resolved NO — strictly losing)
-# sneak through, so the lower bound is strictly positive.
+# for SHADOW → CANARY. 2¢ matches the FULL-state target edge (see
+# MM_SIZING_TARGET_EDGE_CENTS) — at canary 0.5× sizing on $982 equity
+# (~10 contracts/fill), 2¢ covers the maker-fee-plus-slippage floor on a
+# bad day. A lower floor (e.g. 1¢) would canary families that don't clear
+# fees, burning the canary budget on negative-EV exposure. Setting this = 0
+# would also let pre-fix spurious-fill bugs sneak through (the Apr-17
+# _safe_cents bug generated 700+ fills with near-zero P&L).
 MM_CANARY_MIN_PNL_PER_FILL_CENTS = float(
-    os.environ.get("MM_CANARY_MIN_PNL_PER_FILL_CENTS", "1.0"))
+    os.environ.get("MM_CANARY_MIN_PNL_PER_FILL_CENTS", "2.0"))
 
 # Minimum paired (live, shadow) row count accumulated since entering CANARY
-# before graduation is evaluated. 20 is a compromise: tight enough to
-# graduate within ~24h at typical weather-MM quote cadence, loose enough to
-# suppress one-lucky-run false positives.
+# before graduation is evaluated. 30 paired rows gives ~5 settlement days at
+# typical canary-cadence per family, enough to suppress one-lucky-run false
+# positives while still letting a clean family graduate inside a week.
 MM_GRADUATION_MIN_PAIRED_N = int(
-    os.environ.get("MM_GRADUATION_MIN_PAIRED_N", "20"))
+    os.environ.get("MM_GRADUATION_MIN_PAIRED_N", "30"))
 
 # CANARY → FULL requires sum(live_pnl) / sum(shadow_pnl) >= this ratio over
 # the paired-row window. 0.5 = live captures at least half the P&L the
@@ -181,6 +184,26 @@ MM_GRADUATION_MIN_PAIRED_N = int(
 # realizable edge and we should not scale up blindly.
 MM_GRADUATION_MIN_PNL_RATIO = float(
     os.environ.get("MM_GRADUATION_MIN_PNL_RATIO", "0.5"))
+
+# Per-series MM canary blocklist. Series in this set are pinned to SHADOW
+# regardless of whether they pass the canary gate — used to stagger cohort
+# rollouts (bring up uncorrelated regimes first, hold correlated ones).
+# Default cohort-2 holdback: KXHIGHCHI + KXHIGHNY are the continental
+# correlated pair (one heat-dome day affects both); KXHIGHDEN's signal Brier
+# (0.316) is worse than baseline (0.244) on the Apr 17 backtest, so it stays
+# blocked until the underlying source quality is re-investigated. Cohort 1
+# (KXHIGHMIA, KXHIGHAUS, KXHIGHLAX) sits in distinct synoptic regimes —
+# subtropical, marine layer, continental subtropical — so simultaneous canary
+# launch is acceptable concurrent risk.
+# Set MM_BLOCKED_SERIES="" to disable the blocklist entirely; comma-separated
+# overrides are also accepted (e.g. "KXHIGHNY,KXHIGHDEN").
+MM_BLOCKED_SERIES: frozenset[str] = frozenset(
+    s.strip().upper()
+    for s in os.environ.get(
+        "MM_BLOCKED_SERIES", "KXHIGHCHI,KXHIGHNY,KXHIGHDEN"
+    ).split(",")
+    if s.strip()
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Source horizon compatibility (max forecast horizon in days per source)

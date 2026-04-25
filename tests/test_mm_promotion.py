@@ -36,6 +36,21 @@ def conn():
     c.close()
 
 
+@pytest.fixture(autouse=True)
+def _empty_mm_blocklist(monkeypatch):
+    """Clear MM_BLOCKED_SERIES so default-blocked series can be exercised.
+
+    Production default holds back KXHIGHCHI/NY/DEN for cohort-2 staggering
+    (see bot/config.py). The unit tests here exercise the gate logic itself
+    on KXHIGHNY for historical reasons; clearing the blocklist isolates the
+    promotion mechanics from the cohort-rollout decision.
+    """
+    empty: frozenset[str] = frozenset()
+    monkeypatch.setattr(
+        "bot.learning.mm_promotion.MM_BLOCKED_SERIES", empty,
+    )
+
+
 def _insert_shadow_row(
     conn,
     *,
@@ -717,9 +732,10 @@ class TestEvaluatePromotion:
     def test_negative_pnl_blocks_promotion(self, conn):
         # B+D rewrite: negative realized shadow P&L must block promotion
         # (was previously accepted on N-floor alone; the 2026-04-17
-        # _safe_cents bug proved that rule dangerous).
+        # _safe_cents bug proved that rule dangerous). Seed n above
+        # MM_SIZING_MIN_N (15) so the unprofitable_shadow gate is reached.
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=10, pnl_per_row=-5, fill_pattern="bid",
+            conn, "KXHIGHNY", n=20, pnl_per_row=-5, fill_pattern="bid",
         )
         ok, reason, metrics = evaluate_mm_promotion(conn, "KXHIGHNY")
         assert not ok
@@ -728,9 +744,9 @@ class TestEvaluatePromotion:
 
     def test_breakeven_pnl_blocks_promotion(self, conn):
         # Zero P&L per fill (the Apr-17 contamination signature) must also
-        # fail the > 1¢ floor.
+        # fail the >= 2¢ floor.
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=10, pnl_per_row=0, fill_pattern="bid",
+            conn, "KXHIGHNY", n=20, pnl_per_row=0, fill_pattern="bid",
         )
         ok, reason, _ = evaluate_mm_promotion(conn, "KXHIGHNY")
         assert not ok
@@ -738,12 +754,12 @@ class TestEvaluatePromotion:
 
     def test_positive_pnl_passes_gate(self, conn):
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=10, pnl_per_row=5, fill_pattern="bid",
+            conn, "KXHIGHNY", n=20, pnl_per_row=5, fill_pattern="bid",
         )
         ok, reason, metrics = evaluate_mm_promotion(conn, "KXHIGHNY")
         assert ok, reason
         assert "canary_gate_passed" in reason
-        assert metrics["n_fills"] == 10
+        assert metrics["n_fills"] == 20
         assert metrics["pnl_per_fill_cents"] == pytest.approx(5.0)
 
 
@@ -771,7 +787,7 @@ def _insert_paired_row(
 
 class TestEvaluateGraduation:
     def test_insufficient_paired_fails(self, conn):
-        # Below MM_GRADUATION_MIN_PAIRED_N (default 20).
+        # Below MM_GRADUATION_MIN_PAIRED_N (default 30).
         t0 = time.time() - 86400
         for i in range(5):
             _insert_paired_row(
@@ -789,7 +805,7 @@ class TestEvaluateGraduation:
     def test_shadow_nonpositive_blocks_graduation(self, conn):
         # Enough pairs, but shadow sum is 0 → can't divide, refuse.
         t0 = time.time() - 86400
-        for i in range(25):
+        for i in range(35):
             _insert_paired_row(
                 conn, series="KXHIGHNY", ticker=f"KXHIGHNY-{i}",
                 ts_unix=t0 + i * 3600,
@@ -804,7 +820,7 @@ class TestEvaluateGraduation:
     def test_ratio_below_floor_blocks(self, conn):
         # Shadow predicts $1 profit per row but live captures only 20% of it.
         t0 = time.time() - 86400
-        for i in range(25):
+        for i in range(35):
             _insert_paired_row(
                 conn, series="KXHIGHNY", ticker=f"KXHIGHNY-{i}",
                 ts_unix=t0 + i * 3600,
@@ -819,7 +835,7 @@ class TestEvaluateGraduation:
 
     def test_all_gates_pass_graduates(self, conn):
         t0 = time.time() - 86400
-        for i in range(25):
+        for i in range(35):
             _insert_paired_row(
                 conn, series="KXHIGHNY", ticker=f"KXHIGHNY-{i}",
                 ts_unix=t0 + i * 3600,
@@ -830,14 +846,14 @@ class TestEvaluateGraduation:
         )
         assert ok, reason
         assert "graduated" in reason
-        assert metrics["n_paired"] == 25
+        assert metrics["n_paired"] == 35
         assert metrics["live_over_shadow_ratio"] == pytest.approx(0.8)
 
     def test_since_ts_excludes_older_rows(self, conn):
         # Rows older than since_ts_unix must not count toward graduation.
-        # Canary floor is 20 paired rows; plant 25 old rows + 3 new ones.
+        # Canary floor is 30 paired rows; plant 35 old rows + 3 new ones.
         t_old = time.time() - 30 * 86400
-        for i in range(25):
+        for i in range(35):
             _insert_paired_row(
                 conn, series="KXHIGHNY", ticker=f"KXHIGHNY-old-{i}",
                 ts_unix=t_old + i * 3600,
@@ -941,7 +957,7 @@ class TestRunMMPromotionSweep:
         # B+D rewrite: promotion lands on LIVE_CANARY; FULL requires
         # graduation evidence the sweep can't fabricate on first pass.
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=10, pnl_per_row=6, fill_pattern="bid",
+            conn, "KXHIGHNY", n=20, pnl_per_row=6, fill_pattern="bid",
         )
         summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
         promoted = [p for p in summary["promoted"]
@@ -958,7 +974,7 @@ class TestRunMMPromotionSweep:
         # This is the regression guard against the 2026-04-17 corruption
         # that produced near-zero P&L across hundreds of rows.
         _seed_settled_shadow_rows(
-            conn, "KXHIGHNY", n=10, pnl_per_row=-5, fill_pattern="bid",
+            conn, "KXHIGHNY", n=20, pnl_per_row=-5, fill_pattern="bid",
         )
         summary = run_mm_promotion_sweep(conn, equity_dollars=1000.0)
         assert len(summary["promoted"]) == 0
@@ -972,12 +988,13 @@ class TestRunMMPromotionSweep:
         assert summary["graduated"] == []
 
     def test_canary_graduates_to_full_with_paired_evidence(self, conn):
-        # Set CANARY, seed 25 paired rows after the since_ts, expect
-        # graduation to LIVE_FULL and a Thompson resample.
+        # Set CANARY, seed enough paired rows after since_ts to clear
+        # MM_GRADUATION_MIN_PAIRED_N (30), expect graduation to LIVE_FULL
+        # and a Thompson resample.
         set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
         flag = get_mm_live_state(conn, "KXHIGHNY")
         # Insert paired rows strictly after the CANARY since_ts_unix.
-        for i in range(25):
+        for i in range(35):
             _insert_paired_row(
                 conn, series="KXHIGHNY", ticker=f"KXHIGHNY-g{i}",
                 ts_unix=flag.since_ts_unix + 60 + i * 60,

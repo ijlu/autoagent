@@ -63,13 +63,10 @@ logger = logging.getLogger(__name__)
 _KV_PREFIX = "mm_live:"
 _KV_TTL_S = 30 * 24 * 3600
 
-# Weather MM is blocked-by-default at the series level until the Phase 0
-# backtest analysis is revisited. Start empty: *any* series can be
-# promoted once shadow data supports it. (Contrast with directional's
-# catastrophic-calibration block list — MM has no families where the
-# fair-value is broken, only families where structure held through
-# directional moves. That's what the gate itself catches.)
-MM_BLOCKED_SERIES: frozenset[str] = frozenset()
+# Per-series block list; sourced from bot.config so operators can override
+# at deploy time via MM_BLOCKED_SERIES env. See config.py for the default
+# cohort-staggering rationale (CHI/NY correlated pair + DEN worse Brier).
+from bot.config import MM_BLOCKED_SERIES  # noqa: E402  (intentional re-export)
 
 # kv_cache key for the last-sampled Thompson multiplier. Getter reads
 # this first; on miss, samples from the posterior and writes it back.
