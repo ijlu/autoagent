@@ -25,8 +25,12 @@ import requests
 
 from bot.daemon.poller_base import Poller
 from bot.daemon.stations import STATIONS, ALL_STATION_IDS
+from bot.db import get_connection, kv_get, kv_set
 
 logger = logging.getLogger(__name__)
+
+# TTL for kv_cache daily-high entries — 25 hours, matches metar_observations.py
+_DAILY_HIGH_TTL = 90_000
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,8 @@ class METARPoller(Poller):
         with self._lock:
             changes = self._detect_changes(readings)
             self._last_poll_time = time.time()
+
+        self._persist_running_highs()
 
         return changes
 
@@ -362,8 +368,104 @@ class METARPoller(Poller):
         return changes
 
     # ------------------------------------------------------------------
+    # kv_cache persistence
+    # ------------------------------------------------------------------
+
+    def _persist_running_highs(self) -> None:
+        """Write each station's current running_high_f to kv_cache.
+
+        Called after every successful METAR poll so that seed_running_high()
+        can recover in-memory state after a daemon restart — even when
+        metar_observations signal source is never called (e.g. all weather
+        markets are trading at extreme prices and fail the price_bounds
+        filter before the ensemble is invoked).
+        """
+        try:
+            conn = get_connection()
+        except RuntimeError:
+            return  # DB not yet initialised
+
+        snapshot: list[tuple[str, float, str]] = []
+        with self._lock:
+            for station_id, state in self._states.items():
+                if state.running_high_f > -999.0:
+                    snapshot.append(
+                        (station_id, state.running_high_f, state.running_high_date)
+                    )
+
+        for station_id, high_f, date_lst in snapshot:
+            kv_key = f"metar_daily_high_{station_id}_{date_lst}"
+            try:
+                existing = kv_get(conn, kv_key)
+                if existing is None:
+                    record: dict = {"high_f": high_f, "obs_count": 0}
+                else:
+                    if high_f <= existing.get("high_f", -999.0):
+                        continue  # kv already has equal or higher value — nothing to do
+                    record = dict(existing)
+                    record["high_f"] = high_f
+                kv_set(conn, kv_key, record, _DAILY_HIGH_TTL)
+            except Exception as exc:
+                logger.warning(
+                    "[metar-poller] persist daily high failed for %s: %s",
+                    station_id, exc,
+                )
+
+    # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
+
+    def seed_running_high(self, conn) -> dict[str, float]:
+        """Seed running_high_f from kv_cache on daemon startup.
+
+        _persist_running_highs() writes ``metar_daily_high_{station}_{date_lst}``
+        after every successful METAR poll (every ~30s).  On a mid-day restart
+        that entry already captures the afternoon peak; without seeding we would
+        start from the current (evening) METAR reading and miss it entirely,
+        causing wrong-direction quotes near settlement.
+
+        Returns {station: seeded_high_f} for each station that was seeded.
+        Safe to call before start() — holds self._lock internally.
+        """
+        seeded: dict[str, float] = {}
+        with self._lock:
+            for station_id, state in self._states.items():
+                today_lst = self._get_lst_date(station_id)
+                kv_key = f"metar_daily_high_{station_id}_{today_lst}"
+                try:
+                    record = kv_get(conn, kv_key)
+                except Exception as exc:
+                    logger.warning(
+                        "[metar-poller] seed kv_get failed for %s: %s",
+                        station_id, exc,
+                    )
+                    continue
+
+                if not isinstance(record, dict):
+                    continue
+                high_f = record.get("high_f")
+                if not isinstance(high_f, (int, float)):
+                    continue
+                high_f = float(high_f)
+
+                if high_f < -40 or high_f > 130:
+                    logger.warning(
+                        "[metar-poller] seed skipped %s: implausible high_f=%.1f",
+                        station_id, high_f,
+                    )
+                    continue
+
+                if high_f > state.running_high_f:
+                    state.running_high_f = high_f
+                    state.running_high_date = today_lst
+                    seeded[station_id] = high_f
+                    logger.info(
+                        "[metar-poller] seeded %s running_high_f=%.1f°F "
+                        "from kv_cache (obs_count=%d)",
+                        station_id, high_f, record.get("obs_count", 0),
+                    )
+
+        return seeded
 
     def _update_state(self, station: str, reading: StationReading) -> None:
         """Update running high, last temp, and trajectory buffer.

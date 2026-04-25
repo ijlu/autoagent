@@ -25,6 +25,7 @@ from bot.daemon.stations import (
     station_for_ticker,
 )
 from bot.db import get_connection, kv_get, kv_set
+from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -48,6 +49,17 @@ _METAR_CACHE_TTL = 300  # 5 minutes
 
 # KV cache TTL for daily high tracking (25 hours -- covers full settlement day + buffer)
 _DAILY_HIGH_TTL = 90_000
+
+
+# ── A4: learned per-(station, LST hour) diurnal fit ──
+#
+# Written by tools/backfill_weather_effective_n.py --persist-diurnal.
+# Key prefix constant is pinned by the drift-guard test.
+_DIURNAL_KEY_PREFIX: str = "weather_metar_diurnal_"
+# Hard clamps on learned σ at read time — mirrors the persist-side guard
+# and also protects against corrupted kv payloads.
+_DIURNAL_SIGMA_FLOOR_F: float = 0.3
+_DIURNAL_SIGMA_CEIL_F: float = 12.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -325,6 +337,138 @@ def _compute_probability(
 # Main entry point
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _metar_expected_eventual_high(
+    running_high: float, forecast_high: float, hours_left: float
+) -> float:
+    """Blended expected eventual daily high.
+
+    Early in the day (many hours left) → trust the forecast more.
+    Late in the day (few hours left) → trust the running observation more.
+    eventual_high is always ≥ running_high (daily HIGH only rises).
+    """
+    if hours_left <= 0:
+        return running_high
+    total_day_hours = 24.0
+    day_fraction_elapsed = max(0.0, min(1.0, 1.0 - hours_left / total_day_hours))
+    forecast_weight = max(0.1, 1.0 - day_fraction_elapsed)
+    obs_weight = 1.0 - forecast_weight
+    return (
+        forecast_weight * max(forecast_high, running_high)
+        + obs_weight * running_high
+    )
+
+
+def _get_diurnal_fit(station: str, lst_hour: int) -> tuple[float, float, float] | None:
+    """Return ``(alpha, beta, rmse)`` for (station, lst_hour) or None.
+
+    Looks up ``weather_metar_diurnal_<station>`` in kv_cache. Missing keys,
+    malformed payloads, unknown hours, or out-of-band σ all return None —
+    the caller falls back to the v1 naive blend.
+    """
+    try:
+        conn = get_connection()
+    except RuntimeError:
+        return None
+    payload = kv_get(conn, f"{_DIURNAL_KEY_PREFIX}{station}")
+    if not isinstance(payload, dict):
+        return None
+    hours = payload.get("hours")
+    if not isinstance(hours, dict):
+        return None
+    cell = hours.get(str(lst_hour))
+    if not isinstance(cell, dict):
+        return None
+    try:
+        alpha = float(cell["alpha"])
+        beta = float(cell["beta"])
+        rmse = float(cell["rmse"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(alpha) and math.isfinite(beta) and math.isfinite(rmse)):
+        return None
+    if rmse < _DIURNAL_SIGMA_FLOOR_F or rmse > _DIURNAL_SIGMA_CEIL_F:
+        return None
+    return alpha, beta, rmse
+
+
+def get_metar_gaussian(ticker: str, market_data: dict) -> GaussianForecast | None:
+    """Return METAR's temperature distribution for the settlement day.
+
+    Unlike the v1 probability entry point, this does NOT short-circuit
+    to 0.95/0.96/0.98 when the running high already exceeds a threshold.
+    Instead it always emits ``GaussianForecast(expected_eventual_high,
+    sigma_for_hours_left)``; downstream ``probability_for_market`` will
+    produce an analogous near-certainty value when threshold ≪ mean
+    without the hand-coded margin table.
+
+    Threshold/bracket-independent; per-ticker projection is done by the
+    ensemble combiner.
+    """
+    ticker_upper = ticker.upper() if ticker else ""
+    title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
+
+    ws = station_for_ticker(ticker_upper)
+    if ws is None:
+        return None
+    station = ws.icao
+
+    threshold, _ = _parse_threshold_from_market(ticker, title)
+    if threshold is None or threshold < -40 or threshold > 140:
+        return None
+
+    metar_data = _fetch_metar_data()
+    if metar_data is None:
+        return None
+    obs = _extract_station_obs(metar_data, station)
+    if obs is None:
+        return None
+
+    temp_c = obs.get("temp")
+    if temp_c is None:
+        return None
+    try:
+        temp_c = float(temp_c)
+    except (TypeError, ValueError):
+        return None
+    temp_f = temp_c * 9.0 / 5.0 + 32.0
+    obs_time = obs.get("reportTime") or obs.get("obsTime") or ""
+
+    daily_record = _update_running_daily_high(station, temp_f, obs_time)
+    running_high = float(daily_record["high_f"])
+
+    hours_left = _hours_remaining_in_settlement_day(station)
+    forecast_high = _get_forecast_high(station, running_high)
+
+    # A4: if a per-(station, LST hour) diurnal fit has been persisted,
+    # replace the naive blend + hours_left σ schedule with the learned
+    # predictor. Daily high can only rise, so clamp μ ≥ running_high.
+    lst_hour_now = _get_lst_now(station).hour
+    fit = _get_diurnal_fit(station, lst_hour_now)
+    if fit is not None:
+        alpha, beta, rmse = fit
+        predicted = alpha + beta * temp_f
+        expected_eventual_high = max(predicted, running_high)
+        sigma_f = rmse
+    else:
+        expected_eventual_high = _metar_expected_eventual_high(
+            running_high, forecast_high, hours_left
+        )
+        sigma_f = _sigma_for_hours(hours_left)
+
+    # Settlement-day horizon from the canonical LST offset so our horizon
+    # lines up with every other source's on the same bucket.
+    lst_offset = lst_offset_for_station(station)
+    horizon_hours = hours_until_settlement_end(lst_offset, day_idx=0)
+
+    return GaussianForecast(
+        mean_f=expected_eventual_high,
+        sigma_f=sigma_f,
+        horizon_hours=horizon_hours,
+        source_name="metar",
+        source_tag=f"metar:{station}",
+    )
+
+
 def get_metar_observation_estimate(ticker: str, market_data: dict) -> tuple:
     """Estimate probability for Kalshi high-temperature markets using live METAR observations.
 
@@ -454,17 +598,20 @@ def get_metar_observation_estimate(ticker: str, market_data: dict) -> tuple:
 def _sigma_for_hours(hours_left: float) -> float:
     """Compute uncertainty sigma based on hours remaining in settlement day.
 
-    Same model as _compute_probability but extracted for bracket reuse.
+    v2 (2026-04-24): 3-4x larger than original. Prior σ=0.3-2°F created
+    over-confident near-threshold pricing. Aligns with weather_quoter.py.
     """
     if hours_left <= 0:
-        return 0.1
+        return 0.5
     elif hours_left < 1:
-        return 0.3
+        return 1.0
     elif hours_left < 2:
-        return 0.5 + (hours_left - 1.0) * 0.3
-    elif hours_left < 6:
-        return 0.8 + (hours_left - 2.0) * 0.175
-    elif hours_left < 12:
-        return 1.5 + (hours_left - 6.0) * 0.083
-    else:
         return 2.0
+    elif hours_left < 4:
+        return 3.5
+    elif hours_left < 6:
+        return 5.0
+    elif hours_left < 12:
+        return 6.5
+    else:
+        return 8.0
