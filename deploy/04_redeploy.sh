@@ -33,6 +33,7 @@ rsync -avz --progress \
     --include='tools/' --include='tools/***' \
     --include='*.py' \
     --include='.env' \
+    --include='.gitignore' \
     --exclude='*' \
     "$BOT_DIR/" "root@${SERVER}:/home/kalshi/autoagent/"
 
@@ -45,10 +46,22 @@ ssh "root@${SERVER}" "sed -i 's|/Users/jlu/.kalshi_private_key.pem|/home/kalshi/
 # kalshi_trades.db or log files.
 ssh "root@${SERVER}" "rm -rf /home/kalshi/autoagent/bot/market_maker \
     /home/kalshi/autoagent/bot/orchestrator.py \
+    /home/kalshi/autoagent/bot/observability/opportunity_log.py \
+    /home/kalshi/autoagent/bot/learning/threshold_tuner.py \
+    /home/kalshi/autoagent/trade_v3_audit.py \
+    /home/kalshi/autoagent/trade_audit_export.py \
+    /home/kalshi/autoagent/trade_v1_backup.py \
+    /home/kalshi/autoagent/trade_v2_backup.py \
+    /home/kalshi/autoagent/agent.py \
+    /home/kalshi/autoagent/agent-claude.py \
+    /home/kalshi/autoagent/.kalshi_private_key.pem \
+    /home/kalshi/autoagent/Users \
     /home/kalshi/autoagent/tests/test_family_caps.py \
     /home/kalshi/autoagent/tests/test_mm_opportunity_log.py \
     /home/kalshi/autoagent/tests/test_mm_postmortems.py \
-    /home/kalshi/autoagent/tests/test_adverse_selection_defenses.py"
+    /home/kalshi/autoagent/tests/test_adverse_selection_defenses.py \
+    /home/kalshi/autoagent/tests/test_threshold_tuner.py \
+    /home/kalshi/autoagent/tests/test_mm_promotion_golden.py"
 
 # Fix ownership + DB permissions
 ssh "root@${SERVER}" "chown -R kalshi:kalshi /home/kalshi/autoagent && chmod 600 /home/kalshi/autoagent/.env && chmod 664 /home/kalshi/autoagent/kalshi_trades.db 2>/dev/null || true"
