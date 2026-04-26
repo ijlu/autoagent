@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -365,7 +366,9 @@ def materialize_due(
     stats["city_dates_eligible"] = len(grouped)
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    for (city, date_iso), (station, tickers) in grouped.items():
+    for i, ((city, date_iso), (station, tickers)) in enumerate(grouped.items()):
+        if i > 0:
+            time.sleep(2)
         observed_high_f = _fetch_iem_high(
             station, date_iso, http_session=http_session,
         )
