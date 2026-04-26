@@ -67,6 +67,28 @@ DIRECTIONAL_BLOCKED_FAMILIES: frozenset[str] = frozenset(
     ).split(",")
     if f.strip()
 )
+
+# Series the cycle scanner explicitly enumerates via `?series_ticker=<X>`.
+# Why this exists: as of 2026-04-25 Kalshi's unfiltered `/markets?status=open`
+# response is ~99% KXMVE parlay legs (50K rows), and the first 5K pages —
+# all the scanner could reach — contained zero non-parlay markets. Switching
+# to a per-series fetch deterministically pulls the markets we have ensemble
+# signal for, in ~12 small API calls. Discovery of new tradeable series is
+# handled separately by `bot/daemon/series_discovery.py` (alert-only, daily).
+#
+# Membership rule: only series with a registered family_router (weather via
+# stations.py, KXJOB/GDP/CPI via family_routers.py) or that passed Phase 0
+# gating (KXFED). Crypto stays in for shadow-mode evaluation despite the
+# directional blocklist — the alpha_backtest log needs the rows so calibration
+# can keep tracking the families we'd un-block once signal improves.
+TRADE_SERIES_ALLOWLIST: tuple[str, ...] = (
+    # Weather (one per WeatherStation in bot/daemon/stations.py)
+    "KXHIGHNY", "KXHIGHCHI", "KXHIGHLAX", "KXHIGHAUS", "KXHIGHMIA", "KXHIGHDEN",
+    # Macro
+    "KXFED", "KXJOB", "KXGDP", "KXCPI",
+    # Crypto (shadow-eval only via DIRECTIONAL_BLOCKED_FAMILIES)
+    "KXBTC", "KXETH",
+)
 MM_MIN_SPREAD = int(os.environ.get("MM_MIN_SPREAD_CENTS", "4"))
 MM_HALF_SPREAD = int(os.environ.get("MM_HALF_SPREAD_CENTS", "2"))
 MM_MAX_INVENTORY = int(os.environ.get("MM_MAX_INVENTORY", "50"))

@@ -43,6 +43,7 @@ from bot.daemon.requote_triggers import (
     TimeDecayDriver,
 )
 from bot.daemon.scheduler import Scheduler
+from bot.daemon.series_discovery import run_discovery as run_series_discovery
 from bot.daemon.shadow_integrity import run_shadow_integrity_check
 from bot.daemon.weather_handler import WeatherChangeHandler
 from bot.daemon.weather_quoter import WeatherQuoter
@@ -142,6 +143,13 @@ SETTLEMENT_BACKFILL_INTERVAL_S = 600
 # tick after a 13h outage backfills cleanly. One IEM fetch per (city, date)
 # pair, ~6 cities × 1 date = ~6 HTTP calls per tick worst case.
 MOS_MATERIALIZE_INTERVAL_S = 3600
+
+# Daily series-discovery sweep. Looks at /events?status=open, finds
+# series_tickers that match a routable prefix (weather + macro families)
+# and aren't in TRADE_SERIES_ALLOWLIST, alerts on novel ones. Per Josh:
+# "daily is fine since we'd need to backtest the ensemble anyway" — the
+# minimum lead time before we'd act on a discovery is days, not hours.
+SERIES_DISCOVERY_INTERVAL_S = 24 * 3600
 
 
 def _configure_logging() -> None:
@@ -358,6 +366,29 @@ def _run_mm_fill_match(conn) -> None:
         logger.debug(
             "[mm_fill] checked=%d no_fill=%d",
             summary["checked"], summary["no_fill"],
+        )
+
+
+def _run_series_discovery(conn) -> None:
+    """Daily routable-series discovery sweep.
+
+    See `bot/daemon/series_discovery.py` for design. Cheap: paginates
+    `/events?status=open` (~30 pages once) and writes a small
+    `discovered_series` table. Exceptions propagate so a regression
+    surfaces in `[scheduler] task series_discovery raised …` rather
+    than silently dropping a daily heartbeat.
+    """
+    summary = run_series_discovery(conn)
+    if summary["new_routable"]:
+        logger.info(
+            "[series_discovery] events=%d routable_seen=%d NEW=%d upserted=%d",
+            summary["events_aggregated"], summary["routable_seen"],
+            summary["new_routable"], summary["upserted"],
+        )
+    else:
+        logger.debug(
+            "[series_discovery] events=%d routable_seen=%d nothing new",
+            summary["events_aggregated"], summary["routable_seen"],
         )
 
 
@@ -635,6 +666,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_mm_promotion_sweep(conn),
         interval_s=MM_PROMOTION_SWEEP_INTERVAL_S,
         initial_delay_s=900.0,  # run after directional promotion so logs group
+    )
+    scheduler.register(
+        "series_discovery",
+        lambda: _run_series_discovery(conn),
+        interval_s=SERIES_DISCOVERY_INTERVAL_S,
+        # First run a few minutes after boot so any newly-launched series
+        # gets surfaced quickly on a fresh deploy. Subsequent runs follow
+        # the daily cadence.
+        initial_delay_s=300.0,
     )
     scheduler.register(
         "shadow_integrity",

@@ -6681,26 +6681,37 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
         result["trades_skipped_reason"] = "active_feedback_skip_hour"
     else:
         # ── Phase 3: Scan & score ─────────────────────────────────────────
+        # Per-series fetch. Unfiltered `/markets?status=open` started returning
+        # ~99% KXMVE parlay legs (50K rows) somewhere on or before 2026-04-25;
+        # the previous 10-page (5K-market) cursor walk hit zero non-parlay
+        # markets per cycle for days. We now enumerate the series we have
+        # ensemble signal for explicitly. New series get surfaced by the
+        # `series_discovery` daemon task — alert-only, no auto-add.
+        from bot.config import TRADE_SERIES_ALLOWLIST
         print("[trade.py] Fetching markets …")
-        markets = []
-        cursor = None
-        MAX_PAGES = 10  # scan up to 5000 markets to get past parlay flood
-        try:
-            for page in range(MAX_PAGES):
-                url = "/markets?limit=500&status=open"
-                if cursor:
-                    url += f"&cursor={cursor}"
-                resp = api_get(url)
-                batch = resp.get("markets", [])
-                markets.extend(batch)
-                cursor = resp.get("cursor")
-                print(f"[trade.py] Page {page+1}: fetched {len(batch)} markets (total {len(markets)})")
-                if not cursor or len(batch) < 500:
-                    break  # no more pages
-        except Exception as e:
-            print(f"[trade.py] ERROR fetching markets: {e}")
+        markets: list[dict] = []
+        for series in TRADE_SERIES_ALLOWLIST:
+            try:
+                cursor = None
+                series_count = 0
+                while True:
+                    url = f"/markets?limit=200&status=open&series_ticker={series}"
+                    if cursor:
+                        url += f"&cursor={cursor}"
+                    resp = api_get(url)
+                    batch = resp.get("markets", [])
+                    markets.extend(batch)
+                    series_count += len(batch)
+                    cursor = resp.get("cursor")
+                    if not cursor or len(batch) < 200:
+                        break
+                print(f"[trade.py]   {series}: {series_count} markets")
+            except Exception as e:
+                # One bad series shouldn't abort the whole scan — log and continue.
+                print(f"[trade.py] ERROR fetching {series}: {e}")
         result["markets_scanned"] = len(markets)
-        print(f"[trade.py] Scanned {len(markets)} markets total")
+        print(f"[trade.py] Scanned {len(markets)} markets total across "
+              f"{len(TRADE_SERIES_ALLOWLIST)} allowlisted series")
 
         # ── Cycle funnel counters (2026-04-22 audit — observability #4) ──
         # Bundled with the avoid-filter partition fix. Without this funnel

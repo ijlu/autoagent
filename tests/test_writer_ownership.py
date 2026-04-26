@@ -115,6 +115,10 @@ EXPECTED_INSERT_WRITERS: dict[str, set[str]] = {
         "bot/learning/postmortems.py",
         "bot/learning/populate_from_alpha.py",
     },
+    # Discovery scan (alert-only registry). `series_discovery.py` owns both
+    # INSERT and UPDATE — the table is purely an internal dedup ledger and
+    # has no other writer.
+    "discovered_series": {"bot/daemon/series_discovery.py"},
     # settlements, kv_cache — bot/db.py owns via helpers.
     "settlements": {"bot/db.py", "trade.py"},
     # kv_cache: bot/db.py provides the generic put/expiry plumbing;

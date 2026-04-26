@@ -525,6 +525,23 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         "ON fills_ledger(family, fill_ts_unix)"
     )
 
+    # ── Discovered series (alert-only registry) ──
+    # Daily `series_discovery` task lists `/events?status=open`, filters to
+    # routable prefixes (weather + macro), and inserts any series_ticker not
+    # already in TRADE_SERIES_ALLOWLIST. One row per (series_ticker). Auto-add
+    # is intentionally NOT done — adding a new weather city to scanning without
+    # a station registered in bot/daemon/stations.py would mis-route the
+    # ensemble. Josh reviews the alert and decides to wire it explicitly.
+    conn.execute("""CREATE TABLE IF NOT EXISTS discovered_series (
+        series_ticker         TEXT PRIMARY KEY,
+        first_seen_unix       REAL NOT NULL,
+        last_seen_unix        REAL NOT NULL,
+        sample_event_ticker   TEXT,
+        sample_market_count   INTEGER,
+        family_prefix         TEXT,
+        alert_sent_unix       REAL
+    )""")
+
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
         ("trades", "action", "TEXT DEFAULT 'buy'"),
