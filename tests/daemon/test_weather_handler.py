@@ -99,16 +99,20 @@ class TestLiveMode:
 
     @pytest.fixture()
     def live_conn(self):
+        # KXHIGHMIA is cohort-1 (not in MM_BLOCKED_SERIES); KXHIGHNY is blocked.
         c = init_db(":memory:")
-        set_mm_live_state(c, "KXHIGHNY", LiveState.LIVE_FULL)
+        set_mm_live_state(c, "KXHIGHMIA", LiveState.LIVE_FULL)
         yield c
         c.close()
+
+    def _mia_change(self, **kw):
+        return _make_change(series="KXHIGHMIA", station="KMIA", **kw)
 
     def test_live_routes_to_requote_city(self, quoter, fcache, live_conn):
         h = WeatherChangeHandler(
             quoter=quoter, forecast_cache=fcache, live=True, conn=live_conn,
         )
-        h([_make_change()])
+        h([self._mia_change()])
         quoter.requote_city.assert_called_once()
         quoter.shadow_requote_city.assert_not_called()
 
@@ -121,7 +125,7 @@ class TestLiveMode:
         h = WeatherChangeHandler(
             quoter=quoter, forecast_cache=fcache, live=True, conn=live_conn,
         )
-        h([_make_change()])
+        h([self._mia_change()])
         kwargs = quoter.requote_city.call_args.kwargs
         assert kwargs["old_temp_f"] == 70.0
         assert kwargs["new_temp_f"] == 72.0
@@ -138,7 +142,7 @@ class TestLiveMode:
         h = WeatherChangeHandler(
             quoter=quoter, forecast_cache=fcache, live=False, conn=live_conn,
         )
-        h([_make_change()])
+        h([self._mia_change()])
         quoter.shadow_requote_city.assert_called_once()
         quoter.requote_city.assert_not_called()
 
@@ -157,7 +161,7 @@ class TestLiveMode:
         h = WeatherChangeHandler(
             quoter=quoter, forecast_cache=fcache, live=True, conn=live_conn,
         )
-        h([_make_change()])
+        h([self._mia_change()])
         assert h.stats["markets_quoted"] == 1
         assert h.stats["markets_skipped"] == 1
 

@@ -189,7 +189,10 @@ from bot.learning.shadow_calibration_bridge import (
 assert callable(bridge_shadow_to_calibration), 'shadow_cal_bridge regression: entrypoint missing'
 assert WATERMARK_KEY == 'shadow_cal_bridge_watermark', 'shadow_cal_bridge regression: watermark key changed (would silently reset dedup on deploy)'
 assert SOURCE_DESC == 'weather_mm_shadow', 'shadow_cal_bridge regression: source_desc changed (breaks downstream audit filters)'
-print('bot/ imports OK — Phase 2 weather expansion + Phase 3 econ sources + T1.1/T1.2/T3.1/T3.3/B+D/shadow_integrity/settlement_backfill/shadow_cal_bridge wired')
+# MOS bias fitter — wired into daemon via _run_mos_materializer so warm-bias corrections reach kv_cache
+from bot.learning.weather_mos_materializer import fit_and_persist_mos_bias
+assert callable(fit_and_persist_mos_bias), 'mos_fitter regression: fit_and_persist_mos_bias missing'
+print('bot/ imports OK — Phase 2 weather expansion + Phase 3 econ sources + T1.1/T1.2/T3.1/T3.3/B+D/shadow_integrity/settlement_backfill/shadow_cal_bridge/mos_fitter wired')
 \""
 echo "  bot/ OK"
 

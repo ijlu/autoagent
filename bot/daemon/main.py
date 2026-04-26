@@ -55,7 +55,10 @@ from bot.learning.mm_promotion import (
 from bot.learning.settlement_backfill import backfill_from_catalog
 from bot.learning.shadow_calibration_bridge import bridge_shadow_to_calibration
 from bot.learning.shadow_promotion import run_promotion_sweep
-from bot.learning.weather_mos_materializer import materialize_due as mos_materialize_due
+from bot.learning.weather_mos_materializer import (
+    materialize_due as mos_materialize_due,
+    fit_and_persist_mos_bias,
+)
 from bot.observability.alerts import send_alert
 
 logger = logging.getLogger(__name__)
@@ -277,6 +280,17 @@ def _run_mos_materializer(conn) -> None:
         logger.debug(
             "[mos_materializer] eligible=%d no new rows",
             stats["tickers_eligible"],
+        )
+
+    # Always re-fit bias after materialisation — even when no new rows were
+    # written, EWMA weights shift daily so the fit should stay fresh.
+    fit_stats = fit_and_persist_mos_bias(conn)
+    if fit_stats["keys_written"] or fit_stats.get("error"):
+        logger.info(
+            "[mos_fitter] cells=%d keys_written=%d cells_thin=%d%s",
+            fit_stats["cells_fitted"], fit_stats["keys_written"],
+            fit_stats["cells_thin"],
+            f" error={fit_stats['error']}" if fit_stats.get("error") else "",
         )
 
 

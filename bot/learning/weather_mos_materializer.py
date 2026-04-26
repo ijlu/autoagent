@@ -24,18 +24,106 @@ so re-runs collapse to ``INSERT OR IGNORE`` no-ops.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from bot.daemon.stations import STATION_BY_SERIES, WeatherStation
-from bot.db import db_write_ctx
+from bot.db import db_write_ctx, kv_set
 from bot.signals.sources._fomc_calendar import MONTH_ABBR
 from bot.signals.weather_ensemble_v2 import _city_key, _series_from_ticker
 from bot.signals.weather_sources import GAUSSIAN_COMBINE_SOURCES
 
 logger = logging.getLogger(__name__)
+
+# ── MOS bias fitting constants ────────────────────────────────────────────────
+# These mirror tools/backfill_weather_effective_n.py. Keep in sync.
+_MOS_BIAS_KEY_PREFIX: str = "weather_mos_bias_"
+_MOS_BIAS_TTL_SEC: int = 45 * 86400
+_MOS_BIAS_MIN_SAMPLES: int = 8
+_MOS_BIAS_MAX_ABS_F: float = 5.0
+_MOS_BIAS_EWMA_HALF_LIFE_DAYS: float = 14.0
+
+
+@dataclass
+class MOSBiasFit:
+    source: str
+    city: str
+    n: int
+    bias_f: float
+    eff_n: float
+
+
+def _ewma_weight(date_iso: str, ref_date_iso: str, half_life_days: float) -> float:
+    try:
+        d = datetime.strptime(date_iso[:10], "%Y-%m-%d")
+        ref = datetime.strptime(ref_date_iso[:10], "%Y-%m-%d")
+    except (ValueError, IndexError):
+        return 0.0
+    age_days = max(0.0, (ref - d).total_seconds() / 86400.0)
+    return 2.0 ** (-age_days / half_life_days)
+
+
+def fit_and_persist_mos_bias(
+    conn: sqlite3.Connection,
+) -> dict:
+    """Fit EWMA per-(source, city) forecast bias from ``weather_gaussian_snapshots_backfill``
+    and write correction values to ``kv_cache`` so ``_apply_mos_bias`` in
+    ``weather_ensemble_v2`` can de-bias Gaussian forecasts at quote time.
+
+    Idempotent — re-running overwrites kv_cache with the latest fit.
+    Returns a stats dict with ``cells_fitted``, ``keys_written``, ``cells_thin``.
+    """
+    ref_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        rows = conn.execute(
+            """SELECT source, city, settlement_date, forecast_mean_f, observed_high_f
+                 FROM weather_gaussian_snapshots_backfill
+                WHERE observed_high_f IS NOT NULL
+                  AND forecast_mean_f IS NOT NULL
+                  AND source != 'metar'"""
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("[mos_fitter] backfill query failed: %s", exc)
+        return {"cells_fitted": 0, "keys_written": 0, "cells_thin": 0, "error": str(exc)}
+
+    per_cell: dict[tuple[str, str], list[tuple[float, float]]] = {}
+    for src, city, date_iso, fcst, obs in rows:
+        w = _ewma_weight(str(date_iso), ref_date, _MOS_BIAS_EWMA_HALF_LIFE_DAYS)
+        if w <= 0:
+            continue
+        per_cell.setdefault((str(src), str(city)), []).append((w, float(fcst) - float(obs)))
+
+    fits: list[MOSBiasFit] = []
+    for (src, city), pairs in per_cell.items():
+        sum_w = sum(w for w, _ in pairs)
+        if sum_w <= 0:
+            continue
+        sum_we = sum(w * e for w, e in pairs)
+        sum_w2 = sum(w * w for w, _ in pairs)
+        eff_n = (sum_w * sum_w) / sum_w2 if sum_w2 > 0 else 0.0
+        fits.append(MOSBiasFit(src, city, len(pairs), sum_we / sum_w, eff_n))
+
+    keys_written = 0
+    cells_thin = 0
+    with db_write_ctx(conn):
+        for f in fits:
+            if f.eff_n < _MOS_BIAS_MIN_SAMPLES:
+                cells_thin += 1
+                continue
+            if abs(f.bias_f) > _MOS_BIAS_MAX_ABS_F:
+                continue
+            key = f"{_MOS_BIAS_KEY_PREFIX}{f.source}_{_city_key(f.city)}"
+            kv_set(conn, key, {
+                "bias": f.bias_f, "n": f.n, "eff_n": f.eff_n,
+                "fit_at": datetime.now(timezone.utc).isoformat(),
+            }, _MOS_BIAS_TTL_SEC)
+            keys_written += 1
+
+    return {"cells_fitted": len(fits), "keys_written": keys_written, "cells_thin": cells_thin}
 
 
 # Static lead bucket for live-materialized rows. Matches the Open-Meteo
