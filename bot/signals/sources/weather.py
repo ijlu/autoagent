@@ -117,34 +117,102 @@ def _detect_city(ticker_upper: str, title: str):
     return None
 
 
-def _parse_threshold(ticker: str, title: str):
-    """Extract temperature threshold and direction from title/ticker.
+def _parse_threshold(ticker: str, market_data: dict):
+    """Extract temperature threshold and direction from a Kalshi market response.
 
-    Returns (threshold, is_above) or (None, None) on failure.
+    Returns ``(threshold, is_above)`` or ``(None, None)`` on failure.
+
+    Direction priority (most → least authoritative):
+
+      1. **API strikes** on the market payload. For T-markets exactly one of
+         ``floor_strike`` / ``cap_strike`` is populated — Kalshi's settlement
+         engine reads from these fields and they are the ground truth:
+            cap_strike only   → "high < cap"   → is_above=False
+            floor_strike only → "high > floor" → is_above=True
+      2. ``yes_sub_title`` text — Kalshi's per-side question. Carries phrases
+         like "78° or below" / "59° or higher" (number-then-keyword shape).
+      3. Legacy ``title`` / ``subtitle`` regex (keyword-then-number, "above 80").
+      4. Bare ``<N`` / ``>N`` characters in any title field.
+      5. For B-markets: ``-B<N>`` ticker suffix or "X-Y°F" range in title
+         (direction is meaningless for brackets; placeholder True).
+      6. Otherwise — refuse to guess. The ``-T<N>`` suffix alone does NOT
+         encode direction. Returning a default ('above') silently inverts
+         every below-direction market — exactly the bug that produced the
+         late-day Brier 0.46-0.93 vs market 0.000 pathology and matches the
+         2026-04-22 weather_quoter sign-flip incident (poisoned 27k shadow
+         rows). Sources that get (None, None) drop out of the ensemble for
+         that market — that is the correct behavior.
     """
-    temp_match = re.search(
-        r'(at or above|at or below|above|below|over|under|at least|exceed)\s+(\d+\.?\d*)', title
+    ticker_upper = (ticker or "").upper()
+    is_t = "-T" in ticker_upper
+    is_b = "-B" in ticker_upper
+
+    title_blob = " ".join(filter(None, [
+        market_data.get("yes_sub_title") or "",
+        market_data.get("title") or "",
+        market_data.get("subtitle") or "",
+    ])).lower()
+
+    # 1. API strikes — authoritative for threshold markets.
+    if is_t:
+        api_floor = market_data.get("floor_strike")
+        api_cap = market_data.get("cap_strike")
+        try:
+            if api_cap is not None and api_floor is None:
+                return float(api_cap), False
+            if api_floor is not None and api_cap is None:
+                return float(api_floor), True
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Keyword-then-number ("at or above 75").
+    m = re.search(
+        r'(at or above|at or below|above|below|over|under|at least|exceed)\s+(\d+\.?\d*)',
+        title_blob,
     )
-    if not temp_match:
-        tick_match = re.search(r'-[TB](-?\d+\.?\d*)', ticker)
-        if tick_match:
-            threshold = float(tick_match.group(1))
-            is_above = True  # KXHIGH markets are "will high be above X" by default
-            return threshold, is_above
-        # Range markets: title like "78-79\u00b0F" or "between 78 and 80"
-        range_match = re.search(r'(\d+\.?\d*)\s*[-\u2013]\s*(\d+\.?\d*)\s*\u00b0?[fF]?', title)
-        if range_match:
-            low_bound = float(range_match.group(1))
-            high_bound = float(range_match.group(2))
-            threshold = (low_bound + high_bound) / 2  # midpoint of range
-            is_above = True  # will check P(temp in range) below
-            return threshold, is_above
-        return None, None
-    else:
-        direction = temp_match.group(1)
-        threshold = float(temp_match.group(2))
-        is_above = direction in ("above", "over", "at least", "exceed", "at or above")
-        return threshold, is_above
+    if m:
+        direction = m.group(1)
+        return (
+            float(m.group(2)),
+            direction in ("above", "over", "at least", "exceed", "at or above"),
+        )
+
+    # 3. Number-then-keyword ("78° or below", "75F or higher") — the shape
+    # Kalshi's yes_sub_title actually uses.
+    m = re.search(
+        r'(\d+\.?\d*)\s*\u00b0?\s*[fF]?\s+(or above|or below|or higher|or lower|and above|and below)',
+        title_blob,
+    )
+    if m:
+        direction = m.group(2)
+        return (
+            float(m.group(1)),
+            direction in ("or above", "or higher", "and above"),
+        )
+
+    # 4. Bare "<N" / ">N" characters.
+    lt = re.search(r'<\s*(\d+\.?\d*)', title_blob)
+    if lt:
+        return float(lt.group(1)), False
+    gt = re.search(r'>\s*(\d+\.?\d*)', title_blob)
+    if gt:
+        return float(gt.group(1)), True
+
+    # 5. Bracket markets — direction is irrelevant; just extract a threshold
+    # so callers' bracket logic can read floor/cap separately.
+    if is_b:
+        tm = re.search(r'-B(-?\d+\.?\d*)', ticker_upper)
+        if tm:
+            return float(tm.group(1)), True
+        rm = re.search(
+            r'(\d+\.?\d*)\s*\u00b0?[fF]?\s*[-\u2013]\s*(\d+\.?\d*)\s*\u00b0?[fF]?',
+            title_blob,
+        )
+        if rm:
+            return (float(rm.group(1)) + float(rm.group(2))) / 2, True
+
+    # No direction information recoverable. Refuse to guess.
+    return None, None
 
 
 def _determine_day_index(title: str, market_data: dict | None = None,
@@ -275,7 +343,7 @@ def get_weather_gaussian(ticker, market_data):
     if not city_key:
         return None
 
-    threshold, _ = _parse_threshold(ticker, title)
+    threshold, _ = _parse_threshold(ticker, market_data)
     if threshold is None or threshold < -40 or threshold > 140:
         return None
 
@@ -339,8 +407,8 @@ def get_weather_estimate(ticker, market_data):
     if not city_key:
         return None, None
 
-    # Extract temperature threshold from title
-    threshold, is_above = _parse_threshold(ticker, title)
+    # Extract temperature threshold + direction (API-first, falls back to title text).
+    threshold, is_above = _parse_threshold(ticker, market_data)
     if threshold is None:
         return None, None
 
@@ -531,20 +599,11 @@ def get_tomorrow_gaussian(ticker, market_data):
     if not city_key:
         return None
 
-    # Same threshold-parsing pattern as v1 to keep "when does this source fire"
-    # unchanged — we're adding a Gaussian sibling, not changing source scope.
-    temp_match = re.search(
-        r'(at or above|at or below|above|below|over|under|at least|exceed)\s+(\d+\.?\d*)', title
-    )
-    if not temp_match:
-        tick_match = re.search(r'-[TB](-?\d+\.?\d*)', ticker)
-        if tick_match:
-            threshold = float(tick_match.group(1))
-        else:
-            return None
-    else:
-        threshold = float(temp_match.group(2))
-    if threshold < -40 or threshold > 140:
+    # Reuse the canonical parser so direction-handling stays in one place.
+    # The Gaussian path doesn't need is_above (the combiner projects per-market
+    # via probability_for_market downstream), but we still need a threshold.
+    threshold, _ = _parse_threshold(ticker, market_data)
+    if threshold is None or threshold < -40 or threshold > 140:
         return None
 
     day_idx = _determine_day_index(title, market_data, city_key)
@@ -607,23 +666,9 @@ def get_tomorrow_weather_estimate(ticker, market_data):
     if not city_key:
         return None, None
 
-    # Extract threshold (same regex as Open-Meteo source)
-    temp_match = re.search(
-        r'(at or above|at or below|above|below|over|under|at least|exceed)\s+(\d+\.?\d*)', title
-    )
-    if not temp_match:
-        tick_match = re.search(r'-[TB](-?\d+\.?\d*)', ticker)
-        if tick_match:
-            threshold = float(tick_match.group(1))
-            is_above = True
-        else:
-            return None, None
-    else:
-        direction = temp_match.group(1)
-        threshold = float(temp_match.group(2))
-        is_above = direction in ("above", "over", "at least", "exceed", "at or above")
-
-    if threshold < -40 or threshold > 140:
+    # Extract threshold + direction via the canonical parser (API-first).
+    threshold, is_above = _parse_threshold(ticker, market_data)
+    if threshold is None or threshold < -40 or threshold > 140:
         return None, None
 
     # Determine which forecast day BEFORE fetching (avoids wasted API calls)

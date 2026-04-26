@@ -49,23 +49,102 @@ def _fake_forecast(high: float, low: float, date: str = "2026-04-16"):
 # ── _parse_threshold ─────────────────────────────────────────────────────────
 
 class TestParseThreshold:
+    """The parser is API-first: floor_strike / cap_strike on the market
+    payload is authoritative. Title text is fallback, and a ticker -T<N>
+    suffix without direction info refuses to guess (returns None) — the
+    2026-04-22 incident proved that hardcoding ``is_above=True`` silently
+    inverts every below-direction market."""
+
+    # ── 1. API strikes (Kalshi steady state) ──
+    def test_api_floor_only_means_above(self):
+        # T58 (NY): yes_sub_title "59° or above", floor_strike=59
+        threshold, is_above = _parse_threshold(
+            "KXHIGHNY-26APR16-T58",
+            {"floor_strike": 59, "yes_sub_title": "59\u00b0 or above"},
+        )
+        assert threshold == 59
+        assert is_above is True
+
+    def test_api_cap_only_means_below(self):
+        # T51 (NY): yes_sub_title "50° or below", cap_strike=50
+        threshold, is_above = _parse_threshold(
+            "KXHIGHNY-26APR16-T51",
+            {"cap_strike": 50, "yes_sub_title": "50\u00b0 or below"},
+        )
+        assert threshold == 50
+        assert is_above is False
+
+    def test_api_cap_only_real_denver_t79(self):
+        # T79 (DEN): yes_sub_title "78° or below", cap_strike=79.
+        # Pre-fix: parser returned (79, True) → P(YES) inverted. Post-fix:
+        # (79, False) so "below" markets score correctly.
+        threshold, is_above = _parse_threshold(
+            "KXHIGHDEN-26APR22-T79",
+            {"cap_strike": 79, "yes_sub_title": "78\u00b0 or below"},
+        )
+        assert threshold == 79
+        assert is_above is False
+
+    def test_api_strikes_as_strings(self):
+        # Kalshi sometimes returns numeric fields as strings.
+        threshold, is_above = _parse_threshold(
+            "KXHIGHNY-26APR16-T75", {"floor_strike": "75"},
+        )
+        assert threshold == 75.0
+        assert is_above is True
+
+    # ── 2. yes_sub_title fallback (number-then-keyword shape) ──
+    def test_yes_sub_title_or_below(self):
+        threshold, is_above = _parse_threshold(
+            "KXHIGHNY-26APR16-T72",
+            {"yes_sub_title": "72\u00b0 or below"},
+        )
+        assert threshold == 72
+        assert is_above is False
+
+    def test_yes_sub_title_or_higher(self):
+        threshold, is_above = _parse_threshold(
+            "KXHIGHNY-26APR16-T75",
+            {"yes_sub_title": "75\u00b0F or higher"},
+        )
+        assert threshold == 75
+        assert is_above is True
+
+    # ── 3. Legacy title regex (keyword-then-number) ──
     def test_above_keyword(self):
         threshold, is_above = _parse_threshold(
-            "KXHIGHNY-26APR16-T85", "will nyc high be at or above 85")
+            "KXHIGHNY-26APR16-T85",
+            {"title": "will nyc high be at or above 85"},
+        )
         assert threshold == 85
         assert is_above is True
 
     def test_below_keyword(self):
         threshold, is_above = _parse_threshold(
-            "KXHIGHNY-26APR16-T72", "will nyc high be at or below 72")
+            "KXHIGHNY-26APR16-T72",
+            {"title": "will nyc high be at or below 72"},
+        )
         assert threshold == 72
         assert is_above is False
 
-    def test_ticker_fallback_defaults_above(self):
+    # ── 4. The "no direction info" case — must refuse to guess ──
+    def test_ticker_only_returns_none(self):
+        """Pre-fix this returned (80, True); post-fix it must refuse.
+        Source then drops out of the ensemble for this market — METAR's own
+        parser still works, so the candidate isn't lost entirely."""
         threshold, is_above = _parse_threshold(
-            "KXHIGHNY-26APR16-T80", "nyc temperature weather high")
-        assert threshold == 80
-        assert is_above is True
+            "KXHIGHNY-26APR16-T80",
+            {"title": "nyc temperature weather high"},
+        )
+        assert threshold is None
+        assert is_above is None
+
+    # ── 5. Bracket markets (direction irrelevant) ──
+    def test_bracket_extracts_threshold_from_ticker(self):
+        threshold, _ = _parse_threshold(
+            "KXHIGHNY-26APR16-B83.5", {"title": ""},
+        )
+        assert threshold == 83.5
 
 
 # ── Direction consistency: Open-Meteo ────────────────────────────────────────

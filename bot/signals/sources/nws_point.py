@@ -168,7 +168,7 @@ def get_nws_point_gaussian(ticker: str, market_data: dict) -> Optional[GaussianF
     if not city:
         return None
 
-    threshold, _ = _parse_threshold(ticker, title)
+    threshold, _ = _parse_threshold(ticker, market_data)
     if threshold is None or threshold < -40 or threshold > 140:
         return None
 
@@ -227,7 +227,7 @@ def get_nws_point_estimate(ticker: str, market_data: dict) -> tuple:
     if not city:
         return None, None
 
-    threshold, is_above = _parse_threshold(ticker, title)
+    threshold, is_above = _parse_threshold(ticker, market_data)
     if threshold is None or threshold < -40 or threshold > 140:
         return None, None
 

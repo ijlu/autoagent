@@ -290,7 +290,7 @@ def _parse_market_for_projection(ticker: str, market_data: dict):
     from bot.signals.sources.weather import _parse_threshold
 
     title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
-    threshold, is_above = _parse_threshold(ticker, title)
+    threshold, is_above = _parse_threshold(ticker, market_data)
     if threshold is None:
         return None
 

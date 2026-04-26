@@ -107,7 +107,7 @@ def get_nbm_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecas
     if not city_key:
         return None
 
-    threshold, _ = _parse_threshold(ticker, title)
+    threshold, _ = _parse_threshold(ticker, market_data)
     if threshold is None or threshold < -40 or threshold > 140:
         return None
 
@@ -157,7 +157,7 @@ def get_nbm_estimate(ticker: str, market_data: dict) -> tuple:
     if not city_key:
         return None, None
 
-    threshold, is_above = _parse_threshold(ticker, title)
+    threshold, is_above = _parse_threshold(ticker, market_data)
     if threshold is None or threshold < -40 or threshold > 140:
         return None, None
 

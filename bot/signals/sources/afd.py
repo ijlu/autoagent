@@ -210,7 +210,7 @@ def _afd_core(ticker: str, market_data: dict):
     if not wfo:
         return None
 
-    threshold, is_above = _parse_threshold(ticker, title)
+    threshold, is_above = _parse_threshold(ticker, market_data)
     if threshold is None or threshold < -40 or threshold > 140:
         return None
 
