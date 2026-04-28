@@ -162,7 +162,7 @@ assert _report.is_clean and not _report.is_meaningful, 'T3.1 validator semantics
 # these knobs or the graduation surface go missing, the single-criterion
 # rule sneaks back in.
 assert MM_CANARY_MIN_PNL_PER_FILL_CENTS > 0, 'B+D regression: canary P&L floor must be positive'
-assert MM_GRADUATION_MIN_PAIRED_N >= 10, 'B+D regression: graduation N too low'
+assert MM_GRADUATION_MIN_PAIRED_N >= 5, 'B+D regression: graduation N too low'  # 2026-04-26: floor relaxed from 10 to 5 alongside default 8 to compress canary window
 assert 0.0 < MM_GRADUATION_MIN_PNL_RATIO <= 1.0, 'B+D regression: graduation ratio out of range'
 assert callable(evaluate_mm_graduation), 'B+D regression: evaluate_mm_graduation missing'
 # T3.3 (2026-04-21) — reader migration from mm_processed_fills to

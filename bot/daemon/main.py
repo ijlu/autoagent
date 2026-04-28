@@ -59,6 +59,8 @@ from bot.learning.shadow_promotion import run_promotion_sweep
 from bot.learning.weather_mos_materializer import (
     materialize_due as mos_materialize_due,
     fit_and_persist_mos_bias,
+    fit_and_persist_skill_curves,
+    fit_and_persist_group_correlation,
 )
 from bot.observability.alerts import send_alert
 
@@ -300,6 +302,153 @@ def _run_mos_materializer(conn) -> None:
             fit_stats["cells_thin"],
             f" error={fit_stats['error']}" if fit_stats.get("error") else "",
         )
+
+    # Skill σ and group ρ ride the same scheduler tick: they read from the
+    # same backfill table the materializer just topped up, and the
+    # combine consumes all three (bias / σ / ρ) on the next quote.
+    skill_stats = fit_and_persist_skill_curves(conn)
+    if skill_stats["keys_written"] or skill_stats.get("error"):
+        logger.info(
+            "[skill_fitter] buckets=%d keys_written=%d (city=%d) buckets_thin=%d%s",
+            skill_stats["buckets_fitted"], skill_stats["keys_written"],
+            skill_stats.get("city_keys_written", 0),
+            skill_stats["buckets_thin"],
+            f" error={skill_stats['error']}" if skill_stats.get("error") else "",
+        )
+
+    group_stats = fit_and_persist_group_correlation(conn)
+    if group_stats["persisted"] or group_stats.get("error"):
+        logger.info(
+            "[group_rho_fitter] persisted=%s rho=%s n_eff=%s n_pairs=%s%s",
+            group_stats["persisted"], group_stats["rho"],
+            group_stats["n_eff"], group_stats["n_pairs"],
+            f" error={group_stats['error']}" if group_stats.get("error") else "",
+        )
+
+    # METAR residual σ per (station, LST hour). Replaces the hardcoded
+    # hours-remaining schedule with empirical std of
+    # (eventual_daily_high − running_max_at_hour) from the hourly backfill
+    # — making METAR's σ much tighter late in the day, which is when
+    # running_high is most informative and forecasts are stalest.
+    try:
+        from bot.learning.weather_mos_materializer import (
+            fit_and_persist_metar_residual_sigma,
+        )
+        residual_stats = fit_and_persist_metar_residual_sigma(conn)
+        if residual_stats["keys_written"]:
+            logger.info(
+                "[metar_residual_fitter] cells=%d keys_written=%d cells_thin=%d",
+                residual_stats["cells_fitted"], residual_stats["keys_written"],
+                residual_stats["cells_thin"],
+            )
+    except Exception as exc:
+        logger.warning("[metar_residual_fitter] failed: %s", exc)
+
+    # Snapshots-based skill σ + MOS bias for sources missing from the
+    # original Open-Meteo backfill (NWS Point, MADIS, etc.). Reads live
+    # forecasts joined to observed daily highs so all firing sources get
+    # per-city σ, not just HRRR/NBM/weather/open_meteo.
+    try:
+        from bot.learning.weather_mos_materializer import (
+            fit_and_persist_skill_from_snapshots,
+        )
+        snap_stats = fit_and_persist_skill_from_snapshots(conn)
+        if snap_stats["skill_keys_written"] or snap_stats["mos_keys_written"]:
+            logger.info(
+                "[snapshot_fitter] skill_written=%d skill_thin=%d  "
+                "mos_written=%d mos_thin=%d",
+                snap_stats["skill_keys_written"], snap_stats["skill_cells_thin"],
+                snap_stats["mos_keys_written"], snap_stats["mos_cells_thin"],
+            )
+    except Exception as exc:
+        logger.warning("[snapshot_fitter] failed: %s", exc)
+
+    # Coverage audit fires after every fitter tick — surfaces any
+    # (source, city) cell that's still on a wide pooled fallback so we
+    # can fix the data instead of letting the under-weighting compound.
+    try:
+        _run_source_coverage_audit(conn)
+    except Exception as exc:
+        logger.warning("[source_coverage] audit failed: %s", exc)
+
+
+def _run_source_coverage_audit(conn) -> None:
+    """Per-source kv coverage check. Warns when a (source, city) cell has
+    no learned skill σ or MOS bias, so we don't silently fall back to a
+    wide pooled value (which under-weights the source in the combine).
+
+    Discovery context (2026-04-27): NWS Point / MADIS / AFD had only n=12
+    backfill rows total, so they got a pooled-only skill σ ≈ 3°F vs the
+    canonical sources' per-city ≈ 1°F. NWS Point's correct +5°F warm
+    forecast for Austin was being weighted at 4% of the precision pool —
+    effectively excluded — and we never noticed. This audit makes the gap
+    visible at every materializer tick.
+
+    City convention (also 2026-04-27): three different city naming
+    schemes exist in the codebase:
+      * ``WeatherStation.city`` uses the raw human form: "los angeles",
+        "nyc". ``STATION_BY_CITY`` is keyed by these AND their aliases
+        ("new york", "la"), so its keys aren't unique-per-city.
+      * The materializer normalizes when writing kv: ``"los angeles"``
+        → ``"los_angeles"``, ``"nyc"`` → ``"nyc"``. KV keys end up as
+        ``weather_skill_hrrr_los_angeles_6_24`` (underscore form).
+      * ``predict_v2._city_for_ticker`` does the same normalization for
+        reads, so live quotes hit the right kv keys.
+    Earlier this audit iterated ``STATION_BY_CITY.keys()`` and its
+    aliases ("new york", "la") got normalized to "new_york"/"la" — kv
+    keys under those names don't exist, causing 30+ false-positive
+    "missing" warnings that masked any real coverage gaps. Fixed by
+    iterating the canonical 6-city set used by the materializer.
+    """
+    SKILL_SOURCES = ("hrrr", "nbm", "weather", "open_meteo", "nws_point",
+                     "madis")
+    MOS_SOURCES = ("hrrr", "nbm", "weather", "open_meteo", "nws_point",
+                   "metar", "madis")
+    # Canonical 6-city set. Must match
+    # ``bot.learning.weather_mos_materializer._STATION_BY_CITY_KEY`` keys
+    # — those are the only city-key strings the materializer ever writes.
+    cities = ["nyc", "chicago", "miami", "los_angeles", "austin", "denver"]
+
+    # Skill σ coverage: per-(source, city) check. ``cities`` is already
+    # in kv-key form ("nyc", "los_angeles", etc.) — no normalization here
+    # so the audit's idea of a city always matches the materializer's.
+    skill_missing = []
+    for src in SKILL_SOURCES:
+        for city in cities:
+            key = f"weather_skill_{src}_{city}_6_24"
+            row = conn.execute(
+                "SELECT 1 FROM kv_cache WHERE key=?", (key,),
+            ).fetchone()
+            if row is None:
+                skill_missing.append((src, city))
+
+    # MOS bias coverage: per-(source, city) check
+    mos_missing = []
+    for src in MOS_SOURCES:
+        for city in cities:
+            key = f"weather_mos_bias_{src}_{city}"
+            row = conn.execute(
+                "SELECT 1 FROM kv_cache WHERE key=?", (key,),
+            ).fetchone()
+            if row is None:
+                mos_missing.append((src, city))
+
+    if skill_missing:
+        logger.warning(
+            "[source_coverage] skill σ missing for %d (source, city) cells: %s",
+            len(skill_missing),
+            ", ".join(f"{s}/{c}" for s, c in skill_missing[:8])
+            + (f" ... +{len(skill_missing)-8} more" if len(skill_missing) > 8 else ""),
+        )
+    if mos_missing:
+        logger.warning(
+            "[source_coverage] MOS bias missing for %d (source, city) cells: %s",
+            len(mos_missing),
+            ", ".join(f"{s}/{c}" for s, c in mos_missing[:8])
+            + (f" ... +{len(mos_missing)-8} more" if len(mos_missing) > 8 else ""),
+        )
+    if not skill_missing and not mos_missing:
+        logger.info("[source_coverage] all (source, city) cells have learned σ + bias")
 
 
 def _run_settlement_backfill(conn) -> None:
@@ -655,11 +804,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         "mos_materializer",
         lambda: _run_mos_materializer(conn),
         interval_s=MOS_MATERIALIZE_INTERVAL_S,
-        # Wait 30 min after boot so weather_forecast_snapshots has rows for
-        # at least a few cycles, AND so the first eligible-ticker query
-        # doesn't fire while the schema is still being migrated by an
-        # in-flight init_db. First useful tick is the second one (~+90 min).
-        initial_delay_s=1800.0,
+        # Run the fitter on startup with a small safety delay. The 30-min
+        # delay this used to have was a defensive "wait for schema
+        # migrations to settle" that didn't apply once init_db became
+        # synchronous. The cost: post-restart, METAR's per-(station, hour)
+        # residual σ kv was missing for ~30 min, so METAR's σ defaulted to
+        # the wide hardcoded schedule and METAR contributed near-zero
+        # weight to the combine. On hot days that meant we used cold-start
+        # forecast values for the whole morning. Discovered 2026-04-28.
+        initial_delay_s=60.0,
     )
     scheduler.register(
         "mm_promotion_sweep",

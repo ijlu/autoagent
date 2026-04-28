@@ -317,11 +317,36 @@ def apply_calibration(
 
     Always clamps output to [0.02, 0.98]. Returns ``prob`` unchanged (modulo
     clamp) when the curve is missing, identity, or a legacy shape.
+
+    GLOBAL DISABLE (2026-04-27): the persisted Platt curve was fit
+    overwhelmingly on weather rows from the broken v1 ensemble path
+    (8509/8815 rows = 96.5%). Those rows had raw=0.98 + actual=16% in the
+    top bucket because the broken v1 was producing clamped extremes
+    regardless of input. The Platt fit captured that pattern (A=22M,
+    B=-6.1M → essentially a step function at 0.28) and now applies it to
+    every category, destroying signal in non-weather predictions too.
+    Until we accumulate enough clean v2-era data to refit per category,
+    apply_calibration is gated behind ``CALIBRATION_ENABLED`` (default
+    false) and returns the raw prob (clamped) for any category.
+
+    The fitter (``fit_calibration``) keeps running so data continues to
+    accumulate. When per-category sample counts cross a threshold, we'll
+    enable per-family Platt fits and flip the flag.
     """
     if prob is None:
         return None
     if not isinstance(prob, (int, float)) or math.isnan(prob):
         return prob
+
+    # Global gate — see docstring. Default is false; override by setting
+    # CALIBRATION_ENABLED=true in the env once the fit is trustworthy.
+    try:
+        from bot.config import CALIBRATION_ENABLED
+    except ImportError:
+        CALIBRATION_ENABLED = False
+    if not CALIBRATION_ENABLED:
+        return _clamp(float(prob))
+
     if not curve or _looks_like_legacy_flat(curve):
         return _clamp(float(prob))
 

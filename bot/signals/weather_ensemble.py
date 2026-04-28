@@ -1,9 +1,10 @@
 """Bayesian combiner for weather sources.
 
-Given 8 potentially-correlated weather sources (metar observations, Open-Meteo,
-Tomorrow.io, NWS hourly, NBM, HRRR, MADIS basket, AFD forecaster discussion),
-combine them into a single probability estimate that beats any individual
-source on historical Brier.
+Given 7 potentially-correlated weather sources (metar observations, Open-Meteo,
+NWS hourly, NBM, HRRR, MADIS basket, AFD forecaster discussion), combine them
+into a single probability estimate that beats any individual source on
+historical Brier. (Tomorrow.io was dropped 2026-04-26 — see
+bot/config.py TOMORROW_API_KEY note.)
 
 Strategy:
   1. Collect (prob, source_tag) from every weather source that has an opinion
@@ -38,7 +39,7 @@ DEFAULT_WEATHER_PRIORS = {
     "hrrr":      0.90,
     "nbm":       0.85,
     "nws_point": 0.75,
-    "tomorrow":  0.70,
+    # 2026-04-26: tomorrow dropped (TOS storage clause + reanalysis-only history)
     "weather":   0.65,  # Open-Meteo default model
     "madis":     0.55,
     "afd":       0.40,
@@ -105,7 +106,6 @@ def predict(
     from bot.signals.sources.metar_observations import get_metar_observation_estimate
     from bot.signals.sources.weather import (
         get_weather_estimate,
-        get_tomorrow_weather_estimate,
         get_noaa_alerts_for_market,
     )
     from bot.signals.sources.nws_point import get_nws_point_estimate
@@ -134,7 +134,7 @@ def predict(
         ("hrrr",      get_hrrr_estimate),
         ("nbm",       get_nbm_estimate),
         ("nws_point", get_nws_point_estimate),
-        ("tomorrow",  get_tomorrow_weather_estimate),
+        # 2026-04-26: tomorrow.io dropped (TOS storage + reanalysis history)
         ("weather",   get_weather_estimate),
         ("madis",     get_madis_estimate),
         ("afd",       get_afd_estimate),

@@ -588,9 +588,13 @@ class SkillFit:
     bias_f: float             # mean(forecast - observed)
     rmse_f: float             # sqrt(mean((forecast - observed)^2))
     prior_sigma_f: float      # average self-reported σ across the rows (for drift diagnostics)
+    city: Optional[str] = None  # None = pooled across all cities
 
 
-def fit_skill_curves(conn: sqlite3.Connection) -> list[SkillFit]:
+def fit_skill_curves(
+    conn: sqlite3.Connection, *, per_city: bool = False,
+    winsorize_pct: float = 0.0,
+) -> list[SkillFit]:
     """Fit per-(source, horizon bucket) bias + RMSE from the backfill table.
 
     RMSE is returned (not std); treating σ=RMSE is the right conservative
@@ -600,14 +604,19 @@ def fit_skill_curves(conn: sqlite3.Connection) -> list[SkillFit]:
     METAR rows are skipped (obs of ground truth; forecast == observed by
     construction — σ there is the epsilon stamped during replay, not a
     real forecast error).
+
+    When ``per_city=True`` also fits per-(source, city, bucket) cells in
+    addition to the pooled fits. Diagnostics show the actual error std
+    varies 0.9–2.0°F across cities for the same source — a single pooled
+    σ is wrong for everyone. Per-city σ feeds back through
+    ``weather_ensemble_v2._get_learned_sigma`` with pooled fallback when
+    a city cell is too thin.
     """
     # lead_hours in the backfill is nominal (A2.5 defaults to 12h). We
     # bucket on it so the fit already lines up with the buckets the live
-    # combiner queries. Once real multi-lead init cycles land (future
-    # HRRR pullable via grib2), multiple rows per (source, city, date)
-    # at different leads will start distinguishing buckets.
+    # combiner queries.
     rows = conn.execute(
-        """SELECT source, lead_hours, forecast_mean_f, forecast_sigma_f,
+        """SELECT source, city, lead_hours, forecast_mean_f, forecast_sigma_f,
                   observed_high_f
              FROM weather_gaussian_snapshots_backfill
             WHERE observed_high_f IS NOT NULL
@@ -615,32 +624,51 @@ def fit_skill_curves(conn: sqlite3.Connection) -> list[SkillFit]:
               AND source != 'metar'"""
     ).fetchall()
 
-    per_bucket: dict[tuple[str, str], list[tuple[float, float, float]]] = {}
-    for src, lead, fcst, sigma, obs in rows:
+    pooled: dict[tuple[str, str], list[tuple[float, float, float]]] = {}
+    per_city_buckets: dict[
+        tuple[str, str, str], list[tuple[float, float, float]]
+    ] = {}
+    for src, city, lead, fcst, sigma, obs in rows:
         if lead is None:
             continue
         bucket = _bucket_for(float(lead))
         if bucket is None:
             continue
-        per_bucket.setdefault((src, bucket), []).append(
-            (float(fcst), float(sigma or 0.0), float(obs))
-        )
+        sample = (float(fcst), float(sigma or 0.0), float(obs))
+        pooled.setdefault((src, bucket), []).append(sample)
+        if per_city and city:
+            per_city_buckets.setdefault((src, str(city), bucket), []).append(sample)
 
-    out: list[SkillFit] = []
-    for (src, bucket), samples in sorted(per_bucket.items()):
+    def _fit_one(samples, src, bucket, city=None) -> SkillFit:
         n = len(samples)
-        if n == 0:
-            continue
         errs = [f - o for f, _, o in samples]
         sigs = [s for _, s, _ in samples]
+        # Winsorize: clip residuals outside [p, 1-p] back to those quantiles
+        # so a single 5°F miss in a 90-day sample doesn't double the σ
+        # estimate. With ``winsorize_pct=0`` this is a no-op (current behavior).
+        if winsorize_pct > 0 and n >= 20:
+            sorted_errs = sorted(errs)
+            lo_idx = int(n * winsorize_pct)
+            hi_idx = n - 1 - lo_idx
+            lo_val = sorted_errs[lo_idx]
+            hi_val = sorted_errs[hi_idx]
+            errs = [max(lo_val, min(hi_val, e)) for e in errs]
         bias = sum(errs) / n
         rmse = math.sqrt(sum(e * e for e in errs) / n)
         prior = sum(sigs) / n if sigs else 0.0
-        out.append(SkillFit(
+        return SkillFit(
             source=src, bucket=bucket, n=n,
             bias_f=bias, rmse_f=rmse,
-            prior_sigma_f=prior,
-        ))
+            prior_sigma_f=prior, city=city,
+        )
+
+    out: list[SkillFit] = []
+    for (src, bucket), samples in sorted(pooled.items()):
+        if samples:
+            out.append(_fit_one(samples, src, bucket, city=None))
+    for (src, city, bucket), samples in sorted(per_city_buckets.items()):
+        if samples:
+            out.append(_fit_one(samples, src, bucket, city=city))
     return out
 
 
@@ -648,16 +676,22 @@ def persist_skill_fit(
     conn: sqlite3.Connection, fit: SkillFit,
     *, ttl_seconds: int = _SKILL_TTL_SEC,
 ) -> str:
-    """Write a fitted skill curve into kv_cache under
-    ``weather_skill_<source>_<bucket>``. Returns the kv key written.
+    """Write a fitted skill curve into kv_cache. Returns the kv key written.
 
-    weather_ensemble_v2 reads ``sigma`` (= RMSE) to override the source's
-    prior σ on Gaussians in that horizon bucket. ``bias`` is stored for
-    A5 and operator debugging.
+    Pooled fits land at ``weather_skill_<source>_<bucket>``; per-city fits
+    land at ``weather_skill_<source>_<city>_<bucket>``.
+    ``weather_ensemble_v2._get_learned_sigma`` reads per-city first, falls
+    back to pooled, falls back to the source's own prior.
     """
     from bot.db import kv_set
 
-    key = f"{_SKILL_KEY_PREFIX}{fit.source}_{fit.bucket}"
+    if fit.city:
+        # City names from the backfill table can include spaces ("los angeles");
+        # normalize to underscore form for kv key safety + consumer alignment.
+        city_key = fit.city.strip().lower().replace(" ", "_")
+        key = f"{_SKILL_KEY_PREFIX}{fit.source}_{city_key}_{fit.bucket}"
+    else:
+        key = f"{_SKILL_KEY_PREFIX}{fit.source}_{fit.bucket}"
     payload = {
         "sigma": fit.rmse_f,
         "bias": fit.bias_f,
@@ -665,6 +699,8 @@ def persist_skill_fit(
         "prior_sigma": fit.prior_sigma_f,
         "fit_at": datetime.now(timezone.utc).isoformat(),
     }
+    if fit.city:
+        payload["city"] = fit.city
     kv_set(conn, key, payload, ttl_seconds)
     return key
 

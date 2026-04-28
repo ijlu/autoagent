@@ -194,12 +194,14 @@ def get_nws_point_gaussian(ticker: str, market_data: dict) -> Optional[GaussianF
     sigma_f = _nws_point_sigma_for_day(day_idx)
     horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
 
+    from bot.signals.sources._freshness import nws_point_latest_issued_at
     return GaussianForecast(
         mean_f=float(forecast_high),
         sigma_f=sigma_f,
         horizon_hours=horizon_hours,
         source_name="nws_point",
         source_tag=f"nws_point:{city_key}_{target_date}",
+        issued_at=nws_point_latest_issued_at(),
     )
 
 

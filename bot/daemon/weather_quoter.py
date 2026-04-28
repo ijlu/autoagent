@@ -879,11 +879,29 @@ class WeatherQuoter:
         Gaussian combine (A1–A5). Any error or ``None`` return falls back to
         the v1 METAR-only logistic CDF below so a broken v2 read can never
         leave us without a fair value.
+
+        F (2026-04-27): the v1 fallback is a known liability — it skips
+        per-city skill σ, MOS bias, group correlation discount, staleness
+        inflation, and truncated projection. Falling back silently means a
+        latent v2 bug can quietly degrade us to v1 quoting without alerting
+        anyone. Log a WARNING (not info) when the fallback fires + bump the
+        v1-fallback counter so the daemon health log surfaces the rate.
         """
         if WEATHER_ENSEMBLE_V2 and market.raw:
             v2_cents = self._compute_fair_value_v2(market)
             if v2_cents is not None:
                 return v2_cents
+            # v2 is enabled but didn't return — falling back to v1.
+            logger.warning(
+                "[wx-quoter] v1 FALLBACK fired for %s — predict_v2 returned None or "
+                "raised; v1 path bypasses skill σ / MOS bias / group ρ / staleness / "
+                "truncation. If this is frequent, investigate predict_v2 failures.",
+                market.ticker,
+            )
+            try:
+                self._v1_fallback_count = getattr(self, "_v1_fallback_count", 0) + 1
+            except Exception:
+                pass
 
         mu = _blended_mu(running_high_f, forecast_high_f, hours_left)
         sigma = _sigma_for_hours(hours_left)

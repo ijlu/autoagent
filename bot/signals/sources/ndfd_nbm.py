@@ -133,12 +133,14 @@ def get_nbm_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecas
     sigma_f = _nbm_sigma_for_day(day_idx)
     horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
 
+    from bot.signals.sources._freshness import nbm_latest_issued_at
     return GaussianForecast(
         mean_f=float(forecast_high),
         sigma_f=sigma_f,
         horizon_hours=horizon_hours,
         source_name="nbm",
         source_tag=f"nbm:{city_key}_{date_label}",
+        issued_at=nbm_latest_issued_at(),
     )
 
 

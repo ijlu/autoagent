@@ -61,6 +61,13 @@ _DIURNAL_KEY_PREFIX: str = "weather_metar_diurnal_"
 _DIURNAL_SIGMA_FLOOR_F: float = 0.3
 _DIURNAL_SIGMA_CEIL_F: float = 12.0
 
+# Cold-start σ floor applied when kv lookup for forecast_high returns None
+# (kv not yet populated post-restart). 10°F captures "we have an
+# observation but no forecast — eventual peak could be anywhere within a
+# typical day's range." The combiner downweights this Gaussian heavily
+# (precision ∝ 1/σ²), so other sources dominate until kv fills in.
+_COLD_START_SIGMA_F: float = 10.0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
@@ -231,10 +238,29 @@ def _update_running_daily_high(station: str, temp_f: float, obs_time: str) -> di
 # Forecast high integration
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _get_forecast_high(station: str, running_high: float) -> float:
-    """Retrieve the forecast high for today from kv_cache.
+def _get_forecast_high(station: str, running_high: float) -> Optional[float]:
+    """Retrieve the cached forecast high for today, or ``None`` when the
+    kv cache hasn't been populated yet.
 
-    Falls back to running_high + 5 deg F if no forecast is cached.
+    The kv key is written by the forecast sources (weather, HRRR, NBM,
+    NWS Point) when they first fire for ``day_idx == 0``. After daemon
+    restart there's a window of 1-2 cycles where this key is missing.
+
+    Cold-start audit (2026-04-28): the previous fallback returned
+    ``running_high + 5°F`` — i.e. a guess based on current temperature.
+    On hot days that guess is way too low (running_high at 9 AM is
+    ~10-15°F below the eventual peak). The combiner's
+    ``_metar_expected_eventual_high`` blends this fallback at high
+    forecast_weight early in the day, collapsing METAR's μ toward
+    running_high. Net effect: METAR contributes a 5-10°F-too-low
+    Gaussian during the cold-start window. By mid-afternoon the kv
+    populates and METAR works correctly, but the morning damage is done
+    on hot-day projections.
+
+    Returning None lets the caller widen σ rather than guess. The caller
+    (``get_metar_gaussian``) treats a None forecast as "no extra info
+    beyond running_high" and applies the wider hours-left σ schedule
+    until kv populates.
     """
     date_lst = _get_lst_date(station)
     forecast_key = f"metar_forecast_high_{station}_{date_lst}"
@@ -247,8 +273,7 @@ def _get_forecast_high(station: str, running_high: float) -> float:
     except RuntimeError:
         pass
 
-    # Conservative fallback: assume some warming potential remains
-    return running_high + 5.0
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -450,15 +475,42 @@ def get_metar_gaussian(ticker: str, market_data: dict) -> GaussianForecast | Non
         expected_eventual_high = max(predicted, running_high)
         sigma_f = rmse
     else:
-        expected_eventual_high = _metar_expected_eventual_high(
-            running_high, forecast_high, hours_left
-        )
-        sigma_f = _sigma_for_hours(hours_left)
+        if forecast_high is None:
+            # Cold-start path: kv hasn't been populated yet (e.g. <2 min
+            # after daemon restart, before forecast sources have fired).
+            # Fall back to running_high alone — better than guessing a
+            # forecast — and widen σ so the combine treats this Gaussian
+            # as low-information rather than a confident sub-peak read.
+            expected_eventual_high = running_high
+            sigma_f = max(
+                _sigma_for_hours(hours_left, station=station, lst_hour=lst_hour_now),
+                _COLD_START_SIGMA_F,
+            )
+        else:
+            expected_eventual_high = _metar_expected_eventual_high(
+                running_high, forecast_high, hours_left
+            )
+            # Pass station + LST hour so _sigma_for_hours can read the learned
+            # per-cell residual σ from kv_cache (Option A). Falls back to the
+            # hardcoded hours-remaining schedule on cold cache.
+            sigma_f = _sigma_for_hours(hours_left, station=station, lst_hour=lst_hour_now)
 
     # Settlement-day horizon from the canonical LST offset so our horizon
     # lines up with every other source's on the same bucket.
     lst_offset = lst_offset_for_station(station)
     horizon_hours = hours_until_settlement_end(lst_offset, day_idx=0)
+
+    # METAR has a real observation timestamp — use it directly. Falls back
+    # to "now" if the timestamp is malformed; staleness inflation is a
+    # no-op for live observations regardless.
+    issued_at_unix: Optional[float] = None
+    if obs_time:
+        try:
+            issued_at_unix = datetime.fromisoformat(
+                obs_time.replace("Z", "+00:00")
+            ).timestamp()
+        except (TypeError, ValueError):
+            issued_at_unix = None
 
     return GaussianForecast(
         mean_f=expected_eventual_high,
@@ -466,6 +518,7 @@ def get_metar_gaussian(ticker: str, market_data: dict) -> GaussianForecast | Non
         horizon_hours=horizon_hours,
         source_name="metar",
         source_tag=f"metar:{station}",
+        issued_at=issued_at_unix,
     )
 
 
@@ -526,6 +579,13 @@ def get_metar_observation_estimate(ticker: str, market_data: dict) -> tuple:
 
     # ── Get forecast high for remaining-potential estimation ──
     forecast_high = _get_forecast_high(station, high_f)
+    if forecast_high is None:
+        # v1 path: legacy callers expect a numeric value. Cold-start
+        # behavior here is less critical because v1 is only the fallback
+        # when WEATHER_ENSEMBLE_V2 is off; preserve the historical
+        # ``running_high + 5°F`` shape so downstream math doesn't divide
+        # by None. v2 path (above) widens σ instead.
+        forecast_high = high_f + 5.0
 
     # ── Check for bracket market (different probability model) ──
     is_bracket = "-B" in ticker_upper
@@ -595,12 +655,64 @@ def get_metar_observation_estimate(ticker: str, market_data: dict) -> tuple:
     return prob, f"metar:{station}"
 
 
-def _sigma_for_hours(hours_left: float) -> float:
-    """Compute uncertainty sigma based on hours remaining in settlement day.
+_METAR_RESIDUAL_SIGMA_KEY_PREFIX: str = "weather_metar_residual_sigma_"
 
-    v2 (2026-04-24): 3-4x larger than original. Prior σ=0.3-2°F created
-    over-confident near-threshold pricing. Aligns with weather_quoter.py.
+
+def _get_learned_residual_sigma(
+    station: Optional[str], lst_hour: Optional[int],
+) -> Optional[float]:
+    """Look up empirically-fit per-(station, LST hour) residual σ from
+    kv_cache. Returns None when the cell isn't fit (cold start or thin
+    sample) so the caller falls back to the hardcoded schedule.
+
+    The fit comes from
+    ``bot.learning.weather_mos_materializer.fit_and_persist_metar_residual_sigma``
+    which measures std of (eventual_daily_high − running_max_at_hour_h)
+    across the hourly METAR backfill for each station.
     """
+    if station is None or lst_hour is None:
+        return None
+    try:
+        conn = get_connection()
+    except RuntimeError:
+        return None
+    key = f"{_METAR_RESIDUAL_SIGMA_KEY_PREFIX}{station}_{int(lst_hour)}"
+    try:
+        payload = kv_get(conn, key)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    sigma = payload.get("sigma")
+    if not isinstance(sigma, (int, float)):
+        return None
+    sigma_f = float(sigma)
+    if not (0.1 <= sigma_f <= 15.0):
+        return None
+    return sigma_f
+
+
+def _sigma_for_hours(
+    hours_left: float,
+    station: Optional[str] = None,
+    lst_hour: Optional[int] = None,
+) -> float:
+    """Compute uncertainty σ for METAR's Gaussian.
+
+    Reads per-(station, LST hour) learned residual σ from kv_cache when
+    both are supplied — that's the empirical std of
+    (eventual_daily_high − running_max_at_hour_h), the right quantity for
+    a precision-weighted combine where METAR's mean is the running max.
+
+    Falls back to a hardcoded hours-remaining schedule when the learned
+    cell is missing (cold cache, thin samples, or station/hour not
+    supplied by the caller). The schedule is conservative — wide enough
+    that the fallback can't single-handedly produce overconfident quotes.
+    """
+    learned = _get_learned_residual_sigma(station, lst_hour)
+    if learned is not None:
+        return learned
+
     if hours_left <= 0:
         return 0.5
     elif hours_left < 1:

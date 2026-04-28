@@ -3207,7 +3207,59 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
     If adaptive_weights is provided (dict of source→weight), uses learned weights
     instead of static SOURCE_WEIGHTS. If calibration_corrections is provided,
     applies bias correction to the final ensemble output.
+
+    Weather short-circuit: when ``WEATHER_ENSEMBLE_V2`` is enabled and this is
+    a weather ticker, bypass the per-source probability collection and Platt
+    calibration entirely — call ``predict_v2`` directly. Reasoning:
+      * ``predict_v2`` produces a properly-combined Gaussian estimate with
+        per-city skill σ, MOS bias, group correlation discount, staleness
+        inflation, running-high truncation, and clamp.
+      * The probability-space combine in this function is lossier than v2's
+        Bayesian Gaussian combine.
+      * The Platt calibration was fit on historical v1 outputs and would
+        re-introduce a known bias if applied to v2. Skipping it is correct.
     """
+    from bot.config import WEATHER_ENSEMBLE_V2
+
+    ticker_upper = (ticker or "").upper()
+    is_weather_ticker = (
+        ticker_upper.startswith("KXHIGH")
+        or ticker_upper.startswith("KXHMONTHRANGE")
+        or ticker_upper.startswith("KXHURR")
+    )
+    if WEATHER_ENSEMBLE_V2 and is_weather_ticker and market_data is not None:
+        try:
+            from bot.signals.weather_ensemble_v2 import (
+                predict_v2,
+                _collect_gaussians,
+            )
+            v2_prob, v2_tag = predict_v2(ticker, market_data)
+            if v2_prob is not None:
+                # Source count: how many Gaussians actually fired. Used
+                # downstream by edge-threshold logic (more sources → smaller
+                # required edge). predict_v2's tag has the form
+                # "weather_ensemble_v2:hrrr+nbm+nws_point+weather+metar+madis+afd"
+                # so the contributor count is plus-separated tokens after the
+                # colon. Cap at the count of independent groups.
+                n_contributors = 1
+                if v2_tag and ":" in v2_tag:
+                    contributor_tokens = v2_tag.split(":", 1)[1].split("+")
+                    n_contributors = max(1, len(contributor_tokens))
+                # Treat HRRR/NBM/Open-Meteo as one effective group (group ρ
+                # is 1.0 in the model-correlation kv). So the number of
+                # *independent* opinions feeding v2 is at most:
+                #   model_group(1) + nws_point + metar + madis + afd → up to 5.
+                # Cap to that so a downstream "n_sources >= 3" gate doesn't
+                # treat the three correlated models as three separate votes.
+                n_independent = min(n_contributors, 5)
+                print(f"[weather_v2] {ticker} → p={v2_prob:.3f} via {v2_tag}")
+                return v2_prob, v2_tag, n_independent
+        except Exception as exc:
+            # Fall through to v1 path on any failure — never leave the caller
+            # without an estimate.
+            print(f"[weather_v2] {ticker} predict_v2 raised "
+                  f"{type(exc).__name__}: {exc}; falling back to v1")
+
     weights = adaptive_weights if adaptive_weights else SOURCE_WEIGHTS
     estimates = []  # list of (prob, weight, source_name)
 
@@ -3392,21 +3444,28 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
         base = s.split(":")[0] if ":" in s else s.split("_")[0]
         source_names.add(base.lower())
 
-    # Count effective sources: each correlated group counts as 1 effective source
-    claimed_by_group = set()
-    n_effective = 0.0
-    for group_name, group_members in _CORRELATED_GROUPS.items():
-        overlap = source_names & group_members
-        if len(overlap) >= 2:
-            # Multiple correlated sources → count as 1.0 (no bonus for correlated data)
-            n_effective += 1.0
-            claimed_by_group |= overlap
-        elif len(overlap) == 1:
-            n_effective += 1.0
-            claimed_by_group |= overlap
-    # Add ungrouped sources at full weight
-    ungrouped = source_names - claimed_by_group
-    n_effective += len(ungrouped)
+    # Count effective sources: each correlated group counts as 1 effective source.
+    # Use canonical "claim by first matching group" semantics from
+    # bot.signals.ensemble._compute_n_effective — a source that appears in
+    # multiple groups (e.g. `fred` ∈ cpi ∩ fed) must be counted ONCE, not N
+    # times. Old in-line loop here had the same double-count bug fixed in
+    # commit adf884d for bot/signals/ensemble.py but never propagated to this
+    # local copy. CLAUDE.md Known Bug Pattern #9.
+    try:
+        from bot.signals.ensemble import _compute_n_effective
+        n_effective = _compute_n_effective(source_names, _CORRELATED_GROUPS)
+    except Exception:
+        # Fallback: inline the same algorithm so a future import-time failure
+        # never reverts to the buggy double-count behavior.
+        claimed = set()
+        n_effective = 0.0
+        for _, group_members in _CORRELATED_GROUPS.items():
+            overlap = (source_names & group_members) - claimed
+            if overlap:
+                n_effective += 1.0
+                claimed |= overlap
+        ungrouped = source_names - claimed
+        n_effective += len(ungrouped)
 
     n_sources = max(1, round(n_effective))  # integer for backward compat
 

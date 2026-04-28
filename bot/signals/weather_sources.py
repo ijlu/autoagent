@@ -21,7 +21,7 @@ from __future__ import annotations
 HRRR: str = "hrrr"
 NBM: str = "nbm"
 NWS_POINT: str = "nws_point"
-TOMORROW: str = "tomorrow"
+TOMORROW: str = "tomorrow"  # 2026-04-26: dropped from live ensemble (TOS storage clause + reanalysis-only history). Constant kept so any historical kv_cache row referencing it is still recognised by readers; not a member of CANONICAL_WEATHER_SOURCES.
 WEATHER: str = "weather"  # Open-Meteo (kept "weather" to match live source_name)
 METAR: str = "metar"
 MADIS: str = "madis"
@@ -29,8 +29,10 @@ AFD: str = "afd"  # treated as a Gaussian via base + parsed_shift in v1
 
 
 # Order is irrelevant; treat as a set.
+# 2026-04-26: TOMORROW removed (see constant note). Re-add only if the source
+# is wired back into _collect_gaussians AND a TOS-clean storage path exists.
 CANONICAL_WEATHER_SOURCES: frozenset[str] = frozenset({
-    HRRR, NBM, NWS_POINT, TOMORROW, WEATHER, METAR, MADIS, AFD,
+    HRRR, NBM, NWS_POINT, WEATHER, METAR, MADIS, AFD,
 })
 
 
@@ -39,7 +41,7 @@ CANONICAL_WEATHER_SOURCES: frozenset[str] = frozenset({
 # as an independent Gaussian (today). If/when AFD becomes a full Gaussian
 # this set should expand and the comment should be updated.
 GAUSSIAN_COMBINE_SOURCES: frozenset[str] = frozenset({
-    HRRR, NBM, NWS_POINT, TOMORROW, WEATHER, METAR, MADIS,
+    HRRR, NBM, NWS_POINT, WEATHER, METAR, MADIS,
 })
 
 

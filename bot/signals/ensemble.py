@@ -229,8 +229,51 @@ def get_independent_estimate(
     estimates = []
     _disabled = disabled_sources or set()
 
-    # ── Family router short-circuit ──
-    # KXHIGH / KXHMONTHRANGE / KXHURR → weather_ensemble (9-source Bayesian combiner)
+    # ── Weather v2 short-circuit (overrides the family router below) ──
+    # When WEATHER_ENSEMBLE_V2 is enabled and this is a weather ticker, call
+    # predict_v2 directly. v2 produces a properly-combined Gaussian estimate
+    # with per-city skill σ, MOS bias, group correlation discount, staleness
+    # inflation, running-high truncation, and clamp — strictly better than
+    # the v1 family-router probability-space combine for weather. Platt
+    # calibration is intentionally bypassed (v2 doesn't need it; the curve
+    # was fit on v1 outputs and would re-introduce known biases).
+    try:
+        from bot.config import WEATHER_ENSEMBLE_V2
+    except ImportError:
+        WEATHER_ENSEMBLE_V2 = False
+    ticker_upper = (ticker or "").upper()
+    is_weather_ticker = (
+        ticker_upper.startswith("KXHIGH")
+        or ticker_upper.startswith("KXHMONTHRANGE")
+        or ticker_upper.startswith("KXHURR")
+    )
+    if (
+        WEATHER_ENSEMBLE_V2
+        and is_weather_ticker
+        and market_data is not None
+        and "weather_ensemble" not in _disabled
+    ):
+        try:
+            from bot.signals.weather_ensemble_v2 import predict_v2
+            v2_prob, v2_tag = predict_v2(ticker, market_data)
+            if v2_prob is not None:
+                # Same source-count convention as in trade.py: cap at 5
+                # independent groups so the three correlated model sources
+                # don't masquerade as three votes.
+                n_contributors = 1
+                if v2_tag and ":" in v2_tag:
+                    n_contributors = max(1, len(v2_tag.split(":", 1)[1].split("+")))
+                pipeline_track_attempt("weather_ensemble_v2")
+                pipeline_track_result("weather_ensemble_v2", True, 0.0)
+                final = max(0.02, min(0.98, float(v2_prob)))
+                print(f"[ensemble] weather_v2 → {final:.3f} ({v2_tag})")
+                return final, v2_tag, min(n_contributors, 5)
+        except Exception as exc:
+            print(f"[ensemble] weather_v2 raised "
+                  f"{type(exc).__name__}: {exc}; falling back to family router")
+
+    # ── Family router short-circuit (legacy path; only reached when v2 is
+    # disabled, the ticker isn't weather, or v2 returned None / raised) ──
     # KXJOB → ADP lead indicator; KXGDP → GDPNow; KXCPI → commodity-basket model.
     # The router output is purpose-built for the family — generic sources either
     # duplicate what the router already combined (weather) or don't answer the

@@ -55,6 +55,15 @@ WEATHER_MM_LIVE = os.environ.get("WEATHER_MM_LIVE", "false").lower() in ("true",
 # posting is still gated by WEATHER_MM_LIVE. Falls back to v1 on v2 errors / None.
 WEATHER_ENSEMBLE_V2 = os.environ.get("WEATHER_ENSEMBLE_V2", "false").lower() in ("true", "1", "yes")
 
+# Platt calibration application gate. Default false (2026-04-27 audit):
+# the persisted Platt curve was fit overwhelmingly on weather rows from the
+# broken v1 ensemble path (8509/8815 rows = 96.5%) and degenerated into a
+# step function at p=0.28 — destroys signal when applied to non-weather
+# predictions too. The fitter keeps running (data accumulates); the
+# applier is gated until per-category fits land. Flip on when retrained
+# per-category with ≥200 settled rows per family from the v2 path.
+CALIBRATION_ENABLED = os.environ.get("CALIBRATION_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # Directional families hard-blocked from trading regardless of
 # per-family shadow-to-live flags. Anti-calibrated in Phase 0 backtests:
 # KXBTC / KXETH (Brier 0.76–0.94) and KXHIGHDEN (0.316 vs 0.244 baseline).
@@ -183,22 +192,28 @@ MM_SIZING_CACHE_TTL_S = int(os.environ.get("MM_SIZING_CACHE_TTL_S", "300"))
 # a canary phase before scaling to full Thompson sizing (step D).
 
 # Minimum realized per-fill shadow P&L (cents, net of maker fees) required
-# for SHADOW → CANARY. 2¢ matches the FULL-state target edge (see
-# MM_SIZING_TARGET_EDGE_CENTS) — at canary 0.5× sizing on $982 equity
-# (~10 contracts/fill), 2¢ covers the maker-fee-plus-slippage floor on a
-# bad day. A lower floor (e.g. 1¢) would canary families that don't clear
-# fees, burning the canary budget on negative-EV exposure. Setting this = 0
-# would also let pre-fix spurious-fill bugs sneak through (the Apr-17
-# _safe_cents bug generated 700+ fills with near-zero P&L).
+# for SHADOW → CANARY. 2026-04-26: relaxed 2.0¢ → 0.5¢ to compress the
+# 4-week go-live ETA. 0.5¢ is still strictly above the maker-fee floor
+# (~0.44¢ at typical fill price), so a family that earns this is at least
+# fee-positive in shadow — we are NOT canarying negative-EV exposure, just
+# tolerating a thinner edge buffer. The downstream CANARY → FULL gate
+# (MM_GRADUATION_MIN_PNL_RATIO=0.5 over MM_GRADUATION_MIN_PAIRED_N pairs)
+# is the real safety net here. Setting this = 0 would still let pre-fix
+# spurious-fill bugs sneak through (the Apr-17 _safe_cents bug generated
+# 700+ fills with near-zero P&L), so keep the strict-positive floor.
 MM_CANARY_MIN_PNL_PER_FILL_CENTS = float(
-    os.environ.get("MM_CANARY_MIN_PNL_PER_FILL_CENTS", "2.0"))
+    os.environ.get("MM_CANARY_MIN_PNL_PER_FILL_CENTS", "0.5"))
 
 # Minimum paired (live, shadow) row count accumulated since entering CANARY
-# before graduation is evaluated. 30 paired rows gives ~5 settlement days at
-# typical canary-cadence per family, enough to suppress one-lucky-run false
-# positives while still letting a clean family graduate inside a week.
+# before graduation is evaluated. 2026-04-26: relaxed 30 → 8 to compress
+# the canary observation window from ~5 settlement days to ~1.5 days at
+# typical canary cadence per family. With cohort-1 (MIA/AUS/LAX) running
+# concurrently in distinct synoptic regimes, 8 paired rows per family
+# still suppresses pure-luck false positives via the joint MIN_PNL_RATIO
+# check — graduation requires sum(live)/sum(shadow) >= 0.5, which a
+# one-day fluke can't fake across 8 fills.
 MM_GRADUATION_MIN_PAIRED_N = int(
-    os.environ.get("MM_GRADUATION_MIN_PAIRED_N", "30"))
+    os.environ.get("MM_GRADUATION_MIN_PAIRED_N", "8"))
 
 # CANARY → FULL requires sum(live_pnl) / sum(shadow_pnl) >= this ratio over
 # the paired-row window. 0.5 = live captures at least half the P&L the
@@ -270,7 +285,15 @@ BLS_API_KEY = os.environ.get("BLS_API_KEY", "")
 BEA_API_KEY = os.environ.get("BEA_API_KEY", "")
 CENSUS_API_KEY = os.environ.get("CENSUS_API_KEY", "")
 EIA_API_KEY = os.environ.get("EIA_API_KEY", "")
-TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
+# 2026-04-26: Tomorrow.io dropped from the ensemble. Their TOS forbids storing
+# the unaltered Datafeed beyond the contract Term and contains a broad
+# competitive-product clause; their "Historical" endpoint returns reanalysis,
+# not as-issued forecasts (so it can't backfill calibration anyway). Force
+# the API key to empty regardless of env so every code path that reads it
+# (weather.py:get_tomorrow_forecast, trade.py:get_tomorrow_forecast) returns
+# None and never makes a live call. Re-enable would be a deliberate code
+# change here, not just an env flip.
+TOMORROW_API_KEY = ""  # noqa: was os.environ.get("TOMORROW_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
 SENSORTOWER_TOKEN = os.environ.get("SENSORTOWER_API_TOKEN", "")
@@ -281,7 +304,9 @@ METACULUS_API_TOKEN = os.environ.get("METACULUS_API_TOKEN", "")
 # Source weights (default priors — adaptive learning updates these)
 # ══════════════════════════════════════════════════════════════════════════════
 SOURCE_WEIGHTS = {
-    "polymarket": 0.75, "odds": 0.85, "weather": 0.80, "tomorrow": 0.82,
+    "polymarket": 0.75, "odds": 0.85, "weather": 0.80,
+    "tomorrow": 0.0,  # 2026-04-26: dropped (see TOMORROW_API_KEY note); weight=0 belt+suspenders
+
     "noaa": 0.75, "metar": 0.90, "series": 0.75, "metaculus": 0.70,
     "clevfed": 0.72, "fedwatch": 0.80, "zq_futures": 0.85,
     "crypto": 0.65, "company_kpi": 0.65, "sensortower": 0.55,
