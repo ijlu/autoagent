@@ -1036,6 +1036,150 @@ def fetch_metar_hourly(
     return out
 
 
+# ── CF6 (NWS Climatological Daily Report) ────────────────────────────
+#
+# Kalshi settles every weather market on the NWS Daily Climatological
+# Report (CF6 form), not raw METAR tmpf max — confirmed 2026-04-28 via
+# tools/validate_cf6_hypothesis.py against the 4 catastrophic Miami cases.
+# CF6's TMAX field captures inter-observation peaks (continuous ASOS
+# tracking), which can be 1-3°F above the max-of-hourly-tmpf we used to
+# derive daily_high_f. Training the ensemble on tmpf max produced a
+# systematic cold bias matching the live-shadow Brier gap.
+#
+# CF6 products are issued daily by the NWS WFO that owns each ASOS
+# station. The product PIL is "CF6" + the 3-letter station ID (e.g.,
+# CF6MIA for Miami International). One product covers the whole month;
+# fetching the latest issue of any month gives the full month's TMAX.
+
+import re as _cf6_re
+
+_AFOS_URL: str = "https://mesonet.agron.iastate.edu/cgi-bin/afos/retrieve.py"
+
+# Station ICAO → CF6 PIL. Naming is ICAO-suffix + "CF6" prefix for most
+# stations, with the New York exception (Central Park is KNYC; product
+# is CF6NYC, not CF6CP).
+_CF6_PIL_BY_STATION: dict[str, str] = {
+    "KNYC": "CF6NYC",
+    "KMDW": "CF6MDW",
+    "KMIA": "CF6MIA",
+    "KLAX": "CF6LAX",
+    "KAUS": "CF6AUS",
+    "KDEN": "CF6DEN",
+}
+
+
+def _parse_cf6_daily_max(body: str) -> dict[int, int]:
+    """Extract ``{day_of_month: tmax_F}`` from a CF6 product body.
+
+    The CF6 daily-rows table starts after a header line containing
+    ``DY MAX MIN``. Data rows are leading-whitespace + 1-2 digit day
+    + 1-3 digit max temp. Summary rows ('SM', 'AV') and end-of-page
+    boilerplate don't match the day-row regex and are silently skipped.
+    """
+    out: dict[int, int] = {}
+    in_table = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not in_table:
+            if (stripped.startswith("DY ") and "MAX" in stripped
+                    and "MIN" in stripped):
+                in_table = True
+            continue
+        m = _cf6_re.match(r"^\s*(\d{1,2})\s+(\d{1,3}|M|-)\s+", line)
+        if not m:
+            if out and stripped.startswith((
+                "AVERAGE MONTHLY", "DPTR FM NORMAL", "HIGHEST", "LOWEST",
+                "TOTAL FOR MONTH", "[TEMPERATURE", "[PRESSURE",
+            )):
+                break
+            continue
+        try:
+            day = int(m.group(1))
+            if not (1 <= day <= 31):
+                continue
+            tmax_raw = m.group(2)
+            if tmax_raw in ("M", "-"):
+                continue
+            tmax = int(tmax_raw)
+            if -60 <= tmax <= 140:
+                out[day] = tmax
+        except ValueError:
+            continue
+    return out
+
+
+def fetch_cf6_tmax(
+    station_icao: str, year: int, month: int,
+    *, session: Optional[requests.Session] = None,
+) -> dict[int, int]:
+    """Fetch CF6 daily TMAX values from IEM's AFOS archive for the given
+    (station, year, month). Returns ``{day_of_month: tmax_F}``.
+
+    Empty dict on missing PIL mapping, missing product, or unparseable
+    response — caller decides whether absence is fatal.
+    """
+    pil = _CF6_PIL_BY_STATION.get(station_icao.upper())
+    if pil is None:
+        return {}
+
+    # Query a date a few days into the next month so the response covers
+    # all days of the target month (CF6 is issued daily; the latest issue
+    # before our `e` cutoff has the full month-to-date table).
+    cutoff = datetime(year, month, 28, tzinfo=timezone.utc) + timedelta(days=10)
+    end_iso = cutoff.strftime("%Y-%m-%dT%H:%MZ")
+
+    sess = session or requests
+    params = {"pil": pil, "limit": "1", "e": end_iso}
+    try:
+        r = sess.get(
+            _AFOS_URL, params=params, timeout=30,
+            headers={"User-Agent": _USER_AGENT},
+        )
+    except requests.RequestException:
+        return {}
+    if r.status_code != 200 or not r.text:
+        return {}
+    return _parse_cf6_daily_max(r.text)
+
+
+def update_daily_high_from_cf6(
+    conn: sqlite3.Connection,
+    station_icao: str,
+    year: int,
+    month: int,
+    *,
+    session: Optional[requests.Session] = None,
+) -> int:
+    """Fetch CF6 TMAX for (station, year, month) and update every
+    weather_metar_hourly_backfill row of that (station, lst_date) with
+    the correct daily_high_f. Returns the number of distinct days
+    overwritten (= number of CF6 day-rows applied).
+
+    No-op when CF6 returns nothing for the period (network failure,
+    out-of-archive month). Idempotent — running daily writes the same
+    value when the CF6 doesn't change.
+    """
+    daily_max = fetch_cf6_tmax(station_icao, year, month, session=session)
+    if not daily_max:
+        return 0
+
+    rows = [
+        (float(tmax), station_icao, f"{year:04d}-{month:02d}-{day:02d}")
+        for day, tmax in daily_max.items()
+    ]
+
+    def _do(c):
+        c.executemany(
+            "UPDATE weather_metar_hourly_backfill "
+            "SET daily_high_f = ? "
+            "WHERE station = ? AND lst_date = ?",
+            rows,
+        )
+
+    db_write(_do, conn=conn)
+    return len(rows)
+
+
 def replay_hourly_and_write(
     conn: sqlite3.Connection,
     station: WeatherStation,

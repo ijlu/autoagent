@@ -40,7 +40,9 @@ StartLimitIntervalSec=600
 StartLimitBurst=10
 
 # Give the scheduler time to run its on_stop hooks on SIGTERM.
-TimeoutStopSec=30
+# mos_materializer can take ~300s; set well above that so redeploys
+# don't get force-killed mid-task.
+TimeoutStopSec=360
 
 # Environment
 EnvironmentFile=/home/kalshi/autoagent/.env

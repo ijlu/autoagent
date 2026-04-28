@@ -1219,3 +1219,118 @@ def test_report_mos_bias_renders_with_fit():
     assert "hrrr" in out
     assert "nyc" in out
     assert "+1.50" in out
+
+
+# ── CF6 (NWS Climatological Daily Report) parser ────────────────────────
+
+# Real CF6MIA body fetched 2026-04-28T18:13Z. Trimmed to keep the test
+# fixture compact while preserving the exact whitespace/format the parser
+# has to handle: header line, '====' separator, daily data rows with
+# varying widths, the '== / SM / AV' summary block, and the page-2
+# boilerplate. If IEM ever changes the CF6 format, this test fails
+# loudly before the daily backfill silently writes wrong daily_high_f.
+_CF6MIA_FIXTURE = """\
+
+582 
+CXUS52 KMFL 281030
+CF6MIA
+PRELIMINARY LOCAL CLIMATOLOGICAL DATA (WS FORM: F-6)
+
+                                          STATION:   MIAMI
+                                          MONTH:     APRIL
+                                          YEAR:      2026
+                                          LATITUDE:   25 49 N      
+                                          LONGITUDE:  80 17 W    
+
+  TEMPERATURE IN F:       :PCPN:    SNOW:  WIND      :SUNSHINE: SKY     :PK WND 
+================================================================================
+1   2   3   4   5  6A  6B    7    8   9   10  11  12  13   14  15   16   17  18
+                                     12Z  AVG MX 2MIN
+DY MAX MIN AVG DEP HDD CDD  WTR  SNW DPTH SPD SPD DIR MIN PSBL S-S WX    SPD DR
+================================================================================
+
+ 1  80  71  76   1   0  11 0.03  0.0    0 11.8 21 100   M    M   5 1      27 100
+ 2  83  72  78   3   0  13 0.07  0.0    0 13.7 23 110   M    M   7 138    33 140
+22  81  71  76  -2   0  11 0.00  0.0    0 14.0 23  90   M    M   5        32  80
+23  79  71  75  -3   0  10    T  0.0    0  9.6 20 100   M    M   7        26 140
+24  84  70  77  -1   0  12 0.00  0.0    0  8.8 17 110   M    M   8        32 130
+25  85  71  78   0   0  13 0.00  0.0    0  7.2 16 110   M    M   3        24 140
+================================================================================
+SM 2246 1929         0 337  3.32  0.0    274.5          M      154              
+================================================================================
+AV 83.2 71.4                              10.6 FASTST   M    M   6    MAX(MPH)  
+                                 MISC ---->    26 100                 41  90   
+================================================================================
+
+PRELIMINARY LOCAL CLIMATOLOGICAL DATA (WS FORM: F-6) , PAGE 2
+
+[TEMPERATURE DATA]      [PRECIPITATION DATA]       SYMBOLS USED IN COLUMN 16    
+
+AVERAGE MONTHLY: 77.3   TOTAL FOR MONTH:   3.32    1 = FOG OR MIST              
+"""
+
+
+def test_cf6_parser_extracts_tmax_per_day():
+    """Verify the parser reads TMAX from the CF6 daily-rows table for a
+    representative real-world CF6MIA body. Specifically confirms the
+    4 catastrophe-day TMAX values that drove the source-of-truth audit:
+    4/22=81, 4/23=79, 4/24=84, 4/25=85 — every one inside the bracket
+    Kalshi settled on those days."""
+    out = bf._parse_cf6_daily_max(_CF6MIA_FIXTURE)
+    assert out[1] == 80
+    assert out[2] == 83
+    assert out[22] == 81
+    assert out[23] == 79
+    assert out[24] == 84
+    assert out[25] == 85
+    # SM/AV summary rows must NOT be parsed as days (they don't start
+    # with a day-of-month integer; the regex is the only line filter).
+    assert 0 not in out
+    assert all(1 <= d <= 31 for d in out.keys())
+
+
+def test_cf6_parser_skips_missing_tmax():
+    body = (
+        "DY MAX MIN AVG DEP HDD CDD\n"
+        "================\n"
+        " 1  80  68  74   1   0   9\n"
+        " 2   M  68  74   1   0   9\n"
+        " 3   -  68  74   1   0   9\n"
+        " 4  82  68  75   1   0  10\n"
+    )
+    out = bf._parse_cf6_daily_max(body)
+    assert out == {1: 80, 4: 82}
+
+
+def test_cf6_parser_handles_pre_table_garbage():
+    """The CF6 product preamble (WMO header, station block) must not
+    accidentally match the day-row regex before the parser locks onto
+    the table."""
+    body = (
+        "582\n"
+        "CXUS52 KMFL 281030\n"
+        "STATION:   MIAMI\n"
+        "MONTH:     APRIL\n"
+        "DY MAX MIN AVG\n"
+        "================\n"
+        " 7  84  69  77\n"
+    )
+    out = bf._parse_cf6_daily_max(body)
+    assert out == {7: 84}
+
+
+def test_cf6_pil_map_covers_all_kalshi_weather_stations():
+    """Drift-guard: every primary station in STATION_BY_SERIES (where
+    series starts with KXHIGH) must have a CF6 PIL mapping. Adding a
+    new weather city to the bot without a CF6 entry would silently
+    leave that city's daily_high_f at the wrong tmpf-derived value."""
+    from bot.daemon.stations import STATION_BY_SERIES
+    weather_icaos = {
+        ws.icao for series, ws in STATION_BY_SERIES.items()
+        if series.startswith("KXHIGH")
+    }
+    missing = weather_icaos - bf._CF6_PIL_BY_STATION.keys()
+    assert not missing, (
+        f"primary stations without CF6 PIL: {missing}; add to "
+        f"_CF6_PIL_BY_STATION or daily_high_f will be uncorrected"
+    )

@@ -204,6 +204,35 @@ def _replay_predict_v2(
     if not gaussians:
         return None
 
+    # Apply the same per-source calibration corrections that
+    # v2._collect_gaussians applies in production. The monkey-patch
+    # below replaces _collect_gaussians wholesale; without doing the
+    # corrections here, the replay would skip _apply_learned_sigma,
+    # _apply_staleness_inflation, _apply_mos_bias, and the σ ceiling —
+    # i.e., we'd be measuring the combine + projection math against raw
+    # source priors, not what production actually does. The docstring
+    # promised "σ, bias, staleness... reflects today's code + current
+    # kv values" but the implementation diverged. Fixed 2026-04-28.
+    city_key = v2._city_for_ticker(ticker)
+    corrected: list[GaussianForecast] = []
+    for g in gaussians:
+        try:
+            g = v2._apply_learned_sigma(g, city_key=city_key)
+        except Exception:
+            pass
+        try:
+            g = v2._apply_staleness_inflation(g)
+        except Exception:
+            pass
+        try:
+            g = v2._apply_mos_bias(g, city_key)
+        except Exception:
+            pass
+        if g.sigma_f > v2._SOURCE_SIGMA_CEILING_F:
+            g = g.with_sigma(v2._SOURCE_SIGMA_CEILING_F)
+        corrected.append(g)
+    gaussians = corrected
+
     # Optional: fetch historical ECMWF for this (city, settle_date) and
     # add it as an additional source. ECMWF is genuinely independent from
     # Open-Meteo's gfs_seamless / gfs_hrrr (which we discovered are

@@ -29,6 +29,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from bot.config import WEATHER_MM_LIVE
@@ -145,6 +146,22 @@ SETTLEMENT_BACKFILL_INTERVAL_S = 600
 # tick after a 13h outage backfills cleanly. One IEM fetch per (city, date)
 # pair, ~6 cities × 1 date = ~6 HTTP calls per tick worst case.
 MOS_MATERIALIZE_INTERVAL_S = 3600
+
+# Daily IEM hourly METAR backfill. Walks the past 7 days for every primary
+# station and writes one row per (station, lst_date, lst_hour) into
+# weather_metar_hourly_backfill. The downstream fitters (METAR residual σ,
+# MOS bias, skill σ) all read this table on the mos_materializer tick — so
+# stale data here means stale ensemble calibration. Discovered missing on
+# 2026-04-28: the only writer was the standalone tool
+# tools/backfill_weather_effective_n.replay_hourly_and_write, last invoked
+# manually on 4/22 and never since. The 7-day rolling window is defensive:
+# any single-day IEM hiccup heals next tick, and any LST timezone-edge
+# lag (PDT not yet complete at the trigger hour) self-resolves the
+# following day. Idempotent INSERT OR REPLACE on (station, lst_date,
+# lst_hour) keeps the overlap free.
+HOURLY_BACKFILL_INTERVAL_S = 86400         # 24 hours
+HOURLY_BACKFILL_LOOKBACK_DAYS = 7
+HOURLY_BACKFILL_TARGET_HOUR_UTC = 6        # 02:00 EDT, 23:00 PDT prior day
 
 # Daily series-discovery sweep. Looks at /events?status=open, finds
 # series_tickers that match a routable prefix (weather + macro families)
@@ -267,6 +284,97 @@ def _run_fills_validator(conn) -> None:
         send_alert(text, level="warning")
     else:
         logger.info(text)
+
+
+def _seconds_until_utc_hour(target_hour: int) -> float:
+    """Seconds from now until the next ``target_hour:00:00`` UTC. Used to
+    align a daily scheduler task to a wall-clock hour rather than to
+    daemon start time, so restarts don't drift the cadence."""
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+def _run_hourly_backfill(conn) -> None:
+    """Daily IEM hourly-METAR backfill + CF6 daily-high refresh.
+
+    Two-stage:
+
+    1. Pull hourly tmpf from IEM's ASOS archive for the past 7 days,
+       writing one row per (station, lst_date, lst_hour) into
+       ``weather_metar_hourly_backfill``. Sets ``daily_high_f`` to the
+       max tmpf seen across hourly cells — a placeholder we overwrite
+       in stage 2.
+    2. Fetch the NWS CF6 (Climatological Daily Report) for each
+       station's current and previous calendar month, and overwrite
+       ``daily_high_f`` with the official TMAX value. Kalshi settles
+       weather markets on CF6 TMAX (confirmed 2026-04-28), which
+       captures peaks between hourly observations. Without this step
+       our calibration trains on tmpf max — systematically 1-3°F cold
+       relative to settlement, the largest single contributor to the
+       weather Brier gap.
+
+    See HOURLY_BACKFILL_INTERVAL_S comment block for scheduling rationale.
+    """
+    from bot.daemon.stations import STATIONS
+    from tools.backfill_weather_effective_n import (
+        replay_hourly_and_write,
+        update_daily_high_from_cf6,
+    )
+
+    today = datetime.now(timezone.utc).date()
+    end_date = today.strftime("%Y-%m-%d")
+    start_date = (
+        today - timedelta(days=HOURLY_BACKFILL_LOOKBACK_DAYS)
+    ).strftime("%Y-%m-%d")
+
+    # ── Stage 1: hourly tmpf into weather_metar_hourly_backfill ──
+    total_rows = 0
+    failures: list[str] = []
+    for icao, station in STATIONS.items():
+        try:
+            n = replay_hourly_and_write(conn, station, start_date, end_date)
+            total_rows += n
+        except Exception as exc:
+            logger.warning(
+                "[hourly_backfill] %s [%s..%s] failed: %s",
+                icao, start_date, end_date, exc,
+            )
+            failures.append(icao)
+
+    # ── Stage 2: CF6 TMAX overwrites the per-row daily_high_f ──
+    # Walk current + previous calendar month per station. Two months
+    # covers any month-boundary edge case (running 06:00 UTC on the 1st
+    # might still need yesterday's CF6 from the prior month).
+    cf6_updated = 0
+    cf6_failures: list[str] = []
+    months = []
+    cur_first = today.replace(day=1)
+    months.append((cur_first.year, cur_first.month))
+    prev_last = cur_first - timedelta(days=1)
+    months.append((prev_last.year, prev_last.month))
+    for icao in STATIONS:
+        for year, month in months:
+            try:
+                n = update_daily_high_from_cf6(conn, icao, year, month)
+                cf6_updated += n
+            except Exception as exc:
+                logger.warning(
+                    "[hourly_backfill] CF6 %s %04d-%02d failed: %s",
+                    icao, year, month, exc,
+                )
+                cf6_failures.append(f"{icao}:{year}-{month:02d}")
+
+    logger.info(
+        "[hourly_backfill] window=[%s..%s] stations=%d hourly_rows=%d "
+        "cf6_days_updated=%d failures_hourly=%d failures_cf6=%d%s%s",
+        start_date, end_date, len(STATIONS), total_rows, cf6_updated,
+        len(failures), len(cf6_failures),
+        f" failed_stations={','.join(failures)}" if failures else "",
+        f" failed_cf6={','.join(cf6_failures)}" if cf6_failures else "",
+    )
 
 
 def _run_mos_materializer(conn) -> None:
@@ -801,6 +909,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         initial_delay_s=180.0,
     )
     scheduler.register(
+        "hourly_backfill",
+        lambda: _run_hourly_backfill(conn),
+        interval_s=HOURLY_BACKFILL_INTERVAL_S,
+        # Align first fire to 06:00 UTC. After that, runs once per day at
+        # the same wall-clock hour regardless of daemon restarts.
+        initial_delay_s=_seconds_until_utc_hour(
+            HOURLY_BACKFILL_TARGET_HOUR_UTC
+        ),
+    )
+    scheduler.register(
         "mos_materializer",
         lambda: _run_mos_materializer(conn),
         interval_s=MOS_MATERIALIZE_INTERVAL_S,
@@ -853,6 +971,24 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Start pollers on scheduler start, stop them on scheduler stop.
     def start_pollers():
+        # Prime the forecast cache synchronously *before* pollers begin
+        # emitting events. Without this, the first METAR change for each
+        # station fires before the forecast_refresh task's initial_delay
+        # window closes — every restart produces N "no forecast for
+        # K[STATION]; fallback X°F" warnings (one per primary station)
+        # while the WeatherChangeHandler falls back to the synthetic
+        # running_high + delta. Across the rotated logs we counted exactly
+        # 40 such warnings per station — uniform, restart-correlated.
+        # Fallback path is correct but suboptimal: WeatherQuoter prices
+        # against running_high + 4°F instead of the model forecast for
+        # those first ~15 seconds. Synchronous prime costs ~3s of startup
+        # and eliminates the race. Failures don't block — daemon proceeds
+        # with an empty cache, same as today's behavior.
+        try:
+            n = forecast_cache.refresh()
+            logger.info("[daemon] forecast cache primed (%d stations)", n)
+        except Exception as exc:
+            logger.warning("[daemon] forecast cache prime failed: %s", exc)
         for p in pollers:
             p.start()
     def stop_pollers():

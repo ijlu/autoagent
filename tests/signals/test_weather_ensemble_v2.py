@@ -713,6 +713,70 @@ def test_predict_v2_floor_lifts_prob_when_forecasts_below_observation(memdb, mon
     assert p > 0.5, f"floor should lift prob above 0.5 (threshold 75), got {p:.3f}"
 
 
+def test_predict_v2_truncation_skipped_when_forecast_agrees_with_metar(memdb, monkeypatch):
+    """H3 conditional truncation (shipped 2026-04-29 alongside the CF6
+    ground-truth fix). When combined.μ ≥ METAR.μ - 0.5°F, projection
+    must run un-truncated so we don't double-count the running-high
+    constraint that step 4c already enforced via mean shift.
+
+    Pre-fix behavior: truncation fires unconditionally → P(in bracket)
+    gets renormalized by 1/p_above_t ≈ 2 when combined.μ ≈ METAR.μ →
+    we hit the 0.995 clamp on whichever bracket holds the centred μ.
+    On boundary-bracket cases that's wrong half the time and Brier
+    explodes (post-CF6 sweep, n=143: −0.034 on KXHIGHMIA pooled with
+    truncation off vs on).
+
+    Setup: forecasts cluster at 75°F (the threshold), METAR also at 75°F.
+    Step 4c is a no-op (combined.μ ≈ METAR.μ). Threshold ticker T75 →
+    P(high > 75) starts ~0.5 from the centred Gaussian; with the H3
+    conditional, projection stays un-truncated and prob stays well
+    below the 0.995 clamp."""
+    gs = [
+        _g("hrrr",  mean_f=75.0, sigma_f=1.0),
+        _g("nbm",   mean_f=75.0, sigma_f=1.0),
+        _g("metar", mean_f=75.0, sigma_f=5.0),
+    ]
+    p, _ = _run_v2(memdb, monkeypatch, gs)
+    assert p < 0.9, (
+        f"truncation should be skipped when forecast ≈ observation; "
+        f"unexpected near-clamp prob {p:.3f} suggests over-amplification "
+        f"(H3 conditional regression — see comment at predict_v2 step 5)"
+    )
+
+
+def test_predict_v2_truncation_still_fires_when_forecast_below_observation(
+    memdb, monkeypatch,
+):
+    """H3 fix preserves the catastrophic-miss save. The path:
+       step 4c shifts combined.μ from below METAR.μ up to METAR.μ;
+       step 5 sees combined.μ == METAR.μ → truncation skipped (per H3).
+    The shifted combined.μ is what gives us a sane projection now —
+    asserting that prob is meaningfully above where the un-shifted
+    forecast (μ=70) would have placed it."""
+    gs = [
+        _g("hrrr",    mean_f=70.0, sigma_f=1.4),
+        _g("nbm",     mean_f=70.0, sigma_f=1.4),
+        _g("weather", mean_f=70.0, sigma_f=1.4),
+        _g("metar",   mean_f=75.5, sigma_f=5.0),
+    ]
+    p, _ = _run_v2(memdb, monkeypatch, gs)
+    # Step 4c lifts combined.μ to 75.5 → P(>75) > 0.5 from the lifted
+    # Gaussian alone, no truncation needed.
+    assert p > 0.5, (
+        f"catastrophic-miss save (forecast 70, METAR 75.5) should still "
+        f"produce P(>75) > 0.5 via step 4c shift; got {p:.3f}"
+    )
+
+
+def test_combined_sigma_floor_is_one():
+    """Pin the σ floor to its post-CF6 sweep optimum (1.0°F). Pre-CF6
+    we ran 0.5°F because cold-biased μ benefited from concentration on
+    the bracket nearest truth. Post-CF6 the sweep showed sigma_floor=1.0
+    gives +0.0025 pooled vs 0.5°F; 1.5°F over-spreads and gives -0.0042.
+    Lock the optimum so it doesn't accidentally drift back."""
+    assert v2._COMBINED_SIGMA_FLOOR_F == 1.0
+
+
 # ── Source staleness (B) ───────────────────────────────────────────────────
 
 def test_staleness_inflation_factor_zero_for_live_sources(memdb):

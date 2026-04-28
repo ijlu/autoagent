@@ -497,11 +497,15 @@ _MAX_AFD_SHIFT_ABS_F: float = 3.0
 _NOAA_LOGIT_WEIGHT: float = 0.5
 
 # σ floor applied to the combined Gaussian before bracket projection. See
-# the long comment at the call site (step 4d in predict_v2). 0.5°F is the
-# tightest σ at which we keep meaningful probability in the bracket
-# adjacent to our central μ — protects against catastrophic late-day
-# misallocation when μ is even slightly off the actual peak.
-_COMBINED_SIGMA_FLOOR_F: float = 0.5
+# the long comment at the call site (step 4d in predict_v2). 1.0°F is the
+# empirical optimum from the post-CF6 sweep (sigma_floor=1.0 gives
+# +0.0025 pooled improvement vs 0.5; 1.5 starts to over-spread). The
+# sweep with floor=0.5 sat right at the threshold of bracket-resolution
+# uncertainty for late-day predictions, where μ is locked to METAR's
+# running max and even small deviations from the true daily peak land
+# entirely in the wrong 1°F bucket. 1.0°F gives meaningful probability
+# in the adjacent bracket without over-spreading on the clear cases.
+_COMBINED_SIGMA_FLOOR_F: float = 1.0
 
 
 def _logit(p: float) -> float:
@@ -846,15 +850,34 @@ def predict_v2(
         combined = combined.with_sigma(_COMBINED_SIGMA_FLOOR_F)
 
     # 5. Project combined Gaussian onto the market.
-    # Option C: pass METAR's μ as the truncation floor — left-truncates
-    # the forecast distribution at the running observed max, which is the
-    # correct physics. When forecasts disagreed wildly with observation,
-    # the renormalization sharpens the projection rather than producing
-    # impossible "below floor" probabilities.
+    # Option C (H3 conditional, 2026-04-29): only pass METAR's μ as the
+    # truncation floor when combined.μ is materially below the observed
+    # running max. Step 4c already shifts combined.μ up to METAR.μ in the
+    # forecast-disagrees-with-observation case, so by step 5 combined.μ ≥
+    # METAR.μ in every path where METAR is present. Applying truncation
+    # unconditionally then re-amplifies the residual upper-tail by
+    # 1/p_above_t — ≈2× when combined.μ ≈ METAR.μ — and pushes us to the
+    # 0.995 clamp on whichever bracket sits at the running max.
+    #
+    # The pre-CF6 sweep showed unconditional truncation was -0.0046 worse
+    # than trunc-off; we kept it because removing it net-hurt. After the
+    # 2026-04-28 CF6 ground-truth fix (which moved learned μ closer to
+    # truth across all stations), trunc-off is now +0.0146 BETTER than
+    # the unconditional path — the same amplification that accidentally
+    # rescued cold-biased predictions now over-amplifies on accurate
+    # ones. Validated with sweep_v2_hypotheses.py post-CF6, n=143;
+    # 4 of 6 families improved (MIA −0.034, NY −0.026, AUS −0.024,
+    # DEN −0.014), CHI/LAX neutral.
+    #
+    # The 0.5°F dead-zone is defensive: keeps truncation available for
+    # edge cases where step 4c is somehow bypassed, preserving the
+    # catastrophic-miss correction (forecast 65°F, METAR 73°F) that the
+    # original truncation was designed for.
     truncation_floor: Optional[float] = None
     for g in gaussians:
         if g.source_name == "metar" and math.isfinite(g.mean_f):
-            truncation_floor = g.mean_f
+            if combined.mean_f < g.mean_f - 0.5:
+                truncation_floor = g.mean_f
             break
     try:
         gaussian_prob = probability_for_market(
