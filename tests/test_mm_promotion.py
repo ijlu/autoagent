@@ -787,7 +787,7 @@ def _insert_paired_row(
 
 class TestEvaluateGraduation:
     def test_insufficient_paired_fails(self, conn):
-        # Below MM_GRADUATION_MIN_PAIRED_N (default 30).
+        # Below MM_GRADUATION_MIN_PAIRED_N (default 8 post-2026-04-26 relax).
         t0 = time.time() - 86400
         for i in range(5):
             _insert_paired_row(
@@ -989,7 +989,7 @@ class TestRunMMPromotionSweep:
 
     def test_canary_graduates_to_full_with_paired_evidence(self, conn):
         # Set CANARY, seed enough paired rows after since_ts to clear
-        # MM_GRADUATION_MIN_PAIRED_N (30), expect graduation to LIVE_FULL
+        # MM_GRADUATION_MIN_PAIRED_N (8 post-2026-04-26), expect graduation to LIVE_FULL
         # and a Thompson resample.
         set_mm_live_state(conn, "KXHIGHNY", LiveState.LIVE_CANARY)
         flag = get_mm_live_state(conn, "KXHIGHNY")

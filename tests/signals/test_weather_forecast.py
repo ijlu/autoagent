@@ -161,7 +161,7 @@ def test_probability_for_market_clamps_low():
     p = probability_for_market(
         f, is_bracket=False, threshold_f=80.0, is_above=True
     )
-    assert p == pytest.approx(0.02, abs=1e-9)
+    assert p == pytest.approx(0.005, abs=1e-9)
 
 
 def test_probability_for_market_clamps_high():
@@ -169,7 +169,7 @@ def test_probability_for_market_clamps_high():
     p = probability_for_market(
         f, is_bracket=False, threshold_f=60.0, is_above=True
     )
-    assert p == pytest.approx(0.98, abs=1e-9)
+    assert p == pytest.approx(0.995, abs=1e-9)
 
 
 def test_probability_for_market_bracket_requires_both_bounds():
@@ -387,3 +387,115 @@ def test_combine_preserves_source_tag_provenance():
     assert combined is not None
     assert "hrrr:nyc_2026-04-23" in combined.source_tag
     assert "nbm:nyc_2026-04-23" in combined.source_tag
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Truncated projection (Option C): left-truncate at running observed max
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_truncation_far_below_bracket_lo_is_near_noop():
+    """When truncation is far below bracket_lo, the renormalization
+    factor 1/P(X ≥ T) ≈ 1 so the truncated answer matches the
+    unconditional answer to within floating-point precision."""
+    f = GaussianForecast(mean_f=70.0, sigma_f=2.0, horizon_hours=4.0, source_name="combined")
+    p_no_trunc = probability_for_market(
+        f, is_bracket=True, bracket_lo_f=68.0, bracket_hi_f=72.0,
+    )
+    p_trunc = probability_for_market(
+        f, is_bracket=True, bracket_lo_f=68.0, bracket_hi_f=72.0,
+        truncation_floor_f=60.0,  # 5σ below — P(X≥60) ≈ 1.0
+    )
+    # Renormalization factor ≈ 1 + ~3e-7. abs=1e-5 is plenty of headroom.
+    assert p_trunc == pytest.approx(p_no_trunc, abs=1e-5)
+
+
+def test_truncation_above_bracket_hi_yields_zero():
+    """If observation already exceeded the bracket cap, probability of
+    landing in the bracket is zero (subject to clamp)."""
+    f = GaussianForecast(mean_f=70.0, sigma_f=2.0, horizon_hours=4.0, source_name="combined")
+    p = probability_for_market(
+        f, is_bracket=True, bracket_lo_f=68.0, bracket_hi_f=72.0,
+        truncation_floor_f=75.0,  # already past bracket cap
+    )
+    # Clamp lower bound is 0.005.
+    assert p == pytest.approx(0.005, abs=1e-9)
+
+
+def test_truncation_inside_bracket_renormalizes():
+    """Forecast μ=63, σ=1, bracket [65, 67], truncation=65 (running observed).
+    Without truncation: P(in [65,67]) ≈ 0.48 (from old floor band-aid).
+    With truncation: P(in [65,67] | high ≥ 65) ≈ 1.0 because almost all of
+    the forecast's mass above 65 is below 67."""
+    f = GaussianForecast(mean_f=63.0, sigma_f=1.0, horizon_hours=4.0, source_name="combined")
+    # Untruncated: small probability (μ way below bracket).
+    p_untrunc = probability_for_market(
+        f, is_bracket=True, bracket_lo_f=65.0, bracket_hi_f=67.0,
+    )
+    assert p_untrunc < 0.05  # standard projection: tiny
+
+    p_trunc = probability_for_market(
+        f, is_bracket=True, bracket_lo_f=65.0, bracket_hi_f=67.0,
+        truncation_floor_f=65.0,
+    )
+    # Truncated: should be close to 1 since the forecast assigns almost
+    # zero mass above 67 anyway, so conditioning on high ≥ 65 puts
+    # essentially all residual mass in [65, 67].
+    assert p_trunc > 0.95
+
+
+def test_truncation_threshold_above_already_satisfied():
+    """For a 'high above 70' threshold market, if observation already
+    crossed 70, YES is certain (1.0)."""
+    f = GaussianForecast(mean_f=65.0, sigma_f=2.0, horizon_hours=2.0, source_name="combined")
+    p = probability_for_market(
+        f, is_bracket=False, threshold_f=70.0, is_above=True,
+        truncation_floor_f=72.0,
+    )
+    # Clamp upper bound is 0.995.
+    assert p == pytest.approx(0.995, abs=1e-9)
+
+
+def test_truncation_threshold_below_already_violated():
+    """For a 'high below 70' threshold market, if observation already
+    crossed 70, YES is impossible (0.0)."""
+    f = GaussianForecast(mean_f=65.0, sigma_f=2.0, horizon_hours=2.0, source_name="combined")
+    p = probability_for_market(
+        f, is_bracket=False, threshold_f=70.0, is_above=False,
+        truncation_floor_f=72.0,
+    )
+    assert p == pytest.approx(0.005, abs=1e-9)
+
+
+def test_truncation_matches_monte_carlo():
+    """Sanity-check the truncated projection against a Monte Carlo draw
+    from a left-truncated normal. With a non-degenerate truncation point
+    the closed-form should agree with empirical frequencies within MC
+    noise."""
+    import random
+    rng = random.Random(42)
+    f = GaussianForecast(mean_f=63.0, sigma_f=1.5, horizon_hours=4.0, source_name="combined")
+    truncation = 64.0
+    bracket_lo, bracket_hi = 64.5, 66.5
+
+    # Sample from truncated normal via rejection
+    n = 200_000
+    accepted = 0
+    in_bracket = 0
+    while accepted < n:
+        x = rng.gauss(63.0, 1.5)
+        if x < truncation:
+            continue
+        accepted += 1
+        if bracket_lo <= x <= bracket_hi:
+            in_bracket += 1
+    p_mc = in_bracket / n
+
+    p_closed = probability_for_market(
+        f, is_bracket=True, bracket_lo_f=bracket_lo, bracket_hi_f=bracket_hi,
+        truncation_floor_f=truncation,
+    )
+    # MC noise std ≈ sqrt(p(1-p)/n) ≤ 0.0011 for any p, so 0.01 is ~9σ
+    assert abs(p_closed - p_mc) < 0.01, (
+        f"closed-form {p_closed:.4f} vs MC {p_mc:.4f}"
+    )

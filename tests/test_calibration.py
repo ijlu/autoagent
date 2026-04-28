@@ -261,6 +261,17 @@ class TestFitCalibration:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestApplyCalibration:
+    """The math tests below monkey-patch ``CALIBRATION_ENABLED=True`` so we
+    can verify the Platt formula. Production default is False — see
+    ``test_calibration_disabled_by_default_returns_raw``. When the flag is
+    flipped on after per-category fits land, the math tests still cover
+    the formula."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_for_math_tests(self, monkeypatch):
+        import bot.config as _config
+        monkeypatch.setattr(_config, "CALIBRATION_ENABLED", True)
+
     def test_none_input_returns_none(self):
         assert cal.apply_calibration(None, {"method": "platt", "A": 1, "B": 0}) is None
 
@@ -309,6 +320,47 @@ class TestApplyCalibration:
         # A huge positive bias would push toward 1.0; clamp must hold
         curve = {"method": "platt", "A": 5.0, "B": 20.0, "families": {}}
         assert cal.apply_calibration(0.8, curve) == 0.98
+
+
+class TestCalibrationGate:
+    """The CALIBRATION_ENABLED feature gate — production default is False."""
+
+    def test_calibration_disabled_by_default_returns_raw(self, monkeypatch):
+        """With the default-off flag, even a sharp Platt curve must be
+        bypassed and the raw probability returned (clamped)."""
+        import bot.config as _config
+        monkeypatch.setattr(_config, "CALIBRATION_ENABLED", False)
+        # The Platt curve below would map 0.8 → ~0.667 if applied. With the
+        # gate off it must return 0.8 verbatim.
+        curve = {"method": "platt", "A": 0.5, "B": 0.0, "families": {}}
+        assert cal.apply_calibration(0.8, curve) == pytest.approx(0.8, abs=1e-9)
+
+    def test_calibration_disabled_still_clamps(self, monkeypatch):
+        """Even with the gate off, output still goes through the [0.02, 0.98]
+        clamp (no caller should ever see a literal 0 or 1)."""
+        import bot.config as _config
+        monkeypatch.setattr(_config, "CALIBRATION_ENABLED", False)
+        assert cal.apply_calibration(0.001, {"method": "platt", "A": 1, "B": 0}) == 0.02
+        assert cal.apply_calibration(0.999, {"method": "platt", "A": 1, "B": 0}) == 0.98
+
+    def test_calibration_disabled_handles_none_input(self, monkeypatch):
+        """The early-return for None must still work with gate off."""
+        import bot.config as _config
+        monkeypatch.setattr(_config, "CALIBRATION_ENABLED", False)
+        assert cal.apply_calibration(None, None) is None
+
+    def test_step_function_curve_neutralized_when_disabled(self, monkeypatch):
+        """The actual broken curve we found in production has A=22M, B=-6.1M
+        — a step function at p=0.28. With the gate off, all inputs return
+        raw (clamped) regardless of the curve's shape."""
+        import bot.config as _config
+        monkeypatch.setattr(_config, "CALIBRATION_ENABLED", False)
+        broken_curve = {"method": "platt", "A": 21883020.0, "B": -6124319.0,
+                         "families": {}}
+        # Without the gate, raw 0.65 would have been pushed to 0.98 by this
+        # curve. With it, we get 0.65 back.
+        assert cal.apply_calibration(0.65, broken_curve) == pytest.approx(0.65, abs=1e-9)
+        assert cal.apply_calibration(0.20, broken_curve) == pytest.approx(0.20, abs=1e-9)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -362,8 +414,11 @@ class TestLegacyShims:
         assert isinstance(curve, dict)
         assert "method" in curve
 
-    def test_apply_calibration_correction_preserves_legacy_signature(self):
-        # Legacy signature (prob, corrections) without ticker must still work
+    def test_apply_calibration_correction_preserves_legacy_signature(self, monkeypatch):
+        # Legacy signature (prob, corrections) without ticker must still work.
+        # Enable the calibration gate for this math-verification test.
+        import bot.config as _config
+        monkeypatch.setattr(_config, "CALIBRATION_ENABLED", True)
         curve = {"method": "platt", "A": 0.5, "B": 0.0, "families": {}}
         out = cal.apply_calibration_correction(0.8, curve)
         assert 0 < out < 1

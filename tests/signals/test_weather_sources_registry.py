@@ -20,7 +20,6 @@ from bot.signals.weather_sources import (
     METAR,
     NBM,
     NWS_POINT,
-    TOMORROW,
     WEATHER,
     is_canonical,
 )
@@ -28,9 +27,13 @@ from bot.signals.weather_sources import (
 
 def test_registry_contents_pinned():
     """Pin the membership so a quiet rename of one of these constants
-    doesn't go unnoticed."""
+    doesn't go unnoticed.
+
+    Tomorrow.io was dropped 2026-04-26 (see weather_sources.py TOMORROW
+    constant note); the bare constant is still exported but no longer a
+    member of CANONICAL_WEATHER_SOURCES."""
     assert CANONICAL_WEATHER_SOURCES == frozenset({
-        "hrrr", "nbm", "nws_point", "tomorrow", "weather",
+        "hrrr", "nbm", "nws_point", "weather",
         "metar", "madis", "afd",
     })
     assert GAUSSIAN_COMBINE_SOURCES == CANONICAL_WEATHER_SOURCES - {AFD}
@@ -116,8 +119,9 @@ def test_live_source_modules_emit_canonical_source_name():
         nws_point: NWS_POINT,
         madis: MADIS,
         metar_observations: METAR,
-        # weather.py emits BOTH 'weather' (Open-Meteo) and 'tomorrow'
-        # (Tomorrow.io) — assert both literal strings present.
+        # weather.py emits 'weather' (Open-Meteo). It still has a
+        # get_tomorrow_forecast helper kept for code-archeology, but
+        # tomorrow is no longer a canonical live source post-2026-04-26.
     }
     for module, name in expected.items():
         src = inspect.getsource(module)
@@ -130,7 +134,6 @@ def test_live_source_modules_emit_canonical_source_name():
 
     weather_src = inspect.getsource(weather)
     assert f'source_name="{WEATHER}"' in weather_src
-    assert f'source_name="{TOMORROW}"' in weather_src
 
 
 def test_kv_cache_prefixes_have_no_legacy_drift():

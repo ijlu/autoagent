@@ -138,16 +138,19 @@ def _projected_prob_for_combined(gaussians, *, threshold_f=75.0):
     return combined
 
 
-def test_v2_group_discount_five_identical_models_yields_input_sigma():
-    """Five models with identical (μ=78, σ=2) combined with 1/5 weights each
-    should give precision = 5 * (1/5) * (1/σ²) = 1/σ² → combined σ = σ.
+def test_v2_group_discount_four_identical_models_yields_input_sigma():
+    """Four models with identical (μ=78, σ=2) combined with 1/4 weights each
+    should give precision = 4 * (1/4) * (1/σ²) = 1/σ² → combined σ = σ.
 
     This is the heart of the correlation discount: identical correlated
-    forecasts should produce ONE effective source, not FIVE."""
-    gs = [_g(n, mean_f=78.0, sigma_f=2.0) for n in ("hrrr", "nbm", "nws_point", "tomorrow", "weather")]
+    forecasts should produce ONE effective source, not FOUR.
+
+    (Was 5 models pre-2026-04-26; tomorrow.io was dropped — see
+    bot/config.py TOMORROW_API_KEY note.)"""
+    gs = [_g(n, mean_f=78.0, sigma_f=2.0) for n in ("hrrr", "nbm", "nws_point", "weather")]
     combined = _projected_prob_for_combined(gs)
     assert abs(combined.sigma_f - 2.0) < 1e-9, (
-        f"5 correlated models should yield σ=2.0, got σ={combined.sigma_f}"
+        f"4 correlated models should yield σ=2.0, got σ={combined.sigma_f}"
     )
     assert abs(combined.mean_f - 78.0) < 1e-9
 
@@ -554,3 +557,286 @@ def test_learned_sigma_flows_into_combine(memdb, monkeypatch):
     # HRRR dominates → μ closer to 78 than to 82.
     assert combined.mean_f < 79.0
     assert combined.mean_f > 78.0
+
+
+# ── σ inflation (post-combine, pre-projection) ────────────────────────────
+
+def test_sigma_inflation_default_is_one(monkeypatch, memdb):
+    """Cold cache + no env var → default 1.0× (no-op).
+
+    The 91-day skill-curve fit showed σ priors are roughly empirically
+    correct, so the post-combine inflation multiplier defaults to 1.0
+    (no-op). Kept as a kv/env-overridable knob in case later shadow data
+    diverges and we need an emergency band-aid before re-fitting."""
+    monkeypatch.delenv(v2._SIGMA_INFLATION_ENV, raising=False)
+    assert v2._get_sigma_inflation() == 1.0
+
+
+def test_sigma_inflation_env_override(monkeypatch, memdb):
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "1.5")
+    assert v2._get_sigma_inflation() == 1.5
+
+
+def test_sigma_inflation_env_clamped(monkeypatch, memdb):
+    """Out-of-range env value clamps to [1.0, 4.0]."""
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "10.0")
+    assert v2._get_sigma_inflation() == v2._SIGMA_INFLATION_MAX
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "0.1")
+    assert v2._get_sigma_inflation() == v2._SIGMA_INFLATION_MIN
+
+
+def test_sigma_inflation_kv_override_precedence(monkeypatch, memdb):
+    """kv_cache value wins over env var."""
+    from bot.db import kv_set
+
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "1.5")
+    kv_set(memdb, v2._SIGMA_INFLATION_KEY, {"factor": 3.0}, ttl_seconds=3600)
+    assert v2._get_sigma_inflation() == 3.0
+
+
+def test_sigma_inflation_kv_clamped(monkeypatch, memdb):
+    from bot.db import kv_set
+
+    monkeypatch.delenv(v2._SIGMA_INFLATION_ENV, raising=False)
+    kv_set(memdb, v2._SIGMA_INFLATION_KEY, {"factor": 99.0}, ttl_seconds=3600)
+    assert v2._get_sigma_inflation() == v2._SIGMA_INFLATION_MAX
+
+
+def test_apply_sigma_inflation_widens_sigma(monkeypatch, memdb):
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "2.0")
+    g = _g("hrrr", mean_f=78.0, sigma_f=1.5, horizon_hours=8.0)
+    inflated = v2._apply_sigma_inflation(g)
+    assert inflated.sigma_f == pytest.approx(3.0)
+    # Mean / horizon / provenance preserved.
+    assert inflated.mean_f == 78.0
+    assert inflated.horizon_hours == 8.0
+    assert inflated.source_name == "hrrr"
+
+
+def test_apply_sigma_inflation_factor_one_is_noop(monkeypatch, memdb):
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "1.0")
+    g = _g("hrrr", mean_f=78.0, sigma_f=1.5)
+    inflated = v2._apply_sigma_inflation(g)
+    assert inflated is g
+
+
+def test_predict_v2_inflation_widens_combined_sigma_in_snapshot(memdb, monkeypatch):
+    """End-to-end: combined σ stored in weather_forecast_snapshots reflects
+    the inflated σ, not the pre-inflation σ. Use a single source so the
+    pre-inflation σ is the source's σ verbatim."""
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "2.0")
+    gs = [_g("hrrr", mean_f=78.0, sigma_f=1.5, horizon_hours=8.0)]
+    p, _ = _run_v2(memdb, monkeypatch, gs)
+    assert p is not None
+
+    row = memdb.execute(
+        "SELECT sigma_f FROM weather_forecast_snapshots "
+        "WHERE source = 'combined_v2' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == pytest.approx(3.0)
+
+
+def test_predict_v2_inflation_pulls_offcenter_prob_toward_half(memdb, monkeypatch):
+    """μ=76.5, threshold=75 (slightly off-center). Wider σ should pull
+    P(>75) toward 0.5 — the calibration fix we want — without hitting the
+    [0.02, 0.98] clamp at either end."""
+    gs = [_g("hrrr", mean_f=76.5, sigma_f=1.5, horizon_hours=8.0)]
+
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "1.0")
+    p_tight, _ = _run_v2(memdb, monkeypatch, gs)
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "2.0")
+    p_wide, _ = _run_v2(memdb, monkeypatch, gs)
+    # Tight σ → confident YES (~0.84). Wide σ → less confident (~0.69).
+    # Both above 0.5; wider should be closer to 0.5.
+    assert 0.5 < p_wide < p_tight, (
+        f"σ inflation should pull off-center prob toward 0.5: "
+        f"tight={p_tight:.4f} wide={p_wide:.4f}"
+    )
+
+
+# ── Running-high floor (the live-shadow Brier-blowup fix) ─────────────────
+
+def test_apply_running_high_floor_raises_combined_when_below_metar_mean(memdb):
+    """The combine produces μ=53; METAR observed running_high pushed METAR's
+    μ to 55. Daily-high cannot be below already-observed running max, so the
+    floor should shift the combined mean up to 55."""
+    combined = _g("combined_v2", mean_f=53.15, sigma_f=1.35)
+    metar = _g("metar", mean_f=55.0, sigma_f=5.0)
+    inputs = [
+        _g("hrrr", mean_f=53.0, sigma_f=1.4),
+        _g("nbm",  mean_f=53.0, sigma_f=1.4),
+        metar,
+    ]
+    floored = v2._apply_running_high_floor(combined, inputs)
+    assert floored.mean_f == pytest.approx(55.0)
+    # σ unchanged in v1 of the fix.
+    assert floored.sigma_f == pytest.approx(1.35)
+    # Provenance preserved.
+    assert floored.source_name == "combined_v2"
+
+
+def test_apply_running_high_floor_noop_when_combined_already_above(memdb):
+    """Combine produced μ=70; METAR observed only μ=55 (early day, low
+    running_high). Floor is below combined mean — no shift."""
+    combined = _g("combined_v2", mean_f=70.0, sigma_f=1.5)
+    metar = _g("metar", mean_f=55.0, sigma_f=5.0)
+    inputs = [_g("hrrr", mean_f=70.0, sigma_f=1.5), metar]
+    floored = v2._apply_running_high_floor(combined, inputs)
+    assert floored is combined  # exact same object — no allocation when no-op
+
+
+def test_apply_running_high_floor_noop_when_no_metar_present(memdb):
+    """If METAR didn't fire (poller silent or station unsupported), there's
+    no observed-running-high information to enforce. Combine is unchanged."""
+    combined = _g("combined_v2", mean_f=53.0, sigma_f=1.5)
+    inputs = [_g("hrrr", mean_f=53.0, sigma_f=1.5)]
+    floored = v2._apply_running_high_floor(combined, inputs)
+    assert floored is combined
+
+
+def test_predict_v2_floor_lifts_prob_when_forecasts_below_observation(memdb, monkeypatch):
+    """End-to-end: forecasts say μ=73°F; METAR observed running_high pushed
+    METAR's μ to 75.5°F (above threshold of 75 from the default ticker).
+    Without the floor, combined.μ falls between 73 and 75.5 (forecast-
+    weighted) → P(>75) is small. With the floor, combined.μ ≥ 75.5 → P(>75)
+    is much larger. Asserts the floor binds and lifts P meaningfully."""
+    gs = [
+        _g("hrrr",    mean_f=73.0, sigma_f=1.4),
+        _g("nbm",     mean_f=73.0, sigma_f=1.4),
+        _g("weather", mean_f=73.0, sigma_f=1.4),
+        _g("metar",   mean_f=75.5, sigma_f=5.0),
+    ]
+    p, _ = _run_v2(memdb, monkeypatch, gs)
+    # With the floor binding at 75.5, the combined Gaussian centers above the
+    # threshold of 75 → P(>75) > 0.5.
+    assert p > 0.5, f"floor should lift prob above 0.5 (threshold 75), got {p:.3f}"
+
+
+# ── Source staleness (B) ───────────────────────────────────────────────────
+
+def test_staleness_inflation_factor_zero_for_live_sources(memdb):
+    """METAR / MADIS / unknown sources have staleness=0 → factor 1.0."""
+    g_metar = _g("metar", mean_f=70.0, sigma_f=2.0, horizon_hours=8.0)
+    g_madis = _g("madis", mean_f=70.0, sigma_f=2.0, horizon_hours=8.0)
+    g_unknown = _g("unknown_source", mean_f=70.0, sigma_f=2.0, horizon_hours=8.0)
+    assert v2._staleness_inflation_factor(g_metar) == 1.0
+    assert v2._staleness_inflation_factor(g_madis) == 1.0
+    assert v2._staleness_inflation_factor(g_unknown) == 1.0
+
+
+def test_staleness_inflation_factor_reflects_cadence(memdb):
+    """NBM (assumed 3h stale) at horizon 12h → factor ≈ sqrt(1.25) ≈ 1.118."""
+    g = _g("nbm", mean_f=70.0, sigma_f=1.5, horizon_hours=12.0)
+    factor = v2._staleness_inflation_factor(g)
+    assert factor == pytest.approx(1.118, abs=0.01)
+
+
+def test_staleness_inflation_uses_issued_at_when_present(memdb):
+    """When the source supplies issued_at, use the real staleness instead
+    of the per-source cadence assumption."""
+    import time as _time
+    # NBM with explicit issued_at = 6h ago (stale beyond cadence-assumption)
+    one_hour_s = 3600.0
+    issued = _time.time() - 6 * one_hour_s
+    g = GaussianForecast(
+        mean_f=70.0, sigma_f=1.5, horizon_hours=12.0,
+        source_name="nbm", source_tag="nbm:nyc", issued_at=issued,
+    )
+    factor = v2._staleness_inflation_factor(g)
+    # sqrt(1 + 6/12) = sqrt(1.5) ≈ 1.225
+    assert factor == pytest.approx(1.225, abs=0.02)
+
+
+def test_apply_staleness_inflation_is_noop_for_live_sources(memdb):
+    """Live obs sources pass through unchanged."""
+    g = _g("metar", mean_f=70.0, sigma_f=2.0, horizon_hours=8.0)
+    out = v2._apply_staleness_inflation(g)
+    assert out is g
+
+
+def test_apply_staleness_inflation_widens_nbm_sigma(memdb):
+    """NBM σ widens by ~12% after staleness inflation at 12h horizon."""
+    g = _g("nbm", mean_f=70.0, sigma_f=1.5, horizon_hours=12.0)
+    out = v2._apply_staleness_inflation(g)
+    # ~ 1.5 × 1.118 ≈ 1.677
+    assert out.sigma_f == pytest.approx(1.677, abs=0.02)
+    # Mean / horizon / provenance preserved.
+    assert out.mean_f == 70.0
+    assert out.horizon_hours == 12.0
+    assert out.source_name == "nbm"
+
+
+def test_issued_at_preserved_through_shifted_and_with_sigma(memdb):
+    """Mutator helpers must round-trip ``issued_at`` so staleness math
+    after MOS bias / skill σ replacement still uses the real timestamp."""
+    g = GaussianForecast(
+        mean_f=70.0, sigma_f=1.5, horizon_hours=12.0,
+        source_name="nbm", source_tag="nbm:nyc", issued_at=1234567890.0,
+    )
+    assert g.shifted(0.5).issued_at == 1234567890.0
+    assert g.with_sigma(2.0).issued_at == 1234567890.0
+    assert g.with_inflated_sigma(1.2).issued_at == 1234567890.0
+
+
+# ── Source σ ceiling (Option B) ─────────────────────────────────────────────
+
+
+def test_source_sigma_ceiling_caps_under_fit_sources(memdb, monkeypatch):
+    """A source whose pooled fallback σ is wide (e.g., NWS Point at 3.5°F)
+    should be capped at _SOURCE_SIGMA_CEILING_F so it isn't effectively
+    excluded from the precision-weighted combine."""
+    # Patch _collect_gaussians to skip the per-source getters and return
+    # raw inputs; the σ ceiling is applied INSIDE _collect_gaussians
+    # itself, so we need to call it via the real predict_v2 path.
+    raw = [
+        _g("hrrr", mean_f=89.5, sigma_f=0.95, horizon_hours=14.0),
+        _g("nws_point", mean_f=94.0, sigma_f=3.50, horizon_hours=14.0),  # wide
+    ]
+
+    # Stub each per-source getter to return the test gaussians directly,
+    # bypassing the API fetches.
+    import bot.signals.sources.hrrr as hrrr_mod
+    import bot.signals.sources.nws_point as nws_mod
+    monkeypatch.setattr(hrrr_mod, "get_hrrr_gaussian", lambda t, m: raw[0])
+    monkeypatch.setattr(nws_mod, "get_nws_point_gaussian", lambda t, m: raw[1])
+    # Force other sources to return None so they don't pollute the test.
+    import bot.signals.sources.ndfd_nbm as nbm_mod
+    import bot.signals.sources.weather as wx_mod
+    import bot.signals.sources.metar_observations as metar_mod
+    import bot.signals.sources.madis as madis_mod
+    monkeypatch.setattr(nbm_mod, "get_nbm_gaussian", lambda t, m: None)
+    monkeypatch.setattr(wx_mod, "get_weather_gaussian", lambda t, m: None)
+    monkeypatch.setattr(metar_mod, "get_metar_gaussian", lambda t, m: None)
+    monkeypatch.setattr(madis_mod, "get_madis_gaussian", lambda t, m: None)
+
+    market_data = _market(title="Will NYC high exceed 90°F today?")
+    out = v2._collect_gaussians("KXHIGHNY-26APR23-T75", market_data)
+    by_name = {g.source_name: g for g in out}
+    # NWS Point's σ should be capped at _SOURCE_SIGMA_CEILING_F.
+    assert by_name["nws_point"].sigma_f <= v2._SOURCE_SIGMA_CEILING_F + 1e-6
+    # HRRR's σ (0.95) is below the ceiling and should pass through.
+    assert by_name["hrrr"].sigma_f <= 1.0
+
+
+def test_source_sigma_ceiling_does_not_affect_well_fit_sources(memdb, monkeypatch):
+    """Sources already at or below the ceiling should not be modified."""
+    g = _g("hrrr", mean_f=70.0, sigma_f=1.5, horizon_hours=8.0)
+    import bot.signals.sources.hrrr as hrrr_mod
+    monkeypatch.setattr(hrrr_mod, "get_hrrr_gaussian", lambda t, m: g)
+    for mod_name, attr in [
+        ("bot.signals.sources.ndfd_nbm", "get_nbm_gaussian"),
+        ("bot.signals.sources.weather", "get_weather_gaussian"),
+        ("bot.signals.sources.metar_observations", "get_metar_gaussian"),
+        ("bot.signals.sources.madis", "get_madis_gaussian"),
+        ("bot.signals.sources.nws_point", "get_nws_point_gaussian"),
+    ]:
+        import importlib
+        mod = importlib.import_module(mod_name)
+        monkeypatch.setattr(mod, attr, lambda t, m: None)
+
+    out = v2._collect_gaussians("KXHIGHNY-26APR23-T75", _market())
+    by_name = {gg.source_name: gg for gg in out}
+    # HRRR σ=1.5 < ceiling=2.0 → unchanged (modulo skill σ override which
+    # may or may not fire depending on kv state; both are <= 2.0).
+    assert by_name["hrrr"].sigma_f <= v2._SOURCE_SIGMA_CEILING_F

@@ -384,3 +384,354 @@ def test_materialized_city_matches_v2_reader_key(conn, fake_iem):
 
     assert bias is not None
     assert bias == pytest.approx(2.0, abs=1e-3)
+
+
+# ── Skill-σ + group-ρ wrappers ──────────────────────────────────────────────
+
+
+def _seed_backfill_for_skill(conn, *, n_days: int = 20) -> None:
+    """Insert n_days of synthetic forecast/observed pairs for hrrr+nbm+weather
+    at lead 12h with a shared per-day shock so error correlation is non-zero."""
+    import datetime as _dt
+    import random as _random
+    rng = _random.Random(0xCAFE)
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    rows = []
+    for d in range(n_days):
+        date_iso = (_dt.date(2026, 4, 1) + _dt.timedelta(days=d)).isoformat()
+        obs = 70.0 + d * 0.3
+        common = rng.gauss(0.0, 1.0)
+        for src in ("hrrr", "nbm", "weather"):
+            fc = obs + common + rng.gauss(0.0, 0.5)
+            rows.append((now_iso, src, "nyc", date_iso, 12, fc, 2.0, obs))
+    conn.executemany(
+        """INSERT INTO weather_gaussian_snapshots_backfill
+              (created_at, source, city, settlement_date, lead_hours,
+               forecast_mean_f, forecast_sigma_f, observed_high_f)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+
+
+def test_fit_and_persist_skill_curves_writes_kv(tmp_path):
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import fit_and_persist_skill_curves
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    _seed_backfill_for_skill(conn, n_days=20)
+
+    stats = fit_and_persist_skill_curves(conn)
+    # 3 sources × (1 pooled + 1 per-city for "nyc") = 6 fits
+    assert stats["buckets_fitted"] == 6
+    assert stats["keys_written"] == 6
+    assert stats["city_keys_written"] == 3
+    assert stats["buckets_thin"] == 0
+
+    pooled = kv_get(conn, "weather_skill_hrrr_6_24")
+    assert pooled is not None
+    assert pooled["n"] == 20
+    assert pooled["sigma"] > 0
+
+    city_specific = kv_get(conn, "weather_skill_hrrr_nyc_6_24")
+    assert city_specific is not None
+    assert city_specific["n"] == 20
+    assert city_specific.get("city") == "nyc"
+
+
+def test_fit_and_persist_skill_curves_skips_thin_buckets(tmp_path):
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import fit_and_persist_skill_curves
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    _seed_backfill_for_skill(conn, n_days=5)  # below _SKILL_MIN_SAMPLES=10
+
+    stats = fit_and_persist_skill_curves(conn)
+    assert stats["keys_written"] == 0
+    assert stats["buckets_thin"] == stats["buckets_fitted"] > 0
+    assert kv_get(conn, "weather_skill_hrrr_6_24") is None
+
+
+def test_fit_and_persist_group_correlation_writes_kv(tmp_path):
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import fit_and_persist_group_correlation
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    _seed_backfill_for_skill(conn, n_days=20)
+
+    stats = fit_and_persist_group_correlation(conn)
+    assert stats["persisted"] is True
+    assert stats["n_pairs"] == 20
+    assert 0.0 < stats["rho"] < 1.0
+    payload = kv_get(conn, "weather_group_corr_model")
+    assert payload is not None
+    assert payload["rho"] == pytest.approx(stats["rho"], abs=1e-9)
+
+
+def test_fit_and_persist_group_correlation_empty_db(tmp_path):
+    from bot.db import init_db
+    from bot.learning.weather_mos_materializer import fit_and_persist_group_correlation
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    stats = fit_and_persist_group_correlation(conn)
+    assert stats["persisted"] is False
+    assert stats["rho"] is None
+
+
+# ── METAR per-(station, LST hour) residual σ fitter ─────────────────────────
+
+
+def _seed_metar_hourly(conn, *, station="KNYC", n_days=30,
+                       late_day_residual_std=0.4,
+                       early_day_residual_std=3.0):
+    """Seed N days of synthetic METAR hourly rows.
+
+    Day-to-day variance in residuals is what fit_metar_residual_sigma
+    should be measuring. We construct each day so that:
+      * h=18 (late day): running_max-vs-daily_high gap has std=late_day_residual_std
+      * h=8  (early day): running_max-vs-daily_high gap has std=early_day_residual_std
+    The fitter should recover something close to those input stds.
+    """
+    import random as _random
+    rng = _random.Random(0xCAFE)
+    rows = []
+    now_iso = "2026-01-01T00:00:00+00:00"
+    for d in range(n_days):
+        date_iso = f"2026-{((d // 28) % 12) + 1:02d}-{(d % 28) + 1:02d}"
+        # Per-day residuals: how far running_max-at-h is from daily_high
+        # at each marker hour. Gaussian draws so std across days = the
+        # parameter we passed.
+        late_residual_today = abs(rng.gauss(0.0, late_day_residual_std))
+        early_residual_today = abs(rng.gauss(0.0, early_day_residual_std))
+        daily_high = 70.0
+        for h in range(24):
+            if h <= 8:
+                temp = daily_high - early_residual_today
+            elif h >= 16:
+                temp = daily_high - late_residual_today
+            else:
+                # Smooth ramp between early and late levels.
+                temp = daily_high - max(late_residual_today, early_residual_today * 0.5)
+            rows.append((now_iso, station, date_iso, h, temp, daily_high))
+    conn.executemany(
+        """INSERT INTO weather_metar_hourly_backfill
+              (created_at, station, lst_date, lst_hour, temp_f, daily_high_f)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+
+
+def test_fit_metar_residual_sigma_persists_per_cell(tmp_path):
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_metar_residual_sigma,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    _seed_metar_hourly(conn, station="KNYC", n_days=30,
+                       late_day_residual_std=0.4, early_day_residual_std=3.0)
+
+    stats = fit_and_persist_metar_residual_sigma(conn)
+    assert stats["keys_written"] == 24  # one cell per hour
+    assert stats["cells_thin"] == 0
+
+    # Late-day cells should have much smaller σ than early-day cells.
+    late = kv_get(conn, "weather_metar_residual_sigma_KNYC_18")
+    early = kv_get(conn, "weather_metar_residual_sigma_KNYC_8")
+    assert late is not None and early is not None
+    assert late["sigma"] < 1.0   # tight late in the day
+    assert early["sigma"] > 1.5  # wider early
+    assert late["n"] == 30
+
+
+def test_fit_metar_residual_sigma_skips_thin_cells(tmp_path):
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_metar_residual_sigma,
+        _METAR_RESIDUAL_SIGMA_MIN_SAMPLES,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    # Below the min-samples gate.
+    _seed_metar_hourly(conn, n_days=_METAR_RESIDUAL_SIGMA_MIN_SAMPLES - 5)
+    stats = fit_and_persist_metar_residual_sigma(conn)
+    assert stats["keys_written"] == 0
+    assert stats["cells_thin"] == stats["cells_fitted"] > 0
+    assert kv_get(conn, "weather_metar_residual_sigma_KNYC_12") is None
+
+
+def test_fit_metar_residual_sigma_floors_pathologically_tight(tmp_path):
+    """If the residuals are all zero (pathological), σ should clamp at the
+    floor (sensor noise) rather than 0."""
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_metar_residual_sigma,
+        _METAR_RESIDUAL_SIGMA_FLOOR_F,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    # Construct hours where running_max == daily_high exactly → σ=0.
+    rows = []
+    for d in range(20):
+        date_iso = f"2026-02-{(d % 28) + 1:02d}"
+        for h in range(24):
+            rows.append(("2026-01-01T00:00:00+00:00", "KLAX", date_iso, h, 80.0, 80.0))
+    conn.executemany(
+        """INSERT INTO weather_metar_hourly_backfill
+              (created_at, station, lst_date, lst_hour, temp_f, daily_high_f)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+
+    stats = fit_and_persist_metar_residual_sigma(conn)
+    assert stats["keys_written"] > 0
+    payload = kv_get(conn, "weather_metar_residual_sigma_KLAX_18")
+    assert payload is not None
+    assert payload["sigma"] == _METAR_RESIDUAL_SIGMA_FLOOR_F
+
+
+def test_sigma_for_hours_reads_kv_when_station_supplied(tmp_path):
+    """Consumer side: _sigma_for_hours uses the learned cell when present."""
+    from bot.db import init_db, kv_set
+    from bot.signals.sources.metar_observations import _sigma_for_hours
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    kv_set(conn, "weather_metar_residual_sigma_KNYC_18",
+           {"sigma": 0.55, "n": 90}, ttl_seconds=86400)
+
+    # Without station/hour, the schedule wins (4 hours left → 5.0°F).
+    assert _sigma_for_hours(4.0) == 5.0
+    # With station/hour, the kv value wins regardless of hours_left.
+    got = _sigma_for_hours(4.0, station="KNYC", lst_hour=18)
+    assert got == pytest.approx(0.55)
+
+
+def test_sigma_for_hours_falls_back_when_kv_missing(tmp_path):
+    """Cold cache: caller passes station/hour but no kv exists → schedule."""
+    from bot.db import init_db
+    from bot.signals.sources.metar_observations import _sigma_for_hours
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    # No kv populated.
+    assert _sigma_for_hours(4.0, station="KNYC", lst_hour=18) == 5.0
+
+
+# ── Snapshots-based skill σ + MOS bias fitter (Options A + C) ───────────────
+
+
+def _seed_snapshots_for_skill_fit(conn, *, source="nws_point", city_series_pair=("KXHIGHNY", "KNYC"),
+                                  n_days=40, residual_std=1.5, residual_mean=0.5):
+    """Insert N days of snapshot rows for a single (source, city) cell paired
+    with observed daily highs in weather_metar_hourly_backfill. Each day has
+    a controlled residual (forecast - observed) so the fitter can recover σ
+    and bias close to the input parameters."""
+    import datetime as _dt
+    import random as _random
+    rng = _random.Random(0xCAFE)
+    series, station = city_series_pair
+    snapshot_rows = []
+    metar_rows = []
+    for d in range(n_days):
+        date_iso = (_dt.date(2026, 3, 1) + _dt.timedelta(days=d)).isoformat()
+        # Compact YYMMM ticker form: 2026-03-15 → 26MAR15
+        date_obj = _dt.date(2026, 3, 1) + _dt.timedelta(days=d)
+        suf = f"{date_obj.strftime('%y').upper()}{date_obj.strftime('%b').upper()}{date_obj.day:02d}"
+        ticker = f"{series}-{suf}-T75"
+        observed = 70.0 + rng.uniform(-2, 2)
+        forecast = observed + residual_mean + rng.gauss(0.0, residual_std)
+        snapshot_rows.append((
+            "2026-03-01T12:00:00+00:00", series, ticker, source,
+            None, forecast, residual_std, 12,
+        ))
+        # Observed daily high lives in weather_metar_hourly_backfill;
+        # only one row needed per (station, lst_date).
+        metar_rows.append((
+            "2026-03-01T12:00:00+00:00", station, date_iso, 12,
+            observed, observed,
+        ))
+    conn.executemany(
+        """INSERT INTO weather_forecast_snapshots
+              (recorded_at, series, ticker, source, forecast_prob,
+               forecast_high_f, sigma_f, hours_out)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        snapshot_rows,
+    )
+    conn.executemany(
+        """INSERT INTO weather_metar_hourly_backfill
+              (created_at, station, lst_date, lst_hour, temp_f, daily_high_f)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        metar_rows,
+    )
+    conn.commit()
+
+
+def test_fit_skill_from_snapshots_writes_per_city_skill_keys(tmp_path):
+    """The fitter should produce per-(source, city, bucket) σ keys by
+    joining snapshots to observed daily highs."""
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_skill_from_snapshots,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    _seed_snapshots_for_skill_fit(conn, source="nws_point",
+                                  city_series_pair=("KXHIGHNY", "KNYC"),
+                                  n_days=40, residual_std=1.2, residual_mean=0.3)
+
+    stats = fit_and_persist_skill_from_snapshots(conn)
+    assert stats["skill_keys_written"] >= 1
+    assert stats["mos_keys_written"] >= 1
+
+    # NWS Point in NY now has a per-city skill σ — closing the gap that
+    # the original backfill table left open.
+    skill = kv_get(conn, "weather_skill_nws_point_nyc_6_24")
+    assert skill is not None
+    # The fitted σ should be roughly residual_std (1.2°F) within sample noise.
+    assert 0.5 < skill["sigma"] < 2.5
+    assert skill["n"] == 40
+
+    # MOS bias should approximately recover the residual_mean of 0.3°F.
+    bias = kv_get(conn, "weather_mos_bias_nws_point_nyc")
+    assert bias is not None
+    assert -1.0 < bias["bias"] < 1.5  # noisy but within tolerance
+
+
+def test_fit_skill_from_snapshots_skips_thin_cells(tmp_path):
+    """Cells with fewer than min_samples should not write kv keys."""
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_skill_from_snapshots,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    _seed_snapshots_for_skill_fit(conn, source="nws_point",
+                                  city_series_pair=("KXHIGHNY", "KNYC"),
+                                  n_days=10)  # below min_samples=30
+
+    stats = fit_and_persist_skill_from_snapshots(conn, min_samples=30)
+    assert stats["skill_keys_written"] == 0
+    assert stats["skill_cells_thin"] >= 1
+    assert kv_get(conn, "weather_skill_nws_point_nyc_6_24") is None
+
+
+def test_fit_skill_from_snapshots_handles_multiple_cities(tmp_path):
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_skill_from_snapshots,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    _seed_snapshots_for_skill_fit(conn, source="nws_point",
+                                  city_series_pair=("KXHIGHNY", "KNYC"), n_days=35)
+    _seed_snapshots_for_skill_fit(conn, source="nws_point",
+                                  city_series_pair=("KXHIGHMIA", "KMIA"), n_days=35)
+
+    stats = fit_and_persist_skill_from_snapshots(conn)
+    # Both cities should land their own per-cell σ.
+    assert kv_get(conn, "weather_skill_nws_point_nyc_6_24") is not None
+    assert kv_get(conn, "weather_skill_nws_point_miami_6_24") is not None
+    # And MOS bias for each city.
+    assert kv_get(conn, "weather_mos_bias_nws_point_nyc") is not None
+    assert kv_get(conn, "weather_mos_bias_nws_point_miami") is not None

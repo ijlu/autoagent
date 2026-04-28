@@ -137,3 +137,129 @@ def test_router_applies_calibration_correction(monkeypatch):
     )
     assert prob == pytest.approx(0.60, abs=1e-6)
     assert n == 1
+
+
+# ── Weather v2 short-circuit (overrides family router) ──────────────────────
+
+
+def test_weather_v2_short_circuits_when_flag_enabled(monkeypatch):
+    """When WEATHER_ENSEMBLE_V2 is true and the ticker is weather, we should
+    call predict_v2 directly and skip the family router AND the generic
+    sources AND the Platt calibration."""
+    import bot.config as _config
+    monkeypatch.setattr(_config, "WEATHER_ENSEMBLE_V2", True)
+
+    router_called = {"n": 0}
+    monkeypatch.setattr(ensemble, "route_family",
+                        lambda t, m: (router_called.update(n=router_called["n"] + 1) or (0.65, "weather_ensemble:x")))
+
+    cal_called = {"n": 0}
+    def fake_cal(prob, corrections, ticker=None):
+        cal_called["n"] += 1
+        return prob - 0.10
+    monkeypatch.setattr(ensemble, "apply_calibration_correction", fake_cal)
+
+    # Stub predict_v2 to return a known value.
+    import bot.signals.weather_ensemble_v2 as v2
+    monkeypatch.setattr(
+        v2, "predict_v2",
+        lambda t, m: (0.83, "weather_ensemble_v2:hrrr+nbm+nws_point+weather+metar+madis+afd"),
+    )
+
+    prob, src, n = ensemble.get_independent_estimate(
+        "KXHIGHNY-26APR27-T75", {"title": "high"}, 0.5, 100.0,
+        calibration_corrections={"buckets": "x"},
+    )
+    assert prob == pytest.approx(0.83, abs=1e-6)
+    assert src.startswith("weather_ensemble_v2:")
+    # Tag has 7 plus-separated tokens but we cap at 5 independent groups.
+    assert n == 5
+    # Router was NOT called because v2 short-circuited.
+    assert router_called["n"] == 0
+    # Platt was NOT called either.
+    assert cal_called["n"] == 0
+
+
+def test_weather_v2_falls_through_when_flag_disabled(monkeypatch):
+    """When WEATHER_ENSEMBLE_V2 is false (default), we hit the family router
+    as before — no v2 call."""
+    import bot.config as _config
+    monkeypatch.setattr(_config, "WEATHER_ENSEMBLE_V2", False)
+
+    v2_called = {"n": 0}
+    import bot.signals.weather_ensemble_v2 as v2
+    def fake_v2(t, m):
+        v2_called["n"] += 1
+        return (0.83, "weather_ensemble_v2:x")
+    monkeypatch.setattr(v2, "predict_v2", fake_v2)
+
+    monkeypatch.setattr(ensemble, "route_family",
+                        lambda t, m: (0.65, "weather_ensemble:legacy"))
+
+    prob, src, n = ensemble.get_independent_estimate(
+        "KXHIGHNY-26APR27-T75", {"title": "high"}, 0.5, 100.0,
+    )
+    assert prob == pytest.approx(0.65, abs=1e-6)
+    assert v2_called["n"] == 0
+
+
+def test_weather_v2_falls_through_on_predict_v2_exception(monkeypatch):
+    """If predict_v2 raises, we fall back to the family router cleanly —
+    never leave the caller without an estimate."""
+    import bot.config as _config
+    monkeypatch.setattr(_config, "WEATHER_ENSEMBLE_V2", True)
+
+    import bot.signals.weather_ensemble_v2 as v2
+    def boom(t, m):
+        raise RuntimeError("simulated v2 failure")
+    monkeypatch.setattr(v2, "predict_v2", boom)
+
+    monkeypatch.setattr(ensemble, "route_family",
+                        lambda t, m: (0.65, "weather_ensemble:fallback"))
+
+    prob, src, n = ensemble.get_independent_estimate(
+        "KXHIGHNY-26APR27-T75", {"title": "high"}, 0.5, 100.0,
+    )
+    assert prob == pytest.approx(0.65, abs=1e-6)
+    assert src.startswith("weather_ensemble:fallback")
+
+
+def test_weather_v2_skipped_for_non_weather_ticker(monkeypatch):
+    """v2 is weather-only; non-weather tickers should still hit the router."""
+    import bot.config as _config
+    monkeypatch.setattr(_config, "WEATHER_ENSEMBLE_V2", True)
+
+    v2_called = {"n": 0}
+    import bot.signals.weather_ensemble_v2 as v2
+    def fake_v2(t, m):
+        v2_called["n"] += 1
+        return (0.83, "weather_ensemble_v2:x")
+    monkeypatch.setattr(v2, "predict_v2", fake_v2)
+
+    monkeypatch.setattr(ensemble, "route_family",
+                        lambda t, m: (0.55, "fedwatch:legacy"))
+
+    prob, src, n = ensemble.get_independent_estimate(
+        "KXFED-27APR-T2.00", {"title": "fed funds"}, 0.5, 100.0,
+    )
+    assert prob == pytest.approx(0.55, abs=1e-6)
+    assert v2_called["n"] == 0  # never called for non-weather
+
+
+def test_weather_v2_returns_none_falls_through(monkeypatch):
+    """If predict_v2 returns None (e.g. no sources fired), fall back to
+    the router rather than returning None outright."""
+    import bot.config as _config
+    monkeypatch.setattr(_config, "WEATHER_ENSEMBLE_V2", True)
+
+    import bot.signals.weather_ensemble_v2 as v2
+    monkeypatch.setattr(v2, "predict_v2", lambda t, m: (None, None))
+
+    monkeypatch.setattr(ensemble, "route_family",
+                        lambda t, m: (0.65, "weather_ensemble:legacy"))
+
+    prob, src, n = ensemble.get_independent_estimate(
+        "KXHIGHNY-26APR27-T75", {"title": "high"}, 0.5, 100.0,
+    )
+    assert prob == pytest.approx(0.65, abs=1e-6)
+    assert src.startswith("weather_ensemble:legacy")
