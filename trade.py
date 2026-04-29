@@ -29,9 +29,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 # New modular sources — import from bot package if available
 try:
-    from bot.signals.sources.metar_observations import get_metar_observation_estimate
+    from bot.signals.sources.metar_observations import (
+        get_metar_observation_estimate,
+        is_metar_fresh_for_ticker as _is_metar_fresh_for_ticker,
+    )
 except ImportError:
     get_metar_observation_estimate = None
+    _is_metar_fresh_for_ticker = None
 try:
     from bot.signals.sources.fedwatch import get_fedwatch_estimate
 except ImportError:
@@ -99,6 +103,7 @@ from bot.learning.alpha_log import (
     fill_settlement_for_ticker as _alpha_fill_settlement,
     log_decision as _alpha_log_decision,
     market_snapshot_from_dict as _alpha_market_snapshot,
+    to_canonical_p_yes as _to_canonical_p_yes,
 )
 from bot.learning.populate_from_alpha import populate_all as _alpha_populate_all
 from bot.learning.directional_shadow import (
@@ -6974,6 +6979,39 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                 _mid = (_mkt_snap.yes_bid_cents + _mkt_snap.yes_ask_cents) // 2
             elif _mkt_snap.yes_last_cents is not None:
                 _mid = _mkt_snap.yes_last_cents
+            # METAR-required gate for weather families. Validation 2026-04-29:
+            # combined μ degrades 1-3°F cold without fresh METAR, producing
+            # catastrophic Brier on bracket-edge calls. Refuse to trade
+            # weather without it. Non-weather tickers skip this check.
+            _is_weather_family = ticker.upper().startswith("KXHIGH")
+            _metar_fresh = (
+                _is_metar_fresh_for_ticker(ticker)
+                if (_is_weather_family and _is_metar_fresh_for_ticker is not None)
+                else True  # non-weather: gate is a no-op
+            )
+
+            # TTE window for weather families. Validation 2026-04-29:
+            # daily highs occur ~3pm LST, settlement is midnight LST, so
+            # TTE <9h means peak already passed and market is at trivial
+            # certainty (Brier ~0.0001) — unwinnable. Trade-eligible
+            # window is TTE ≥12h. Non-weather skips the gate.
+            _tte_hours = None
+            _min_tte_hours = 0.0
+            if _is_weather_family:
+                _close_time = m.get("close_time") if isinstance(m, dict) else None
+                if isinstance(_close_time, str):
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        _expiry_dt = _dt.fromisoformat(
+                            _close_time.replace("Z", "+00:00")
+                        )
+                        _tte_hours = (
+                            _expiry_dt - _dt.now(_tz.utc)
+                        ).total_seconds() / 3600.0
+                        _min_tte_hours = 12.0
+                    except (ValueError, TypeError):
+                        pass
+
             shadow_dec = _eval_directional_shadow(
                 ticker=ticker, side=side,
                 indep_prob=float(indep_prob) if indep_prob is not None else 0.5,
@@ -6981,6 +7019,10 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                 price_cents=int(price_cents),
                 market_mid_cents=_mid,
                 min_edge=MIN_EDGE,
+                metar_required=_is_weather_family,
+                metar_fresh=_metar_fresh,
+                tte_hours=_tte_hours,
+                min_tte_hours=_min_tte_hours,
             )
             if shadow_dec.outcome != _ShadowOutcome.SHADOW_PASS:
                 print(f"  → {ticker}: shadow={shadow_dec.outcome} "
@@ -6996,7 +7038,8 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                         decision_type=_AlphaType.DIRECTIONAL_SHADOW,
                         decision_outcome=_AlphaOutcome.DISCARDED,
                         ensemble=_AlphaEnsemble(
-                            p_yes=float(indep_prob), source_count=sc,
+                            p_yes=_to_canonical_p_yes(indep_prob, side),
+                            source_count=sc,
                         ),
                         market=_mkt_snap,
                         side=side, price_cents=int(price_cents),
@@ -7120,7 +7163,8 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                     decision_type=_AlphaType.DIRECTIONAL_SHADOW,
                     decision_outcome=_outcome,
                     ensemble=_AlphaEnsemble(
-                        p_yes=float(indep_prob), source_count=sc,
+                        p_yes=_to_canonical_p_yes(indep_prob, side),
+                        source_count=sc,
                     ),
                     market=_mkt_snap,
                     side=side, price_cents=int(price_cents),

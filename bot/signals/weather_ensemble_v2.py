@@ -188,6 +188,21 @@ _ASSUMED_STALENESS_HOURS: dict[str, float] = {
 # precision as a well-fit one — under-weight, but not silenced.
 _SOURCE_SIGMA_CEILING_F: float = 2.0
 
+# Per-source learned σ FLOOR. Symmetric counterpart to the ceiling.
+# Without this, a self-referential or under-sampled fit can produce a
+# σ ≪ 1°F (e.g. METAR fit on n=18 with the observation already baked
+# into "ground truth" → σ=0.3°F seen 2026-04-29). Such a tight σ gives
+# precision = 1/σ² = 11+, which dominates the combine and collapses
+# the ensemble's σ to <0.5°F → adjacent-bracket probabilities go to
+# 99% / 1% extremes → directional shadow Brier blew up from 0.16 to
+# 0.46 on KXHIGHNY (4×).
+#
+# 1.5°F floor: leaves room for genuinely-skilled sources (HRRR fit at
+# 1.16°F pooled) while preventing pathological tight σ from any single
+# source dominating. Caps any one source's precision contribution at
+# 1/2.25 = 0.44.
+_LEARNED_SIGMA_FLOOR_F: float = 1.5
+
 
 def _staleness_inflation_factor(
     g: GaussianForecast, now_unix: Optional[float] = None,
@@ -239,11 +254,40 @@ def _apply_learned_sigma(
     callers that don't have city context. The returned object preserves
     ``source_name`` and ``source_tag`` so group routing and provenance
     keep working.
+
+    The learned σ is floored at ``_LEARNED_SIGMA_FLOOR_F`` (1.5°F) — see
+    the constant's docstring for why. Briefly: pathological self-
+    referential fits can produce σ ≪ 1°F that dominates the combine and
+    collapses ensemble σ to <0.5°F.
     """
     learned = _get_learned_sigma(g.source_name, g.horizon_hours, city_key=city_key)
     if learned is None:
         return g
+    learned = max(learned, _LEARNED_SIGMA_FLOOR_F)
     return g.with_sigma(learned)
+
+
+def _apply_learned_sigma_with_flag(
+    g: GaussianForecast, city_key: Optional[str] = None,
+) -> tuple[GaussianForecast, bool]:
+    """Like ``_apply_learned_sigma`` but returns whether a learned value
+    was actually applied. The σ ceiling logic in ``_collect_gaussians``
+    uses this flag — sources WITH a learned σ are trusted (no ceiling
+    clip), sources WITHOUT one are protected by the ceiling so they
+    contribute meaningfully on day 1.
+
+    2026-04-29: previously the ceiling clipped EVERY source unconditionally,
+    which lied about NWS Point's true ~5°F RMSE (clipped to 2.0°F →
+    over-weighted in combine). Now: ceiling only fires for unfit sources;
+    learned σ values pass through but are floored at
+    ``_LEARNED_SIGMA_FLOOR_F`` (regression discovered when METAR's fit
+    produced σ=0.3°F → ensemble σ-collapse → Brier blew up).
+    """
+    learned = _get_learned_sigma(g.source_name, g.horizon_hours, city_key=city_key)
+    if learned is None:
+        return g, False
+    learned = max(learned, _LEARNED_SIGMA_FLOOR_F)
+    return g.with_sigma(learned), True
 
 
 # ── Learned MOS bias (A5) ─────────────────────────────────────────────
@@ -508,6 +552,35 @@ _NOAA_LOGIT_WEIGHT: float = 0.5
 _COMBINED_SIGMA_FLOOR_F: float = 1.0
 
 
+# Snapshot writer health counters. Set after the 26APR26 outage —
+# weather_forecast_snapshots had ~22h of zero writes (Apr 25 22:00 UTC →
+# Apr 26 19:59 UTC) while shadow writes continued, so the diagnostic lost
+# 19% of one day's settlement cohort. The original code swallowed write
+# errors with print(...) which never surfaced in the daemon health log.
+# Counters here are read once per HEALTH_LOG_INTERVAL_S window by
+# bot.daemon.main._log_health and reset to 0 — so a recurring failure
+# mode shows up as a non-zero failure count on every health line.
+_SNAPSHOT_WRITE_OK: int = 0
+_SNAPSHOT_WRITE_FAIL: int = 0
+_SNAPSHOT_BUILD_FAIL: int = 0
+
+
+def get_and_reset_snapshot_health_stats() -> dict[str, int]:
+    """Return cumulative snapshot writer counters since the last call,
+    then reset them. Designed for the periodic health-log emitter.
+    """
+    global _SNAPSHOT_WRITE_OK, _SNAPSHOT_WRITE_FAIL, _SNAPSHOT_BUILD_FAIL
+    stats = {
+        "write_ok": _SNAPSHOT_WRITE_OK,
+        "write_fail": _SNAPSHOT_WRITE_FAIL,
+        "build_fail": _SNAPSHOT_BUILD_FAIL,
+    }
+    _SNAPSHOT_WRITE_OK = 0
+    _SNAPSHOT_WRITE_FAIL = 0
+    _SNAPSHOT_BUILD_FAIL = 0
+    return stats
+
+
 def _logit(p: float) -> float:
     p = max(1e-6, min(1 - 1e-6, p))
     return math.log(p / (1.0 - p))
@@ -580,24 +653,70 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
     """
     city_key = _city_for_ticker(ticker)
     from bot.signals.sources.hrrr import get_hrrr_gaussian
-    from bot.signals.sources.madis import get_madis_gaussian
+    from bot.signals.sources.icon import get_icon_gaussian
     from bot.signals.sources.metar_observations import get_metar_gaussian
-    from bot.signals.sources.ndfd_nbm import get_nbm_gaussian
     from bot.signals.sources.nws_point import get_nws_point_gaussian
+    from bot.signals.sources.ukmo import get_ukmo_gaussian
     from bot.signals.sources.weather import get_weather_gaussian
+
+    # 2026-04-29 architectural revert: IEM 1-min ASOS removed from the
+    # live combine. Discovered post-deploy that IEM 1-min has ~24h
+    # publication latency — its `asos1min.py` endpoint serves archival
+    # historical data, not live observations. The eval recorded MAE
+    # 1.15°F because it ran retroactively against past dates where
+    # data WAS available; for forward-looking quotes IEM always returns
+    # None for the current-day market.
+    #
+    # The IEM 1-min source module + state row + pre-seed values stay
+    # in the codebase for two reasons:
+    #   1. Future use as a high-accuracy retrospective ground truth for
+    #      MOS bias fitting (CF6 is the canonical Kalshi-settlement
+    #      source, but IEM 1-min adds higher-resolution validation).
+    #   2. Documenting the lesson — re-adding IEM as a live source
+    #      would be a regression.
+    #
+    # METAR via aviationweather.gov remains the only real-time
+    # observation channel. Use it directly.
 
     # 2026-04-26: Tomorrow.io dropped — TOS storage clause + reanalysis-only
     # historical endpoint (can't backfill calibration). See bot/config.py
     # TOMORROW_API_KEY note. The function still exists in
     # bot/signals/sources/weather.py for code-archeology / potential
     # Visual-Crossing-style replacement, but is no longer wired in here.
+    #
+    # 2026-04-29: NBM removed from the combine. Live probe confirmed the
+    # "nbm" source (Open-Meteo with ``models=gfs_seamless``) returns
+    # values literally identical to the "weather" source (Open-Meteo
+    # default) for US lat/lons — to 0.0°F across 7 forecast days. The
+    # default Open-Meteo blend at temperate-zone US is GFS, full stop;
+    # forcing gfs_seamless is a no-op. Including both let the precision-
+    # weighted combine treat one source as two, halving the effective
+    # weight of every other source. Real NBM lives at NOAA's NBM API,
+    # not Open-Meteo. ``get_nbm_gaussian`` is preserved in
+    # ``bot.signals.sources.ndfd_nbm`` for back-compat with audit tools
+    # and tests that snapshot the v1 source list, but it is no longer
+    # wired into the production combine. Pin:
+    # tests/signals/test_weather_ensemble_v2_sources.py.
+    #
+    # 2026-04-29: MADIS removed from the combine. Its warming heuristic
+    # (median current temp + min(8°F, (15-hour)*1.5) before 3pm LST) is a
+    # strictly worse model than what ``metar_observations.get_metar_gaussian``
+    # already produces via the learned residual-σ machinery. Empirically
+    # produces -8 to -17°F bias on early-morning observations in spring
+    # because the +8°F flat bump under-models 20-30°F morning-to-peak
+    # swings. ``get_madis_gaussian`` preserved for back-compat as above.
+    # 2026-04-29: ICON, UKMO added (Phase B.2). Pre-seeded σ + bias +
+    # PROBATIONARY state from the eval data. Auto-promote to ACTIVE
+    # after 50+ settled rows with non-regression on combined Brier.
+    # IEM 1-min was added then removed same day (24h publication
+    # latency makes it useless as live observation).
     getters = [
         ("hrrr", get_hrrr_gaussian),
-        ("nbm", get_nbm_gaussian),
         ("nws_point", get_nws_point_gaussian),
         ("weather", get_weather_gaussian),
+        ("icon", get_icon_gaussian),
+        ("ukmo", get_ukmo_gaussian),
         ("metar", get_metar_gaussian),
-        ("madis", get_madis_gaussian),
     ]
     out: list[GaussianForecast] = []
     for name, fn in getters:
@@ -608,9 +727,13 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
             continue
         if g is None:
             continue
-        if g.source_name != name:
+        if g.source_name != name and not name.startswith("__"):
             # Defensive: source misidentified itself. Fix here so downstream
             # grouping uses the canonical key rather than the source's tag.
+            # ``__name__`` keys are sentinel for multi-getter channels
+            # (e.g., __observation_channel__ which dispatches to either
+            # iem_1min or metar) — preserve the underlying source's
+            # actual name so learned σ / MOS bias / snapshots key by it.
             g = GaussianForecast(
                 mean_f=g.mean_f, sigma_f=g.sigma_f,
                 horizon_hours=g.horizon_hours,
@@ -620,7 +743,9 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
         # for this (source, [city,] horizon bucket) when available.
         # Per-city skill σ first (post-2026-04-26 — actual error std varies
         # 0.9-2.0°F by city), pooled fallback, then source's own prior.
-        g = _apply_learned_sigma(g, city_key=city_key)
+        # Returns a flag indicating whether σ was actually replaced — the
+        # ceiling below only fires for un-fit sources (no learned value).
+        g, sigma_was_learned = _apply_learned_sigma_with_flag(g, city_key=city_key)
         # B: inflate σ for source staleness. NBM updates every 6 hours,
         # so a randomly-fetched NBM forecast is ~3h stale on average →
         # treat it as if it were a 3h-older forecast horizon. Live obs
@@ -631,18 +756,149 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
         # A5: shift mean by -bias for this (source, city, season, bucket)
         # when a MOS bias fit has been persisted. Cold-cache = no shift.
         g = _apply_mos_bias(g, city_key)
-        # B (per-source σ ceiling): cap σ so any source whose skill curve
-        # hasn't been fit (NWS Point, MADIS, AFD have only n=12 backfill
-        # rows and inherit a 3+°F pooled fallback) can't be effectively
-        # excluded from the precision-weighted combine. The ceiling is set
-        # so a worst-case fallback source still contributes ~25% as much
-        # precision as a well-fit one (precision = 1/σ²; cap σ=2.0 vs
-        # well-fit σ=1.0 → precision ratio 0.25). Properly fits later via
-        # the snapshots-based skill fitter (Option A).
-        if g.sigma_f > _SOURCE_SIGMA_CEILING_F:
+        # B (per-source σ ceiling): only protects unfit sources (no
+        # learned σ in kv_cache yet). Once `_apply_learned_sigma`
+        # returns a fitted value, we trust it — the ceiling's "ensure
+        # contribution to combine" purpose is moot if we've measured the
+        # source's true performance. Pre-2026-04-29 the ceiling fired
+        # unconditionally, which clipped NWS Point's true ~5°F σ down to
+        # 2°F and over-weighted it in the combine.
+        if not sigma_was_learned and g.sigma_f > _SOURCE_SIGMA_CEILING_F:
             g = g.with_sigma(_SOURCE_SIGMA_CEILING_F)
+        # C (state-machine inflation): probationary sources get σ × 1.3
+        # to cap their weight while on trial. Active sources unchanged.
+        # Shadow / demoted sources are filtered out at the next step.
+        g = _apply_state_machine_inflation(g, city_key)
+        # D (state-machine filter): drop sources whose state excludes
+        # them from the combine (shadow, demoted). Snapshots still
+        # record them upstream of this filter.
+        if not _is_state_machine_active(g, city_key):
+            continue
         out.append(g)
-    return out
+    return _apply_sanity_gate(out)
+
+
+# ── State-machine helpers (Phase B.2) ─────────────────────────────────
+# `bot.learning.source_state_machine` owns the lifecycle. These wrappers
+# are how `_collect_gaussians` consults it per-cycle. Both functions
+# fail-safe on any error (default: include the source) — a transient DB
+# read failure should not silently zero out the combine.
+
+
+def _apply_state_machine_inflation(
+    g: GaussianForecast, city_key: Optional[str],
+) -> GaussianForecast:
+    """If the source is in PROBATIONARY state, inflate σ by the configured
+    multiplier (1.3) to cap its weight while on trial. Active sources
+    unchanged. Shadow / demoted not handled here — they're filtered at
+    the next step."""
+    try:
+        from bot.db import get_connection
+        from bot.learning.source_state_machine import (
+            get_source_state, sigma_inflation_for_state,
+        )
+        conn = get_connection()
+        state = get_source_state(conn, g.source_name, city_key or "pooled")
+        mult = sigma_inflation_for_state(state)
+        if mult != 1.0:
+            return g.with_sigma(g.sigma_f * mult)
+        return g
+    except Exception:
+        # Fail-safe: don't inflate on error. Source contributes at its
+        # natural σ; subsequent filter still applies.
+        return g
+
+
+def _is_state_machine_active(
+    g: GaussianForecast, city_key: Optional[str],
+) -> bool:
+    """True iff the source's state allows combine inclusion (active or
+    probationary). Shadow / demoted return False.
+
+    Fail-safe: on read errors return True (include). Better to over-include
+    on a transient DB hiccup than to silently empty the combine."""
+    try:
+        from bot.db import get_connection
+        from bot.learning.source_state_machine import (
+            get_source_state, is_source_in_combine,
+        )
+        conn = get_connection()
+        state = get_source_state(conn, g.source_name, city_key or "pooled")
+        return is_source_in_combine(state)
+    except Exception:
+        return True
+
+
+# Sanity gate: median-anchored outlier exclusion.
+#
+# Discovered 2026-04-29 that Open-Meteo and NWS Point regularly produce μ
+# 5-15°F off the actual high at low TTE while reporting σ=2.0°F (way too
+# tight for that error magnitude). Their precision weight stays at 1/4 in
+# the combine, dragging combined.μ cold by 2-3°F. METAR+HRRR-only combine
+# beats the 4-source combine by 44% Brier at TTE ≤1h.
+#
+# This gate excludes any source whose μ is more than ``_SANITY_GATE_F``
+# away from the median of (METAR.μ, HRRR.μ) when both are present, else
+# the median of all source μs. METAR is always kept (anchor source). The
+# excluded source is still snapshot'd by the writer (``_write_snapshots``
+# upstream of this filter) — only the live combine drops it.
+#
+# Threshold of 5°F: tight enough to catch the 5-15°F cold-bias cases we
+# observed; loose enough that genuine forecast disagreements (~3°F at
+# long TTE) are kept. Pinned by tests/signals/test_sanity_gate.py.
+_SANITY_GATE_F: float = 5.0
+
+
+_OBSERVATION_SOURCE_NAMES: frozenset[str] = frozenset({"metar", "iem_1min"})
+
+
+def _apply_sanity_gate(gaussians: list[GaussianForecast]) -> list[GaussianForecast]:
+    """Exclude sources whose μ is too far from the observation/HRRR consensus.
+
+    The "observation" source name can be either ``metar`` or ``iem_1min``
+    depending on which fired in the observation channel — both read the
+    same physical ASOS station, so either makes a fine anchor.
+    """
+    if len(gaussians) <= 2:
+        # With ≤2 sources we can't triangulate; keep them all.
+        return gaussians
+
+    obs = next(
+        (g for g in gaussians if g.source_name in _OBSERVATION_SOURCE_NAMES),
+        None,
+    )
+    hrrr = next((g for g in gaussians if g.source_name == "hrrr"), None)
+
+    # Anchor: prefer obs+HRRR median (most-skillful pair). Fall back to
+    # all-source median when either is absent.
+    if obs is not None and hrrr is not None:
+        anchor = (obs.mean_f + hrrr.mean_f) / 2.0
+    else:
+        mus = sorted(g.mean_f for g in gaussians)
+        anchor = mus[len(mus) // 2]
+
+    kept: list[GaussianForecast] = []
+    rejected_names: list[str] = []
+    for g in gaussians:
+        if g is obs:
+            kept.append(g)  # observation is the anchor; never drop
+            continue
+        if abs(g.mean_f - anchor) <= _SANITY_GATE_F:
+            kept.append(g)
+        else:
+            rejected_names.append(
+                f"{g.source_name}({g.mean_f:.1f}vs{anchor:.1f})"
+            )
+
+    if rejected_names:
+        # Per-cycle visibility — these reasons are interesting for ops
+        # but not a fatal log; they show up in daemon.log alongside the
+        # snapshot health line.
+        print(
+            f"[weather_ensemble_v2] sanity gate excluded "
+            f"{len(rejected_names)} source(s): {', '.join(rejected_names)}"
+        )
+    return kept
 
 
 def _weighted_inputs_with_group_discount(
@@ -702,19 +958,55 @@ def _snapshot_rows(
     """Build the list of ``weather_forecast_snapshots`` rows to insert.
 
     Columns per db.py: (recorded_at, series, ticker, source, forecast_prob,
-    forecast_high_f, sigma_f, hours_out). For Gaussian components we
-    record forecast_high_f + sigma_f + hours_out and leave prob NULL
-    (projection happens centrally). For the combined row we record both
-    the combined Gaussian AND the projected prob so backtest readers
-    don't need to re-project.
+    forecast_high_f, sigma_f, hours_out, regime_label, regime_tier_used,
+    regime_sigma_f, pooled_sigma_f). For Gaussian components we record
+    forecast_high_f + sigma_f + hours_out and leave prob NULL (projection
+    happens centrally). For the combined row we record both the combined
+    Gaussian AND the projected prob so backtest readers don't need to
+    re-project.
+
+    Stage 1 regime telemetry: only the METAR row carries non-NULL regime_*
+    columns — the σ side-channel from
+    ``bot.signals.sources.metar_observations._RESIDUAL_TIER_META`` is keyed
+    by station, so we look up the station from the ticker and pop the
+    metadata for the METAR row only. Other source rows leave the regime
+    columns NULL (they're METAR-specific by design).
     """
+    # Resolve station from the ticker so we can fetch the regime
+    # telemetry side-channel for the METAR row (if any).
+    metar_meta: Optional[dict] = None
+    try:
+        from bot.daemon.stations import station_for_ticker
+        from bot.signals.sources.metar_observations import (
+            get_residual_tier_meta,
+        )
+        ws = station_for_ticker(ticker)
+        if ws is not None:
+            metar_meta = get_residual_tier_meta(ws.icao)
+    except Exception:
+        metar_meta = None
+
+    def _meta_cols(source_name: str):
+        # Only the METAR row carries the regime telemetry; other sources
+        # leave these four columns NULL.
+        if source_name != "metar" or metar_meta is None:
+            return (None, None, None, None)
+        return (
+            metar_meta.get("regime_label"),
+            metar_meta.get("regime_tier_used"),
+            metar_meta.get("regime_sigma_f"),
+            metar_meta.get("pooled_sigma_f"),
+        )
+
     rows = []
     for g in gaussians:
+        ml, tier, rsig, psig = _meta_cols(g.source_name)
         rows.append((
             now_iso, series, ticker, g.source_name,
             None,                         # forecast_prob (Gaussian sources log mean, not prob)
             g.mean_f, g.sigma_f,
             int(round(g.horizon_hours)),
+            ml, tier, rsig, psig,
         ))
     if afd_tag is not None and afd_bias is not None:
         rows.append((
@@ -722,12 +1014,14 @@ def _snapshot_rows(
             None,                         # not a prob
             afd_bias, None,               # mean_f slot repurposed as bias_f
             None,
+            None, None, None, None,       # regime cols NULL for non-METAR
         ))
     rows.append((
         now_iso, series, ticker, "combined_v2",
         combined_prob,
         combined.mean_f, combined.sigma_f,
         int(round(combined.horizon_hours)),
+        None, None, None, None,           # regime cols NULL for combined
     ))
     return rows
 
@@ -740,15 +1034,22 @@ def _write_snapshots(rows):
         conn.executemany(
             """INSERT INTO weather_forecast_snapshots
                (recorded_at, series, ticker, source, forecast_prob,
-                forecast_high_f, sigma_f, hours_out)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                forecast_high_f, sigma_f, hours_out,
+                regime_label, regime_tier_used, regime_sigma_f, pooled_sigma_f)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 
+    global _SNAPSHOT_WRITE_OK, _SNAPSHOT_WRITE_FAIL
     try:
         db_write(_do)
+        _SNAPSHOT_WRITE_OK += 1
     except Exception as e:
-        print(f"[weather_ensemble_v2] snapshot error: {type(e).__name__}: {e}")
+        _SNAPSHOT_WRITE_FAIL += 1
+        print(
+            f"[weather_ensemble_v2][ERROR] snapshot write failed: "
+            f"{type(e).__name__}: {e}"
+        )
 
 
 def predict_v2(
@@ -924,7 +1225,12 @@ def predict_v2(
         )
         _write_snapshots(rows)
     except Exception as e:
-        print(f"[weather_ensemble_v2] snapshot build error: {type(e).__name__}: {e}")
+        global _SNAPSHOT_BUILD_FAIL
+        _SNAPSHOT_BUILD_FAIL += 1
+        print(
+            f"[weather_ensemble_v2][ERROR] snapshot build failed: "
+            f"{type(e).__name__}: {e}"
+        )
 
     # 8. Build provenance tag
     parts = [g.source_name for g in gaussians]

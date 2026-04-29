@@ -93,6 +93,71 @@ class TestInitDb:
         conn = init_db(":memory:")
         conn.execute("SELECT param_name, value, version FROM learned_config LIMIT 1")
 
+    def test_weather_metar_hourly_regime_exists(self):
+        """Stage 1 regime sibling backfill table — pinned columns."""
+        conn = init_db(":memory:")
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(weather_metar_hourly_regime)"
+        ).fetchall()}
+        required = {
+            "id", "created_at", "station", "lst_date", "lst_hour",
+            "dwpf", "drct", "sknt", "skyc1",
+        }
+        missing = required - cols
+        assert not missing, f"weather_metar_hourly_regime missing columns: {missing}"
+        # Confirm the unique constraint backing idempotent backfill
+        conn.execute(
+            "INSERT INTO weather_metar_hourly_regime "
+            "(created_at, station, lst_date, lst_hour) VALUES (?, ?, ?, ?)",
+            ("2026-04-28T00:00", "KMIA", "2026-04-28", 14),
+        )
+        try:
+            conn.execute(
+                "INSERT INTO weather_metar_hourly_regime "
+                "(created_at, station, lst_date, lst_hour) VALUES (?, ?, ?, ?)",
+                ("2026-04-28T00:00", "KMIA", "2026-04-28", 14),
+            )
+            assert False, "expected UNIQUE constraint violation"
+        except Exception as e:
+            assert "UNIQUE" in str(e).upper()
+
+    def test_weather_forecast_snapshots_regime_columns(self):
+        """Stage 1 telemetry columns added to capture regime-vs-pooled σ."""
+        conn = init_db(":memory:")
+        cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(weather_forecast_snapshots)"
+        ).fetchall()}
+        required = {
+            "regime_label", "regime_tier_used",
+            "regime_sigma_f", "pooled_sigma_f",
+        }
+        missing = required - cols
+        assert not missing, (
+            f"weather_forecast_snapshots missing regime columns: {missing}"
+        )
+
+    def test_weather_forecast_snapshots_legacy_insert_compat(self):
+        """The legacy v1 ensemble INSERT (8 columns, no regime) must still
+        work after the regime-column additions. New columns default NULL.
+        """
+        conn = init_db(":memory:")
+        conn.execute(
+            """INSERT INTO weather_forecast_snapshots
+               (recorded_at, series, ticker, source, forecast_prob,
+                forecast_high_f, sigma_f, hours_out)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("2026-04-28T20:00", "KXHIGHMIA", "KXHIGHMIA-26APR28-T85",
+             "metar", None, 85.0, 1.0, 5),
+        )
+        row = conn.execute(
+            """SELECT regime_label, regime_tier_used, regime_sigma_f,
+                      pooled_sigma_f
+                 FROM weather_forecast_snapshots LIMIT 1"""
+        ).fetchone()
+        assert row == (None, None, None, None), (
+            f"new columns should default NULL on legacy insert, got {row}"
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Startup invariants

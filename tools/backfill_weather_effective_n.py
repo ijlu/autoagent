@@ -1180,6 +1180,123 @@ def update_daily_high_from_cf6(
     return len(rows)
 
 
+def fetch_metar_regime_hourly(
+    station: WeatherStation, start_date: str, end_date: str,
+    *, session: Optional[requests.Session] = None,
+) -> list[tuple[str, int, Optional[float], Optional[float],
+                Optional[float], Optional[str]]]:
+    """Fetch hourly METAR regime features (dewpoint, wind dir/speed, sky
+    cover) from IEM's ASOS archive.
+
+    Returns ``(lst_date, lst_hour, dwpf, drct, sknt, skyc1)`` per cell —
+    the LAST observation of each LST hour, mirroring ``fetch_metar_hourly``
+    semantics. Any of the regime fields may be None when the station's
+    METAR for that hour didn't include the field (common for skyc1).
+    """
+    sess = session or requests
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    params = {
+        "station": station.icao,
+        "data": "dwpf,drct,sknt,skyc1",
+        "year1": start_dt.year, "month1": start_dt.month, "day1": start_dt.day,
+        "year2": end_dt.year, "month2": end_dt.month, "day2": end_dt.day,
+        "tz": "Etc/UTC",
+        "format": "onlycomma",
+        "missing": "empty",
+        "latlon": "no",
+    }
+    r = sess.get(
+        _IEM_ASOS_URL, params=params, timeout=60,
+        headers={"User-Agent": _USER_AGENT},
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"IEM asos HTTP {r.status_code}: {r.text[:200]}"
+        )
+    reader = csv.DictReader(io.StringIO(r.text))
+    lst_tz = timezone(timedelta(hours=station.lst_offset))
+
+    # (lst_date, lst_hour) → (dwpf, drct, sknt, skyc1, last_utc_dt)
+    per_cell: dict[
+        tuple[str, int],
+        tuple[Optional[float], Optional[float], Optional[float],
+              Optional[str], datetime],
+    ] = {}
+
+    def _maybe_float(s: str) -> Optional[float]:
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    for row in reader:
+        ts_raw = (row.get("valid") or "").strip()
+        if not ts_raw:
+            continue
+        try:
+            dt_utc = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        dt_lst = dt_utc.astimezone(lst_tz)
+        cell = (dt_lst.date().isoformat(), dt_lst.hour)
+        prev = per_cell.get(cell)
+        if prev is None or dt_utc > prev[4]:
+            per_cell[cell] = (
+                _maybe_float(row.get("dwpf", "")),
+                _maybe_float(row.get("drct", "")),
+                _maybe_float(row.get("sknt", "")),
+                (row.get("skyc1") or "").strip() or None,
+                dt_utc,
+            )
+    out: list[tuple[str, int, Optional[float], Optional[float],
+                    Optional[float], Optional[str]]] = []
+    for (lst_date, lst_hour), (dwpf, drct, sknt, skyc1, _) in sorted(per_cell.items()):
+        out.append((lst_date, lst_hour, dwpf, drct, sknt, skyc1))
+    return out
+
+
+def replay_regime_hourly_and_write(
+    conn: sqlite3.Connection,
+    station: WeatherStation,
+    start_date: str,
+    end_date: str,
+    *,
+    session: Optional[requests.Session] = None,
+) -> int:
+    """Fetch hourly regime features and write to
+    ``weather_metar_hourly_regime``. Returns rows written.
+
+    Idempotent via UNIQUE(station, lst_date, lst_hour) + INSERT OR REPLACE.
+    """
+    records = fetch_metar_regime_hourly(
+        station, start_date, end_date, session=session,
+    )
+    if not records:
+        return 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = [
+        (now_iso, station.icao, lst_date, lst_hour, dwpf, drct, sknt, skyc1)
+        for (lst_date, lst_hour, dwpf, drct, sknt, skyc1) in records
+    ]
+
+    def _write(c):
+        c.executemany(
+            """INSERT OR REPLACE INTO weather_metar_hourly_regime
+               (created_at, station, lst_date, lst_hour,
+                dwpf, drct, sknt, skyc1)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+    db_write(_write, conn=conn)
+    return len(rows)
+
+
 def replay_hourly_and_write(
     conn: sqlite3.Connection,
     station: WeatherStation,

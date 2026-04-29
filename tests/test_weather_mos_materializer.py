@@ -190,9 +190,12 @@ def test_materialize_due_writes_one_row_per_canonical_source(conn, fake_iem):
     # NY ticker; source set covers exactly the canonical Gaussian sources
     # (minus metar, which the materializer excludes).
     ticker = "KXHIGHNY-26APR23-T67"
+    # 2026-04-29: source set updated to match _MATERIALIZED_SOURCES (which
+    # is GAUSSIAN_COMBINE_SOURCES - metar). NBM, MADIS, Tomorrow dropped;
+    # ICON, UKMO, IEM 1-min added.
     means = {
-        "hrrr": 68.0, "nbm": 67.5, "nws_point": 68.5,
-        "tomorrow": 67.0, "weather": 68.2, "madis": 66.8,
+        "hrrr": 68.0, "nws_point": 68.5, "weather": 68.2,
+        "icon": 67.8, "ukmo": 67.2, "iem_1min": 67.5,
     }
     _populate_full_ticker(
         conn, ticker, recorded_at="2026-04-23T08:00:00Z", source_means=means,
@@ -276,10 +279,12 @@ def test_materialize_due_dedups_iem_per_city_date(conn, fake_iem):
 
 
 def test_materialize_due_idempotent_under_repeat_runs(conn, fake_iem):
+    # 2026-04-29: was hrrr+nbm; nbm dropped from GAUSSIAN_COMBINE_SOURCES
+    # (Open-Meteo proxy duplicate). Swap to hrrr+weather (also in combine).
     ticker = "KXHIGHMIA-26APR18-B84.5"
     _populate_full_ticker(
         conn, ticker, recorded_at="2026-04-18T08:00:00Z",
-        source_means={"hrrr": 85.0, "nbm": 84.5},
+        source_means={"hrrr": 85.0, "weather": 84.5},
     )
     fake_iem.responses[("KMIA", "2026-04-18")] = 86.0
 
@@ -296,10 +301,11 @@ def test_materialize_due_idempotent_under_repeat_runs(conn, fake_iem):
 
 
 def test_materialize_due_iem_miss_soft_skips_and_retries(conn, fake_iem):
+    # 2026-04-29: was hrrr+nbm; same swap as above.
     ticker = "KXHIGHCHI-26APR20-T55"
     _populate_full_ticker(
         conn, ticker, recorded_at="2026-04-20T08:00:00Z",
-        source_means={"hrrr": 56.0, "nbm": 55.5},
+        source_means={"hrrr": 56.0, "weather": 55.5},
     )
     # Pass 1: IEM has no response → soft skip
     s1 = materialize_due(conn, today_iso="2026-04-25")

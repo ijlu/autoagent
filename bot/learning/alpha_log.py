@@ -139,6 +139,32 @@ class EnsembleSnapshot:
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────
+def to_canonical_p_yes(prob: float, side: str) -> float:
+    """Convert P(our_side) → canonical P(YES) for ``alpha_backtest.ensemble_p_yes``.
+
+    The column convention (per ``EnsembleSnapshot.p_yes`` docstring and per
+    every reader that flips on side — populate_from_alpha, shadow_promotion,
+    bakeoff) is **canonical P(YES), regardless of which side we'd take**.
+
+    Internal probabilities in the directional pipeline are P(our_side) — the
+    score_market candidate constructor flips for NO candidates and
+    directional_shadow.py operates on the post-flip value (see its
+    ``_our_side_market_prob`` and ``indep_prob`` docstring). When those
+    callers log to alpha_backtest, they MUST convert here first.
+
+    Regression note: the Apr 28 bug shipped P(our_side) directly into
+    ``ensemble_p_yes`` for directional shadow rows. 100% of weather rows
+    are side='no' so 100% of weather alpha_backtest data was inverted on
+    one side and double-flipped through populate_from_alpha. This helper
+    + its test are the regression guard.
+    """
+    if side == "yes":
+        return float(prob)
+    if side == "no":
+        return float(1.0 - prob)
+    raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+
+
 def family_from_ticker(ticker: str) -> str:
     """Extract the family prefix. Kalshi tickers look like
     KXHIGHMIA-26APR18-T75 or KXFED-26MAY-T425. We take everything before
@@ -289,6 +315,8 @@ def log_decision(
     cycle_id: Optional[str] = None,
     notes: Optional[str] = None,
     ts_decision_unix: Optional[float] = None,
+    market_id: Optional[str] = None,
+    portfolio_leg_count: Optional[int] = None,
 ) -> Optional[int]:
     """Insert one row into alpha_backtest. Never raises.
 
@@ -329,11 +357,11 @@ def log_decision(
                     yes_bid_cents, yes_ask_cents, yes_last_cents,
                     last_trade_age_s, spread_cents, volume_fp,
                     market_prob_yes, market_prob_source,
-                    cycle_id, notes
+                    cycle_id, notes, market_id, portfolio_leg_count
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           ?, ?, ?, ?, ?,
                           ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?)""",
+                          ?, ?, ?, ?, ?, ?)""",
                 (
                     ts_decision, ts_decision_unix, ticker, family,
                     decision_type, decision_outcome, side, price_cents,
@@ -343,7 +371,7 @@ def log_decision(
                     market.yes_bid_cents, market.yes_ask_cents, market.yes_last_cents,
                     market.last_trade_age_s, spread_cents, market.volume_fp,
                     market_prob, market_prob_source,
-                    cycle_id, notes,
+                    cycle_id, notes, market_id, portfolio_leg_count,
                 ),
             )
         return cur.lastrowid
@@ -374,6 +402,16 @@ def fill_settlement(
     sides win when result='yes'; NO sides win when result='no'. For rows
     with side=None, won_yes is only populated when we can infer it from
     the decision_type context (we don't — set to NULL).
+
+    .. note:: Convention — ``won_yes`` stores **"did our trade win"**, NOT
+       "did the YES outcome happen." The two coincide for YES-side rows
+       but are flipped for NO-side rows. Any reader computing Brier
+       (prediction vs actual YES outcome) MUST use
+       ``CASE WHEN side='yes' THEN won_yes ELSE 1 - won_yes END``
+       to recover the YES outcome. PnL readers, however, can use
+       ``100 * won_yes - price_cents`` directly regardless of side
+       (since "our trade won" is exactly what determines payout).
+       See ``tools/validate_cross_bracket.py`` for both patterns.
     """
     try:
         if ts_settle_unix is None:

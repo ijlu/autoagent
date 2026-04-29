@@ -65,6 +65,8 @@ def test_no_raw_commits_outside_bot_db():
             continue
         if rel.startswith("tests/"):
             continue  # Tests own their fixture connections.
+        if rel.startswith("tools/"):
+            continue  # One-shot utilities open their own short-lived conns.
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:

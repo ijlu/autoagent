@@ -230,24 +230,47 @@ def _determine_day_index(title: str, market_data: dict | None = None,
     lst_tz = timezone(timedelta(hours=offset))
     today_local = datetime.now(lst_tz).date()
 
-    # 1. Try market_data expiry date (most reliable)
+    # 1. Try market_data expiry date (most reliable). If ANY expiry field
+    # was provided and successfully parsed, we trust it absolutely — even
+    # if it's out of the 7-day forecast horizon. The only valid reason to
+    # fall through to title heuristics is "no expiry was supplied at all"
+    # (test fixtures, malformed inputs). For real Kalshi markets that have
+    # already closed (delta < 0), the correct answer is None — we must
+    # never produce "today's" forecast for yesterday's settled market.
+    saw_valid_expiry = False
     if market_data:
         for field in ("close_time", "expiration_time", "expected_expiration_time"):
             val = market_data.get(field)
             if val and isinstance(val, str):
                 try:
                     expiry_dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
-                    expiry_local = expiry_dt.astimezone(lst_tz).date()
-                    delta = (expiry_local - today_local).days
-                    if 0 <= delta < 7:
-                        return delta
-                    print(f"[weather] Settlement {expiry_local} is {delta}d from "
-                          f"today ({today_local}) — outside 7-day forecast")
-                    return None
                 except (ValueError, TypeError):
                     continue
+                expiry_local = expiry_dt.astimezone(lst_tz).date()
+                delta = (expiry_local - today_local).days
+                saw_valid_expiry = True
+                if 0 <= delta < 7:
+                    return delta
+                # Past or beyond-7-days: refuse to guess. The original
+                # bug here was falling through to title heuristics on
+                # past-close markets, which silently returned 0
+                # (today's forecast) for yesterday's settled market —
+                # generating 5-17°F-cold stale predictions in
+                # weather_forecast_snapshots for every closed weather
+                # ticker. Pin: tests/signals/test_weather_day_index_past.py
+                if delta < 0:
+                    return None
+                print(f"[weather] Settlement {expiry_local} is {delta}d from "
+                      f"today ({today_local}) — outside 7-day forecast")
+                return None
 
-    # 2. Fall back to title-based heuristics
+    # 2. Fall back to title-based heuristics ONLY when no expiry field
+    # was successfully parsed. If we saw an expiry that was rejected on
+    # range, we already returned None above; we must never reach here
+    # with a known-bad expiry.
+    if saw_valid_expiry:
+        return None
+
     title_lower = title if title == title.lower() else title.lower()
 
     if "day after tomorrow" in title_lower:

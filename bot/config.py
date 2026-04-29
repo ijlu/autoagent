@@ -55,6 +55,14 @@ WEATHER_MM_LIVE = os.environ.get("WEATHER_MM_LIVE", "false").lower() in ("true",
 # posting is still gated by WEATHER_MM_LIVE. Falls back to v1 on v2 errors / None.
 WEATHER_ENSEMBLE_V2 = os.environ.get("WEATHER_ENSEMBLE_V2", "false").lower() in ("true", "1", "yes")
 
+# Stage 1 (regime conditioning, 2026-04-28) — when true, METAR's residual σ
+# lookup walks (station, hour, regime) → (station, regime) → (station, hour
+# pooled) → schedule. Default false: snapshot rows still capture both the
+# regime-σ-that-would-have-been-used and pooled-σ-that-was-used for offline
+# Brier comparison, so we accumulate the longitudinal dataset Stage 2's
+# promotion gate needs without changing live behavior.
+WEATHER_REGIME_SIGMA = os.environ.get("WEATHER_REGIME_SIGMA", "false").lower() in ("true", "1", "yes")
+
 # Platt calibration application gate. Default false (2026-04-27 audit):
 # the persisted Platt curve was fit overwhelmingly on weather rows from the
 # broken v1 ensemble path (8509/8815 rows = 96.5%) and degenerated into a

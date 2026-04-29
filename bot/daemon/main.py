@@ -321,6 +321,7 @@ def _run_hourly_backfill(conn) -> None:
     from bot.daemon.stations import STATIONS
     from tools.backfill_weather_effective_n import (
         replay_hourly_and_write,
+        replay_regime_hourly_and_write,
         update_daily_high_from_cf6,
     )
 
@@ -343,6 +344,25 @@ def _run_hourly_backfill(conn) -> None:
                 icao, start_date, end_date, exc,
             )
             failures.append(icao)
+
+    # ── Stage 1b: regime features → weather_metar_hourly_regime ──
+    # Sibling table with the same key shape but adds wind dir, sky
+    # cover, dewpoint. Decoupled write so a regime fetch failure can't
+    # block the main backfill (which the calibration pipeline depends on).
+    regime_rows = 0
+    regime_failures: list[str] = []
+    for icao, station in STATIONS.items():
+        try:
+            n = replay_regime_hourly_and_write(
+                conn, station, start_date, end_date,
+            )
+            regime_rows += n
+        except Exception as exc:
+            logger.warning(
+                "[hourly_backfill] regime %s [%s..%s] failed: %s",
+                icao, start_date, end_date, exc,
+            )
+            regime_failures.append(icao)
 
     # ── Stage 2: CF6 TMAX overwrites the per-row daily_high_f ──
     # Walk current + previous calendar month per station. Two months
@@ -369,10 +389,12 @@ def _run_hourly_backfill(conn) -> None:
 
     logger.info(
         "[hourly_backfill] window=[%s..%s] stations=%d hourly_rows=%d "
-        "cf6_days_updated=%d failures_hourly=%d failures_cf6=%d%s%s",
-        start_date, end_date, len(STATIONS), total_rows, cf6_updated,
-        len(failures), len(cf6_failures),
+        "regime_rows=%d cf6_days_updated=%d failures_hourly=%d "
+        "failures_regime=%d failures_cf6=%d%s%s%s",
+        start_date, end_date, len(STATIONS), total_rows, regime_rows,
+        cf6_updated, len(failures), len(regime_failures), len(cf6_failures),
         f" failed_stations={','.join(failures)}" if failures else "",
+        f" failed_regime={','.join(regime_failures)}" if regime_failures else "",
         f" failed_cf6={','.join(cf6_failures)}" if cf6_failures else "",
     )
 
@@ -451,6 +473,28 @@ def _run_mos_materializer(conn) -> None:
             )
     except Exception as exc:
         logger.warning("[metar_residual_fitter] failed: %s", exc)
+
+    # Stage 1: regime-conditional METAR residual σ. Fits per-(station,
+    # hour, regime) and per-(station, regime). Reads from the regime
+    # sibling backfill table populated by _run_hourly_backfill. Writes to
+    # kv_cache under TIER1/TIER2 prefixes; the predict-time lookup
+    # consults these BEFORE the pooled (tier 3) keys when
+    # WEATHER_REGIME_SIGMA flag is enabled. Logging-only otherwise.
+    try:
+        from bot.learning.regime_residual_fitter import (
+            fit_and_persist_regime_residual_sigma,
+        )
+        regime_stats = fit_and_persist_regime_residual_sigma(conn)
+        if (regime_stats["tier1_keys_written"]
+                or regime_stats["tier2_keys_written"]):
+            logger.info(
+                "[regime_residual_fitter] tier1_written=%d tier1_thin=%d "
+                "tier2_written=%d tier2_thin=%d",
+                regime_stats["tier1_keys_written"], regime_stats["tier1_thin"],
+                regime_stats["tier2_keys_written"], regime_stats["tier2_thin"],
+            )
+    except Exception as exc:
+        logger.warning("[regime_residual_fitter] failed: %s", exc)
 
     # Snapshots-based skill σ + MOS bias for sources missing from the
     # original Open-Meteo backfill (NWS Point, MADIS, etc.). Reads live
@@ -649,6 +693,127 @@ def _run_series_discovery(conn) -> None:
         )
 
 
+def _run_cross_bracket_shadow(conn) -> None:
+    """Phase B.3: cross-bracket portfolio shadow logger.
+
+    Scores all open weather markets via cross-bracket portfolio scoring
+    every 5 min. Each non-skip leg gets logged to alpha_backtest with
+    a market_id (settlement key) embedded in notes. Existing single-side
+    directional flow continues unchanged — this is shadow only.
+
+    Promote to live trading after ≥7 days of data + comparison vs
+    single-side directional shadow PnL.
+    """
+    from bot.daemon.cross_bracket_shadow import run_cross_bracket_shadow
+
+    stats = run_cross_bracket_shadow(conn)
+    if stats["total_brackets"] > 0 or stats["errors"] > 0:
+        logger.info(
+            "[cross_bracket_shadow] settlements=%d brackets=%d "
+            "buy_yes=%d buy_no=%d skip=%d errors=%d",
+            stats["settlements_scored"], stats["total_brackets"],
+            stats["decisions_buy_yes"], stats["decisions_buy_no"],
+            stats["decisions_skip"], stats["errors"],
+        )
+
+
+def _run_dashboard_regenerate(conn) -> None:
+    """Regenerate the HTML dashboard. Runs daily; users SCP / view it
+    on demand at /home/kalshi/autoagent/reports/dashboard.html.
+    """
+    try:
+        from tools.dashboard import generate_dashboard
+        generate_dashboard(
+            "/home/kalshi/autoagent/kalshi_trades.db",
+            "/home/kalshi/autoagent/reports/dashboard.html",
+        )
+        logger.info("[dashboard] regenerated")
+    except Exception as exc:
+        logger.warning("[dashboard] regenerate failed: %s", exc)
+
+
+def _run_cross_bracket_validation(conn) -> None:
+    """Daily Phase-B.3 retro-replay. Reports per-family Brier and PnL
+    (gross + net of maker fee) for cross-bracket vs single-side
+    directional shadow cohorts.
+
+    Outputs:
+      * one log line per (cohort, family) for at-a-glance daemon tail-f
+      * markdown snapshot at reports/cross_bracket_validation.md
+        (overwritten each fire — always shows latest)
+      * CSV append at reports/cross_bracket_validation.csv
+        (one row per fire per cohort/family — plot trends over days)
+    """
+    try:
+        from tools.validate_cross_bracket import (
+            per_leg_summary, per_portfolio_summary, write_report,
+        )
+        leg = per_leg_summary(conn)
+        port = per_portfolio_summary(conn)
+
+        if not leg:
+            logger.info("[cross_bracket_validation] no settled rows yet")
+            return
+
+        for r in leg:
+            logger.info(
+                "[cross_bracket_validation] cohort=%s family=%s n=%d "
+                "gross=%+.1fc net=%+.1fc win_rate=%.1f%% brier=%.3f",
+                r["cohort"], r["family"] or "?", r["n"],
+                r["mean_gross_pnl_cents"] or 0.0,
+                r["mean_net_pnl_cents"] or 0.0,
+                (r["win_rate"] or 0.0) * 100.0,
+                r["brier"] or 0.0,
+            )
+
+        for r in port:
+            logger.info(
+                "[cross_bracket_validation] portfolio family=%s n=%d "
+                "gross=%+.1fc net=%+.1fc legs_fired=%.1f/%.0f",
+                r["family"] or "?", r["n_portfolios"],
+                r["mean_portfolio_gross_cents"] or 0.0,
+                r["mean_portfolio_net_cents"] or 0.0,
+                r["mean_legs_fired"] or 0.0,
+                r["mean_legs_total"] or 0.0,
+            )
+
+        write_report(
+            conn,
+            md_path="/home/kalshi/autoagent/reports/cross_bracket_validation.md",
+            csv_path="/home/kalshi/autoagent/reports/cross_bracket_validation.csv",
+        )
+    except Exception as exc:
+        logger.warning("[cross_bracket_validation] failed: %s", exc)
+
+
+def _run_source_state_evaluator(conn) -> None:
+    """Daily Phase-B.2 source-state-machine sweep.
+
+    1. Refresh per-(source, city) metrics from kv_cache + settlements
+    2. Apply state-transition rules (shadow→probationary→active, demote
+       on chronic degradation or σ blow-up)
+    3. Log every transition
+
+    Failures propagate to the scheduler — silent failures in the
+    promotion logic could leave a broken source ACTIVE indefinitely.
+    """
+    from bot.learning.source_state_machine import (
+        evaluate_state_transitions, refresh_metrics,
+    )
+    n_refreshed = refresh_metrics(conn)
+    transitions = evaluate_state_transitions(conn)
+    if transitions:
+        for src, city, old, new, reason in transitions:
+            logger.info(
+                "[source_state] %s/%s: %s → %s (%s)",
+                src, city, old, new, reason,
+            )
+    else:
+        logger.debug(
+            "[source_state] refreshed=%d, no transitions", n_refreshed,
+        )
+
+
 def _run_mm_promotion_sweep(conn) -> None:
     """Daily MM promotion/graduation/demotion sweep (Phase 1 step 10)."""
     equity = _latest_equity_dollars(conn)
@@ -747,6 +912,80 @@ def _log_health(pollers: list[Poller], cycle_runner: CycleRunner,
                     w["key"], w["alive"], w["processed"], w["coalesced"],
                     w["errors"], w["last_error"],
                 )
+
+    # Source state machine — at-a-glance which sources are firing
+    # vs sidelined. New / probationary sources are visible alongside
+    # active ones; demoted sources surface immediately.
+    try:
+        from bot.db import get_connection as _get_conn
+        _conn = _get_conn()
+        rows = _conn.execute(
+            "SELECT source, city, state FROM weather_source_state "
+            "WHERE city = 'pooled' ORDER BY state, source"
+        ).fetchall()
+        if rows:
+            by_state: dict[str, list[str]] = {}
+            for source, _city, state in rows:
+                by_state.setdefault(state, []).append(source)
+            parts = []
+            for state in ("active", "probationary", "demoted", "shadow"):
+                if state in by_state:
+                    parts.append(
+                        f"{state}={','.join(sorted(by_state[state]))}")
+            logger.info("[health] source_state " + "  ".join(parts))
+    except Exception as exc:
+        logger.debug("[health] source_state read failed: %s", exc)
+
+    # Snapshot writer health — surfaces any silent failure of the
+    # weather_forecast_snapshots writer within HEALTH_LOG_INTERVAL_S of
+    # the first failure. Pre-fix (Apr 2026) these failures swallowed
+    # silently into the daemon log, dropping a full settle-date cohort
+    # from every diagnostic. Counters reset per emit; non-zero fail
+    # counts escalate to WARNING so log scans catch them.
+    try:
+        from bot.signals.weather_ensemble_v2 import (
+            get_and_reset_snapshot_health_stats,
+        )
+        snap = get_and_reset_snapshot_health_stats()
+        log_fn = (
+            logger.warning
+            if (snap["write_fail"] > 0 or snap["build_fail"] > 0)
+            else logger.info
+        )
+        log_fn(
+            "[health] wx_snapshots write_ok=%d write_fail=%d build_fail=%d",
+            snap["write_ok"], snap["write_fail"], snap["build_fail"],
+        )
+    except Exception as exc:
+        logger.warning("[health] wx_snapshots stats unavailable: %s", exc)
+
+    # Stage 1 regime σ tier usage — visibility-only when
+    # WEATHER_REGIME_SIGMA is off (counter reflects what tier WOULD have
+    # been used; live σ is still pooled). When the flag flips on, the
+    # same counter shows what's actually being applied. Useful to confirm
+    # the fitter is producing fittable cells across cities/hours; tier1
+    # counts climbing → regime cells are matching live regime detection.
+    try:
+        from bot.signals.sources.metar_observations import (
+            get_and_reset_regime_health_stats,
+        )
+        rg = get_and_reset_regime_health_stats()
+        from bot.config import WEATHER_REGIME_SIGMA
+        # USED counters reflect what σ flowed through (gated by flag).
+        # AVAIL counters reflect what regime cells the fitter+lookup
+        # found — useful Stage 1 leading indicator regardless of flag.
+        logger.info(
+            "[health] wx_regime_sigma flag=%s "
+            "used: tier1=%d tier2=%d tier3_pooled=%d tier4_schedule=%d "
+            "none=%d  available: tier1=%d tier2=%d none=%d",
+            "on" if WEATHER_REGIME_SIGMA else "off",
+            rg["regime_hour"], rg["station_regime"],
+            rg["pooled_hour"], rg["schedule"], rg["none"],
+            rg["avail_regime_hour"], rg["avail_station_regime"],
+            rg["avail_none"],
+        )
+    except Exception as exc:
+        logger.warning("[health] wx_regime_sigma stats unavailable: %s", exc)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -967,6 +1206,44 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         interval_s=HEALTH_LOG_INTERVAL_S,
         initial_delay_s=30.0,
+    )
+    # Source state machine evaluator (Phase B.2) — runs daily at 06:30
+    # UTC, after CF6 ground truth + MOS bias fitter have populated
+    # kv_cache. Refreshes per-(source, city) MAE / σ / bias from
+    # settlements then applies state transitions. New sources auto-
+    # promote shadow → probationary → active when proven; broken
+    # sources auto-demote when σ blows up or rolling MAE degrades.
+    scheduler.register(
+        "source_state_evaluator",
+        lambda: _run_source_state_evaluator(conn),
+        interval_s=86400.0,  # daily
+        initial_delay_s=_seconds_until_utc_hour(6),
+    )
+    # Cross-bracket portfolio shadow logger — runs every 5 min, scores
+    # all open weather markets, logs would-be portfolio decisions.
+    # Shadow only; existing trade flow unchanged.
+    scheduler.register(
+        "cross_bracket_shadow",
+        lambda: _run_cross_bracket_shadow(conn),
+        interval_s=300.0,
+        initial_delay_s=120.0,  # let first cycle settle before first run
+    )
+    # Dashboard regen — also daily, ~30min after the state evaluator
+    # so the dashboard reflects fresh state-machine transitions.
+    scheduler.register(
+        "dashboard_regenerate",
+        lambda: _run_dashboard_regenerate(conn),
+        interval_s=86400.0,
+        initial_delay_s=_seconds_until_utc_hour(7),
+    )
+    # Phase B.3 retro-replay: compare cross-bracket vs single-side
+    # directional shadow PnL/Brier per family. Daily report — no decisions
+    # made yet, just observability for the go/no-go on live promotion.
+    scheduler.register(
+        "cross_bracket_validation",
+        lambda: _run_cross_bracket_validation(conn),
+        interval_s=86400.0,
+        initial_delay_s=_seconds_until_utc_hour(8),
     )
 
     # Start pollers on scheduler start, stop them on scheduler stop.

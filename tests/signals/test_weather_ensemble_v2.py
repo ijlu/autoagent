@@ -526,6 +526,23 @@ def test_apply_learned_sigma_leaves_prior_when_no_fit(memdb):
     assert g2 is g or g2.sigma_f == pytest.approx(5.0)
 
 
+def test_apply_learned_sigma_floors_pathological_tight_sigma(memdb):
+    """Regression: METAR's σ fit at 0.3°F (n=18, self-referential) caused
+    ensemble σ-collapse on 2026-04-29. Learned σ values below the floor
+    must be raised to ``_LEARNED_SIGMA_FLOOR_F`` so no single source can
+    dominate the combine. See the constant's docstring for the math."""
+    _persist_skill(memdb, "metar", "6_24", 0.3)  # the pathological value
+    g = _g("metar", sigma_f=2.0, horizon_hours=12.0)
+    g2 = v2._apply_learned_sigma(g)
+    assert g2.sigma_f == pytest.approx(v2._LEARNED_SIGMA_FLOOR_F)
+    assert g2.sigma_f >= 1.5  # explicit floor sanity
+
+    # And via _apply_learned_sigma_with_flag — same behavior, flag set.
+    g3, was_learned = v2._apply_learned_sigma_with_flag(g)
+    assert was_learned is True
+    assert g3.sigma_f == pytest.approx(v2._LEARNED_SIGMA_FLOOR_F)
+
+
 def test_learned_sigma_flows_into_combine(memdb, monkeypatch):
     """End-to-end: persisting a tighter σ for HRRR than for NBM gives HRRR
     more weight in the precision-weighted combine → combined μ pulled

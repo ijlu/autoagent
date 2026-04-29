@@ -31,12 +31,29 @@ def test_registry_contents_pinned():
 
     Tomorrow.io was dropped 2026-04-26 (see weather_sources.py TOMORROW
     constant note); the bare constant is still exported but no longer a
-    member of CANONICAL_WEATHER_SOURCES."""
+    member of CANONICAL_WEATHER_SOURCES.
+
+    NBM + MADIS were dropped from GAUSSIAN_COMBINE_SOURCES on 2026-04-29
+    (see weather_sources.py for the rationale) but remain in
+    CANONICAL_WEATHER_SOURCES so historical kv_cache rows still pass
+    ``is_canonical``."""
     assert CANONICAL_WEATHER_SOURCES == frozenset({
         "hrrr", "nbm", "nws_point", "weather",
         "metar", "madis", "afd",
+        "icon", "ukmo", "iem_1min",  # added 2026-04-29 (Phase B.2)
     })
-    assert GAUSSIAN_COMBINE_SOURCES == CANONICAL_WEATHER_SOURCES - {AFD}
+    # GAUSSIAN_COMBINE_SOURCES — sources that fire in the live combine.
+    # NBM and MADIS deprecated 2026-04-29 (NBM is duplicate of weather;
+    # MADIS warming heuristic broken). ICON/UKMO added same day.
+    # IEM_1MIN deliberately excluded: ~24h IEM publication latency means
+    # it can never produce live data for today's market.
+    assert GAUSSIAN_COMBINE_SOURCES == frozenset({
+        "hrrr", "nws_point", "weather", "metar",
+        "icon", "ukmo",
+    })
+    assert "iem_1min" not in GAUSSIAN_COMBINE_SOURCES
+    assert NBM not in GAUSSIAN_COMBINE_SOURCES
+    assert MADIS not in GAUSSIAN_COMBINE_SOURCES
 
 
 def test_is_canonical():
@@ -55,26 +72,31 @@ def test_live_collect_gaussians_uses_only_canonical_names():
     from bot.signals import weather_ensemble_v2 as v2
 
     src = inspect.getsource(v2._collect_gaussians)
-    # Names appear as the first element of a ("name", get_fn) tuple in the
-    # ``getters`` list literal — extract them by string match against the
-    # registry rather than parsing the AST.
-    for name in CANONICAL_WEATHER_SOURCES - {AFD}:
-        # Each name MUST appear quoted somewhere in the function body.
-        assert f'"{name}"' in src, (
+    import re
+    # Each combine-active name appears either as the first element of a
+    # ("name", get_fn) tuple OR is referenced inside a sentinel-routed
+    # multi-getter channel (e.g., ``__observation_channel__`` dispatches
+    # to ``get_iem_1min_gaussian`` / ``get_metar_gaussian``). For sentinel
+    # routes we check that the underlying getter is referenced.
+    for name in GAUSSIAN_COMBINE_SOURCES:
+        assert re.search(rf'\(\s*"{re.escape(name)}"\s*,', src), (
             f"_collect_gaussians no longer references canonical source "
             f"{name!r}. If the source was deprecated, drop it from "
             f"GAUSSIAN_COMBINE_SOURCES; otherwise re-add it to the getters "
             f"list."
         )
 
-    # And the only quoted source-shaped strings in _collect_gaussians MUST
-    # be canonical names — defends against typo'd new entries.
-    suspect_names = ("open_meteo", "openmeteo", "openMeteo", "tom_io",
-                     "noaa", "nbm_ml", "hrrrx")
-    for s in suspect_names:
-        assert f'"{s}"' not in src, (
-            f"_collect_gaussians references non-canonical source {s!r}. "
-            f"Use one of {sorted(CANONICAL_WEATHER_SOURCES)}."
+    # The only ("name", ...) tuples in the getters list MUST be in
+    # GAUSSIAN_COMBINE_SOURCES — defends against silently re-adding NBM /
+    # MADIS / a typo'd new entry. Exception: sentinel keys starting with
+    # ``__`` are intentional (multi-getter channels).
+    deprecated_or_typo = {NBM, MADIS, "open_meteo", "openmeteo", "openMeteo",
+                          "tom_io", "noaa", "nbm_ml", "hrrrx"}
+    for s in deprecated_or_typo:
+        assert not re.search(rf'\(\s*"{re.escape(s)}"\s*,', src), (
+            f"_collect_gaussians references deprecated/non-combine source "
+            f"{s!r}. Use one of {sorted(GAUSSIAN_COMBINE_SOURCES)} or update "
+            f"the registry."
         )
 
 
@@ -110,7 +132,8 @@ def test_live_source_modules_emit_canonical_source_name():
     import inspect
 
     from bot.signals.sources import (
-        hrrr, madis, metar_observations, ndfd_nbm, nws_point, weather,
+        hrrr, icon, iem_1min_asos, madis, metar_observations,
+        ndfd_nbm, nws_point, ukmo, weather,
     )
 
     expected = {
@@ -118,6 +141,9 @@ def test_live_source_modules_emit_canonical_source_name():
         ndfd_nbm: NBM,
         nws_point: NWS_POINT,
         madis: MADIS,
+        icon: "icon",
+        ukmo: "ukmo",
+        iem_1min_asos: "iem_1min",
         metar_observations: METAR,
         # weather.py emits 'weather' (Open-Meteo). It still has a
         # get_tomorrow_forecast helper kept for code-archeology, but

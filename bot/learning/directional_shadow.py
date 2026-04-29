@@ -46,6 +46,8 @@ logger = logging.getLogger(__name__)
 # in alpha_log.py, which keeps sqlite-side filtering grep-friendly.
 class ShadowOutcome:
     BLOCKED = "blocked"        # Family on the hard-block list
+    METAR_STALE = "metar_stale"  # Weather family without fresh METAR (caller-set)
+    TTE_OUT_OF_WINDOW = "tte_out_of_window"  # settle horizon outside trade-eligible band
     KELLY_ZERO = "kelly_zero"  # Kelly sizing rounds to 0 contracts
     BELOW_EDGE = "below_edge"  # Post-cal prob does not beat market by MIN_EDGE
     SHADOW_PASS = "shadow_pass"  # Would trade in live mode
@@ -53,6 +55,8 @@ class ShadowOutcome:
 
 _ALL_OUTCOMES: frozenset[str] = frozenset({
     ShadowOutcome.BLOCKED,
+    ShadowOutcome.METAR_STALE,
+    ShadowOutcome.TTE_OUT_OF_WINDOW,
     ShadowOutcome.KELLY_ZERO,
     ShadowOutcome.BELOW_EDGE,
     ShadowOutcome.SHADOW_PASS,
@@ -105,6 +109,10 @@ def evaluate(
     market_mid_cents: Optional[int],
     min_edge: float,
     blocklist: frozenset[str] = DIRECTIONAL_BLOCKED_FAMILIES,
+    metar_required: bool = False,
+    metar_fresh: bool = True,
+    tte_hours: Optional[float] = None,
+    min_tte_hours: float = 0.0,
 ) -> ShadowDecision:
     """Apply the step-7 directional gate to a single candidate.
 
@@ -112,9 +120,20 @@ def evaluate(
     Kelly/edge compute on a family we refuse to trade:
 
       1. Family block list (hard)
-      2. Kelly size == 0
-      3. Edge-vs-market-mid < `min_edge`
-      4. Otherwise: SHADOW_PASS
+      2. METAR-required gate (when caller sets ``metar_required=True``):
+         refuses trade if ``metar_fresh=False``. Wired by trade.py for
+         weather families — the 2026-04-29 validation showed the combine
+         degrades catastrophically without recent METAR observations.
+      3. TTE window (when caller passes ``tte_hours`` + ``min_tte_hours``):
+         refuses trade when settlement is closer than the alpha-window
+         floor. The 2026-04-29 validation showed market Brier
+         ~0.0001 at TTE ≤9h because daily highs occur ~9h before
+         midnight-LST settlement — by the time market is open and
+         we're looking, the peak has happened and everyone with a
+         thermometer knows it. Trade-eligible window is TTE ≥12h.
+      4. Kelly size == 0
+      5. Edge-vs-market-mid < `min_edge`
+      6. Otherwise: SHADOW_PASS
 
     `indep_prob` is already P(our_side), post-calibration — matching the
     convention in `trade.py`'s directional candidate pipeline, where the
@@ -140,6 +159,51 @@ def evaluate(
             market_prob=market_prob_side,
             edge_vs_mid=None,
             skip_reason=f"family_blocked:{family}",
+        )
+
+    # ── 2. METAR-required gate (weather families) ────────────────────
+    # When the caller flags a market as METAR-required (weather families)
+    # we refuse to trade if the station's last observation is stale. The
+    # 2026-04-29 validation showed our combine produces 1-3°F cold bias
+    # without METAR — which translates to catastrophic Brier on
+    # bracket-edge calls. Better to skip than to bet on the wrong bracket.
+    if metar_required and not metar_fresh:
+        return ShadowDecision(
+            outcome=ShadowOutcome.METAR_STALE,
+            family=family,
+            side=side,
+            price_cents=int(price_cents),
+            contracts=0,
+            our_prob=our_prob_side,
+            market_prob=market_prob_side,
+            edge_vs_mid=None,
+            skip_reason="metar_stale_or_missing",
+        )
+
+    # ── 3. TTE window gate ────────────────────────────────────────────
+    # The 2026-04-29 validation: market Brier ≈0.0001 at TTE ≤9h because
+    # daily highs occur ~3pm LST and settlement is midnight LST. By the
+    # time TTE drops below 9h the peak has passed and everyone watching
+    # real-time temps knows the answer. We can't beat that — we'd be
+    # taking the wrong side at near-certainty prices.
+    #
+    # Threshold of 12h: the 9-12h band is the "peak forming" zone where
+    # market_brier jumps from 0.0066 to 0.093 — i.e., the market starts
+    # being uncertain. Below 12h we're still in the post-peak regime
+    # often enough that gating the whole band is the safer call. The
+    # caller (trade.py) uses 12.0 for weather; non-weather skip the gate
+    # by passing tte_hours=None.
+    if tte_hours is not None and tte_hours < min_tte_hours:
+        return ShadowDecision(
+            outcome=ShadowOutcome.TTE_OUT_OF_WINDOW,
+            family=family,
+            side=side,
+            price_cents=int(price_cents),
+            contracts=0,
+            our_prob=our_prob_side,
+            market_prob=market_prob_side,
+            edge_vs_mid=None,
+            skip_reason=f"tte_{tte_hours:.1f}h<{min_tte_hours:.1f}h_min",
         )
 
     # ── 2. Kelly sizing produced no position ──────────────────────────

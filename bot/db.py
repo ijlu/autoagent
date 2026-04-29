@@ -226,6 +226,45 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         n_samples INTEGER DEFAULT 0,
         UNIQUE(series, source))""")
 
+    # Source state machine — Phase B.2 (2026-04-29).
+    # Each source × city has a lifecycle state that controls combine
+    # inclusion. Updated daily by ``source_state_evaluator``:
+    #
+    #   shadow        — snapshotted but excluded from combine. Default
+    #                    for new sources without eval validation.
+    #   probationary  — included in combine with σ inflated × 1.3 (capped
+    #                    weight). Pre-seeded sources start here.
+    #   active        — full weight in combine. Earned by accumulating
+    #                    50+ settled rows in probationary with non-
+    #                    regression on combined Brier.
+    #   demoted       — was active but chronically broke or σ blew up.
+    #                    Excluded from combine. After 7 days returns to
+    #                    shadow for clean re-trial (no eternal blacklist).
+    #
+    # Transition rules and the daily evaluator live in
+    # ``bot.learning.source_state_machine``. Transitions are logged to
+    # this table's ``last_state_change_iso`` plus the daemon log so
+    # operators can verify the dynamic system is doing what it should.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_source_state (
+        source TEXT NOT NULL,
+        city TEXT NOT NULL,
+        state TEXT NOT NULL,
+        n_settled INTEGER DEFAULT 0,
+        mae_7d REAL,
+        mae_30d REAL,
+        brier_7d REAL,
+        brier_30d REAL,
+        sigma_fitted REAL,
+        bias_fitted REAL,
+        indep_vs_combine REAL,
+        last_state_change_iso TEXT,
+        last_evaluated_iso TEXT,
+        notes TEXT,
+        PRIMARY KEY (source, city))""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wss_state "
+        "ON weather_source_state(state)")
+
     # Per-source component estimates logged per cycle for post-hoc
     # calibration. Joined against settlements to compute per-source Brier
     # and update weather_source_weights.
@@ -291,6 +330,32 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     conn.execute("""CREATE INDEX IF NOT EXISTS idx_metar_hourly_station_hour
                     ON weather_metar_hourly_backfill(station, lst_hour)""")
 
+    # ── Stage 1 (regime conditioning): regime-feature sibling backfill ──
+    #
+    # Same (station, lst_date, lst_hour) key as weather_metar_hourly_backfill
+    # but adds wind direction, sky cover, dewpoint — features that determine
+    # the prevailing weather regime (sea breeze vs continental, clear vs
+    # overcast, etc). Used by bot/learning/regime_residual_fitter.py to fit
+    # per-(station, hour, regime) residual peak σ. Sibling rather than
+    # extension columns because: (a) regime data has a different freshness
+    # cycle (pulled together with tmpf, but doesn't gate on CF6), (b) the
+    # production fitter for METAR residual σ hasn't been touched since its
+    # original ship — keep its read schema stable while we layer regime
+    # conditioning.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_metar_hourly_regime (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        station TEXT NOT NULL,
+        lst_date TEXT NOT NULL,
+        lst_hour INTEGER NOT NULL,
+        dwpf REAL,
+        drct REAL,
+        sknt REAL,
+        skyc1 TEXT,
+        UNIQUE(station, lst_date, lst_hour))""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_metar_hourly_regime_station_hour
+                    ON weather_metar_hourly_regime(station, lst_hour)""")
+
     # ── Decision log (full audit trail per decision) ──
     conn.execute("""CREATE TABLE IF NOT EXISTS decision_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -346,7 +411,17 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         won_yes INTEGER,
         realized_pnl_cents INTEGER,
         cycle_id TEXT,
-        notes TEXT)""")
+        notes TEXT,
+        market_id TEXT DEFAULT NULL,
+        portfolio_leg_count INTEGER DEFAULT NULL)""")
+    # Idempotent backfill for DBs created before market_id/portfolio_leg_count existed
+    # (Phase B.3 cross-bracket portfolio reconstruction).
+    for _col, _type in (("market_id", "TEXT"),
+                         ("portfolio_leg_count", "INTEGER")):
+        try:
+            conn.execute(f"ALTER TABLE alpha_backtest ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_alpha_bt_ticker_ts "
         "ON alpha_backtest(ticker, ts_decision_unix)"
@@ -354,6 +429,10 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_alpha_bt_family_settle "
         "ON alpha_backtest(family, ts_settle_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_market_id "
+        "ON alpha_backtest(market_id) WHERE market_id IS NOT NULL"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_alpha_bt_type_outcome "
@@ -598,6 +677,19 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         # breaks P&L out by reason so we can measure whether added
         # requotes earn edge or just burn fees.
         ("weather_mm_shadow", "trigger_reason", "TEXT DEFAULT 'metar_change'"),
+        # Stage 1 regime-conditioning telemetry. Captured on every snapshot
+        # row regardless of WEATHER_REGIME_SIGMA flag, so we have the
+        # longitudinal "what would Stage 2 have done" data ready when the
+        # promotion gate fires. Populated only on the METAR row of each
+        # ticker's snapshot (other source rows leave them NULL).
+        #   regime_label     — e.g. "E|partly", "S|moderate", "unknown"
+        #   regime_tier_used — "regime_hour" / "station_regime" / "pooled_hour" / "schedule"
+        #   regime_sigma_f   — σ that the regime-conditional path WOULD have used
+        #   pooled_sigma_f   — σ the pooled path actually used (= production today)
+        ("weather_forecast_snapshots", "regime_label", "TEXT"),
+        ("weather_forecast_snapshots", "regime_tier_used", "TEXT"),
+        ("weather_forecast_snapshots", "regime_sigma_f", "REAL"),
+        ("weather_forecast_snapshots", "pooled_sigma_f", "REAL"),
     ]
     for table, col, coltype in _migrations:
         try:

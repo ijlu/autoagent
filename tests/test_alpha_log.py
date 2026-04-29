@@ -27,12 +27,50 @@ from bot.learning.alpha_log import (
     log_decision,
     market_snapshot_from_dict,
     resolve_market_prob,
+    to_canonical_p_yes,
 )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # family_from_ticker
 # ══════════════════════════════════════════════════════════════════════════════
+
+class TestToCanonicalPYes:
+    """Regression: ``alpha_backtest.ensemble_p_yes`` MUST be canonical P(YES),
+    not P(our_side). On 2026-04-28 we discovered that trade.py had been
+    passing P(our_side) directly. Every weather decision is side='no', so
+    100% of weather alpha_backtest data was inverted on the column convention,
+    poisoning calibration and timing_patterns downstream.
+
+    This helper is the canonical conversion point. Any caller that has a
+    P(our_side) value and wants to log it MUST go through here. If you write
+    a new caller that bypasses this helper and stores P(our_side) directly,
+    the convention test in TestLogDecision will fail."""
+
+    def test_yes_side_passes_through(self):
+        # YES side: indep_prob = P(our_side) = P(YES)
+        assert to_canonical_p_yes(0.85, "yes") == 0.85
+        assert to_canonical_p_yes(0.0, "yes") == 0.0
+        assert to_canonical_p_yes(1.0, "yes") == 1.0
+
+    def test_no_side_inverts(self):
+        # NO side: indep_prob = P(NO); canonical P(YES) = 1 - P(NO)
+        assert to_canonical_p_yes(0.90, "no") == pytest.approx(0.10)
+        assert to_canonical_p_yes(0.0, "no") == 1.0
+        assert to_canonical_p_yes(1.0, "no") == 0.0
+
+    def test_no_side_extreme_does_not_clip(self):
+        # The bug was extreme on rows where indep_prob ≈ 0.98 (clipped
+        # confident-NO) — the stored value should be 0.02 (canonical P(YES)),
+        # not 0.98.
+        assert to_canonical_p_yes(0.98, "no") == pytest.approx(0.02)
+
+    def test_invalid_side_raises(self):
+        with pytest.raises(ValueError):
+            to_canonical_p_yes(0.5, "neither")
+        with pytest.raises(ValueError):
+            to_canonical_p_yes(0.5, "")
+
 
 class TestFamilyFromTicker:
     @pytest.mark.parametrize("ticker,family", [
@@ -250,6 +288,51 @@ class TestLogDecision:
         # Doesn't matter whether it inserted garbage or returned None — the
         # trading loop must not crash.
         assert rid is None or isinstance(rid, int)
+
+    def test_persists_portfolio_columns(self, conn):
+        """Phase B.3 cross-bracket fields: market_id (settlement key) and
+        portfolio_leg_count (size of the cross-bracket portfolio at decision
+        time) need their own columns so portfolio reconstruction is a clean
+        SQL filter, not a regex over notes."""
+        rid = log_decision(
+            conn,
+            ticker="KXHIGHNY-26APR30-B68.5",
+            decision_type=DecisionType.DIRECTIONAL_SHADOW,
+            decision_outcome=DecisionOutcome.SHADOW_ONLY,
+            ensemble=EnsembleSnapshot(p_yes=0.42, source_count=4),
+            market=MarketSnapshot(yes_bid_cents=28, yes_ask_cents=32),
+            side="yes", price_cents=32, contracts=1,
+            market_id="KXHIGHNY-26APR30",
+            portfolio_leg_count=6,
+            notes="cross_bracket;leg=3;p_yes=0.420;edge_yes=+0.100",
+        )
+        assert rid is not None
+        row = conn.execute(
+            "SELECT market_id, portfolio_leg_count, notes FROM alpha_backtest WHERE id=?",
+            (rid,),
+        ).fetchone()
+        assert row[0] == "KXHIGHNY-26APR30"
+        assert row[1] == 6
+        assert "cross_bracket" in row[2]
+
+    def test_portfolio_columns_default_null(self, conn):
+        """Single-leg / non-portfolio decisions leave the columns NULL."""
+        rid = log_decision(
+            conn,
+            ticker="KXFED-26MAY-T425",
+            decision_type=DecisionType.DIRECTIONAL_SHADOW,
+            decision_outcome=DecisionOutcome.SHADOW_ONLY,
+            ensemble=EnsembleSnapshot(p_yes=0.55, source_count=3),
+            market=MarketSnapshot(yes_bid_cents=48, yes_ask_cents=52),
+            side="yes",
+        )
+        assert rid is not None
+        row = conn.execute(
+            "SELECT market_id, portfolio_leg_count FROM alpha_backtest WHERE id=?",
+            (rid,),
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] is None
 
     def test_persists_market_prob_source_tag(self, conn):
         # Wide spread + no last → wide_mid tag preserved in the row
