@@ -121,10 +121,21 @@ WEATHER_REGIME_SIGMA = os.environ.get("WEATHER_REGIME_SIGMA", "false").lower() i
 # per-category with ≥200 settled rows per family from the v2 path.
 CALIBRATION_ENABLED = os.environ.get("CALIBRATION_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# 2026-05-04: weather-only mode. When true, the scan / score / log paths
+# all skip non-weather families. Effects:
+#   - TRADE_SERIES_ALLOWLIST narrows to KXHIGH* only (no KXFED, KXBTC, etc.)
+#   - SC_ENABLED is forced off (Safe Compounder is non-weather)
+#   - cross-bracket strategy is unaffected (already weather-only)
+# Re-enable non-weather families by flipping this off and (separately)
+# resolving the per-family signal issues that put them in the blocklist.
+WEATHER_ONLY_MODE = os.environ.get("WEATHER_ONLY_MODE", "false").lower() in ("true", "1", "yes")
+
 # Directional families hard-blocked from trading regardless of
-# per-family shadow-to-live flags. Anti-calibrated in Phase 0 backtests:
-# KXBTC / KXETH (Brier 0.76–0.94) and KXHIGHDEN (0.316 vs 0.244 baseline).
-# Env override: DIRECTIONAL_BLOCKLIST="KXBTC,KXETH,KXHIGHDEN,KXFOO" (comma-sep).
+# per-family shadow-to-live flags. KXBTC/KXETH have catastrophic raw Brier
+# (0.76–0.94 in Phase 0). KXHIGHDEN was historically pathological but the
+# 2026-05-04 station-mapping fix may have resolved this — we leave it in the
+# blocklist for now and re-evaluate after the weather-only mode collects
+# clean post-fix data. Env override: DIRECTIONAL_BLOCKLIST="..." (comma-sep).
 _DEFAULT_DIRECTIONAL_BLOCKLIST = "KXBTC,KXETH,KXHIGHDEN"
 DIRECTIONAL_BLOCKED_FAMILIES: frozenset[str] = frozenset(
     f.strip().upper()
@@ -147,14 +158,19 @@ DIRECTIONAL_BLOCKED_FAMILIES: frozenset[str] = frozenset(
 # gating (KXFED). Crypto stays in for shadow-mode evaluation despite the
 # directional blocklist — the alpha_backtest log needs the rows so calibration
 # can keep tracking the families we'd un-block once signal improves.
-TRADE_SERIES_ALLOWLIST: tuple[str, ...] = (
-    # Weather (one per WeatherStation in bot/daemon/stations.py)
+_WEATHER_SERIES: tuple[str, ...] = (
     "KXHIGHNY", "KXHIGHCHI", "KXHIGHLAX", "KXHIGHAUS", "KXHIGHMIA", "KXHIGHDEN",
-    # Macro
-    "KXFED", "KXJOB", "KXGDP", "KXCPI",
-    # Crypto (shadow-eval only via DIRECTIONAL_BLOCKED_FAMILIES)
-    "KXBTC", "KXETH",
 )
+if WEATHER_ONLY_MODE:
+    TRADE_SERIES_ALLOWLIST: tuple[str, ...] = _WEATHER_SERIES
+else:
+    TRADE_SERIES_ALLOWLIST = (
+        *_WEATHER_SERIES,
+        # Macro
+        "KXFED", "KXJOB", "KXGDP", "KXCPI",
+        # Crypto (shadow-eval only via DIRECTIONAL_BLOCKED_FAMILIES)
+        "KXBTC", "KXETH",
+    )
 MM_MIN_SPREAD = int(os.environ.get("MM_MIN_SPREAD_CENTS", "4"))
 MM_HALF_SPREAD = int(os.environ.get("MM_HALF_SPREAD_CENTS", "2"))
 MM_MAX_INVENTORY = int(os.environ.get("MM_MAX_INVENTORY", "50"))
@@ -173,7 +189,10 @@ MAX_QA_PER_RUN = int(os.environ.get("MAX_QA_PER_RUN", "10"))
 # ══════════════════════════════════════════════════════════════════════════════
 # Safe Compounder (separate from MM and directional)
 # ══════════════════════════════════════════════════════════════════════════════
-SC_ENABLED = os.environ.get("SC_ENABLED", "true").lower() in ("true", "1", "yes")
+_SC_ENV = os.environ.get("SC_ENABLED", "true").lower() in ("true", "1", "yes")
+# Weather-only mode forces SC off — Safe Compounder targets non-weather YES<20¢
+# markets and shouldn't trade while we're focused on weather.
+SC_ENABLED = _SC_ENV and not WEATHER_ONLY_MODE
 SC_DRY_RUN = os.environ.get("SC_DRY_RUN", "true").lower() in ("true", "1", "yes")
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -652,6 +652,13 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         ("timing_patterns", "alpha_id", "INTEGER"),
         ("edge_convergence", "alpha_id", "INTEGER"),
         ("loss_postmortems", "alpha_id", "INTEGER"),
+        # 2026-05-04: split raw vs calibrated probability so future calibrator
+        # bake-offs aren't fitting on doubly-processed data. estimated_prob is
+        # post-apply_calibration (or raw, if the path bypassed calibration —
+        # weather v2 short-circuits before apply_calibration). The new
+        # raw_estimated_prob column always holds pre-calibration value.
+        ("alpha_backtest", "raw_ensemble_p_yes", "REAL"),
+        ("calibration", "raw_estimated_prob", "REAL"),
         # Phase 1 step 10: MM promotion gate needs per-shadow-quote fill
         # status and settlement P&L. Matcher populates shadow_bid_filled /
         # shadow_ask_filled from subsequent market snapshots; settlement
