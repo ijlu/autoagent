@@ -28,21 +28,41 @@ Wants=network-online.target
 # They should be disabled before enabling this unit.
 Conflicts=kalshi-bot.service kalshi-bot.timer kalshi-weather-daemon.service
 
+# 2026-05-04: rate-limiter directives moved here from [Service]. Modern
+# systemd (>= 230) requires StartLimit* in [Unit], not [Service]. Prior
+# placement caused "Unknown key name 'StartLimitIntervalSec'" warnings
+# and the directives were silently ignored — defaults of 5 starts /
+# 10s applied instead. Generous limits below give the daemon room to
+# crash-loop a few times before systemd gives up entirely.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
 [Service]
 Type=simple
 User=kalshi
 Group=kalshi
 WorkingDirectory=/home/kalshi/autoagent
 ExecStart=/usr/bin/python3 -m bot.daemon.main
-Restart=on-failure
-RestartSec=30
-StartLimitIntervalSec=600
-StartLimitBurst=10
 
-# Give the scheduler time to run its on_stop hooks on SIGTERM.
-# mos_materializer can take ~300s; set well above that so redeploys
-# don't get force-killed mid-task.
-TimeoutStopSec=360
+# 2026-05-04: changed Restart=on-failure → Restart=always after the
+# 9h outage on May 3. SIGKILL-after-TimeoutStopSec IS technically
+# "result=timeout" (a failure), but systemd's cgroup teardown
+# encountered "Failed to kill control group ... Invalid argument"
+# which left the unit in a state where on-failure didn't auto-recover.
+# Restart=always restarts on EVERY exit — safer default for an
+# always-on trading daemon.
+Restart=always
+RestartSec=30
+
+# 2026-05-04: lowered TimeoutStopSec 360 → 90.
+# Original 360 was sized for mos_materializer's ~300s worst case, but
+# during a routine deploy hitting that limit means SIGKILL + a
+# multi-hour auto-restart failure window (see May 3 outage). 90s lets
+# a deploy fail-fast if the daemon is wedged so systemd can recycle it
+# cleanly. The scheduler's on_stop hooks should complete well under
+# this; any task taking >90s on shutdown is a separate bug to fix in
+# code, not paper over with longer timeouts.
+TimeoutStopSec=90
 
 # Environment
 EnvironmentFile=/home/kalshi/autoagent/.env
