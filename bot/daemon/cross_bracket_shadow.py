@@ -90,10 +90,19 @@ def _is_family_live(conn, family: str) -> bool:
 
 
 def _settlement_unix_from_key(settlement_key: str) -> Optional[int]:
-    """KXHIGHNY-26APR30 → unix ts of 23:59:59 LST that day.
+    """KXHIGHNY-26APR30 → unix ts of 23:59:59 local clock time that day.
 
     Used by the TTE gate. Best-effort parse; returns None on
     unparseable format so the gate can fail-closed (skip live).
+
+    DST-correct: we use IANA timezones via ``zoneinfo`` (Python 3.9+)
+    rather than fixed LST offsets. Previously the function hardcoded
+    LST offsets year-round, which during DST months (March-November)
+    placed settle 1 hour later than the actual local-clock midnight —
+    the cross-bracket TTE gate then thought TTE was 7.78h when reality
+    was 6.78h, missing the first hour of every nightly live window.
+    Confirmed via 2026-05-04 21:00 UTC observation (NY's actual EDT
+    midnight is 04:00 UTC, code-via-LST said 05:00 UTC).
     """
     parts = settlement_key.split("-")
     if len(parts) < 2:
@@ -110,23 +119,22 @@ def _settlement_unix_from_key(settlement_key: str) -> Optional[int]:
         m_idx = months.index(mon) + 1
     except (ValueError, IndexError):
         return None
-    # 23:59:59 LST. Use the family's LST offset so we settle at the
-    # right UTC moment per Kalshi's convention.
     family = _family_from_settlement_key(settlement_key)
-    lst_offsets = {
-        "KXHIGHNY": -5, "KXHIGHMIA": -5,
-        "KXHIGHCHI": -6, "KXHIGHAUS": -6,
-        "KXHIGHDEN": -7, "KXHIGHLAX": -8,
-    }
-    offset = lst_offsets.get(family, -5)
+    iana_tz = {
+        "KXHIGHNY": "America/New_York",
+        "KXHIGHMIA": "America/New_York",
+        "KXHIGHCHI": "America/Chicago",
+        "KXHIGHAUS": "America/Chicago",
+        "KXHIGHDEN": "America/Denver",
+        "KXHIGHLAX": "America/Los_Angeles",
+    }.get(family, "America/New_York")
     try:
-        # 23:59:59 LST = (24 - offset) UTC the same day = 24+|offset| ish
-        # Actually: LST 23:59:59 = LST_unix + 86399. UTC = LST_unix - offset*3600
-        from datetime import datetime, timezone
-        dt = datetime(2000 + yy, m_idx, dd, 23, 59, 59, tzinfo=timezone.utc)
-        # Subtract the offset to convert LST-23:59 to UTC.
-        return int(dt.timestamp() - offset * 3600)
-    except (ValueError, OverflowError):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        local_dt = datetime(2000 + yy, m_idx, dd, 23, 59, 59,
+                            tzinfo=ZoneInfo(iana_tz))
+        return int(local_dt.timestamp())
+    except (ValueError, OverflowError, ImportError):
         return None
 
 
