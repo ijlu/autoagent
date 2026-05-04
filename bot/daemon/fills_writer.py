@@ -128,6 +128,69 @@ def default_source_tagger(client_order_id: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Kalshi fill-payload parsers (dual-format)
+# ---------------------------------------------------------------------------
+#
+# Kalshi's /fills endpoint emits payloads in TWO shapes; both must be
+# parsed identically to avoid silent drops:
+#
+#   Legacy (cents int):
+#     { "count": 1, "yes_price": 91, "no_price": 9, ... }
+#
+#   New (dollar string):
+#     { "count_fp": "1.00", "yes_price_dollars": "0.9100",
+#       "no_price_dollars": "0.0900", ... }
+#
+# 2026-05-04 postmortem: 18 cross-bracket fills were lost because
+# fills_writer only knew the legacy keys. Today every cross-bracket
+# fill on prod ships in the dollar-string format. Real money is in
+# Kalshi's books that the local ledger never saw. Fixed by reading
+# either shape, defensively normalizing to int cents.
+
+
+def _parse_count(fill: dict) -> Optional[int]:
+    """Return ``count`` as an integer, accepting either the legacy
+    ``count`` (int) or the new ``count_fp`` (string in fixed-point
+    contract units, e.g., ``"1.00"``). Returns None on missing/invalid.
+    """
+    raw = fill.get("count")
+    if raw is None:
+        raw = fill.get("count_fp")
+    if raw is None:
+        return None
+    try:
+        # round() not int() — "1.00" → 1, "1.99" → 2. Kalshi uses whole
+        # contracts so partial values shouldn't occur, but rounding is
+        # safer than truncating against future format drift.
+        return round(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_price_cents(fill: dict, side: str) -> Optional[int]:
+    """Return ``side`` ('yes' or 'no') price as integer cents.
+
+    Accepts either ``{side}_price`` (int cents) or ``{side}_price_dollars``
+    (string in dollars, e.g., ``"0.0900"`` for 9¢). Returns None on
+    missing/invalid.
+    """
+    raw = fill.get(f"{side}_price")
+    if raw is not None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    raw_dollars = fill.get(f"{side}_price_dollars")
+    if raw_dollars is None:
+        return None
+    try:
+        # round() to handle floating-point noise: "0.0900" → 9, not 8.
+        return round(float(raw_dollars) * 100)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # FillsWriter
 # ---------------------------------------------------------------------------
 
@@ -225,15 +288,23 @@ class FillsWriter:
 
         The derivation logic (series, family, fee, source) is isolated
         here so it can be unit-tested without touching the database.
+
+        2026-05-04: handles BOTH Kalshi response shapes — the legacy
+        cents-int format (``count``, ``yes_price``, ``no_price``) and
+        the dollar-string format (``count_fp``, ``yes_price_dollars``,
+        ``no_price_dollars``). Discovered after the cross-bracket canary:
+        18 fills were silently dropped because Kalshi switched to the
+        dollar-string format and our parser only knew the legacy keys.
         """
         trade_id = fill.get("trade_id")
         order_id = fill.get("order_id")
         ticker = fill.get("ticker")
         side = fill.get("side")
         action = fill.get("action")
-        count = fill.get("count")
-        yes_price = fill.get("yes_price")
-        no_price = fill.get("no_price")
+        # Read with fallback to the dollar-string format keys.
+        count = _parse_count(fill)
+        yes_price = _parse_price_cents(fill, "yes")
+        no_price = _parse_price_cents(fill, "no")
         is_taker = fill.get("is_taker")
         created_time = fill.get("created_time")
 
@@ -244,11 +315,14 @@ class FillsWriter:
         ]):
             logger.warning(
                 "[fills] malformed fill (missing required field): %r",
-                {k: fill.get(k) for k in (
-                    "trade_id", "order_id", "ticker", "side", "action",
-                    "count", "yes_price", "no_price", "is_taker",
-                    "created_time",
-                )},
+                {
+                    "trade_id": trade_id, "order_id": order_id,
+                    "ticker": ticker, "side": side, "action": action,
+                    "count": count, "yes_price": yes_price,
+                    "no_price": no_price, "is_taker": is_taker,
+                    "created_time": created_time,
+                    "raw_keys": sorted(fill.keys()),
+                },
             )
             return None
 

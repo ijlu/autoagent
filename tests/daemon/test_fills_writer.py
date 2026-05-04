@@ -363,7 +363,10 @@ def _insert_raw(conn: sqlite3.Connection, row: dict) -> None:
 
 def _valid_fill_dict(**overrides) -> dict:
     """Return a Kalshi-shaped /fills page dict (what the API returns
-    per fill), for testing _fill_to_row."""
+    per fill), for testing _fill_to_row.
+
+    Uses the LEGACY cents-int format. The dollar-string format is
+    exercised separately in TestDualFormatPayloads."""
     base = {
         "trade_id": "t1",
         "order_id": "o1",
@@ -379,6 +382,139 @@ def _valid_fill_dict(**overrides) -> dict:
     }
     base.update(overrides)
     return base
+
+
+def _dollar_string_fill_dict(**overrides) -> dict:
+    """Return a fill dict using Kalshi's NEW dollar-string format.
+
+    This is the actual response shape from /fills as of May 2026, and
+    the format that broke fills_writer in the 2026-05-03 cross-bracket
+    canary (18 fills silently dropped). Capturing the live response
+    shape verbatim so future Kalshi format drift is caught."""
+    base = {
+        "trade_id": "76372d92-f9b7-78fc-fa05-f61f83575422",
+        "order_id": "59b0c838-b6c4-4e32-9699-b133e4bdc794",
+        "fill_id": "76372d92-f9b7-78fc-fa05-f61f83575422",
+        "ticker": "KXHIGHNY-26MAY03-B59.5",
+        "market_ticker": "KXHIGHNY-26MAY03-B59.5",
+        "side": "no",
+        "action": "buy",
+        "count_fp": "1.00",
+        "yes_price_dollars": "0.9100",
+        "no_price_dollars": "0.0900",
+        "fee_cost": "0.010000",
+        "is_taker": True,
+        "created_time": "2026-05-03T23:07:15.646414Z",
+        "ts": 1777849635,
+        "subaccount_number": 0,
+        "client_order_id": "mm_xb_KXHIGHNY-26MAY03_5_1777849635011",
+    }
+    base.update(overrides)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Dual-format parsing (cents-int + dollar-string)
+# ---------------------------------------------------------------------------
+
+
+class TestDualFormatPayloads:
+    """Ensures fills_writer handles BOTH the legacy cents-int format
+    and the dollar-string format Kalshi switched to. Postmortem:
+    2026-05-03 cross-bracket canary lost track of 18 live fills
+    because fills_writer only knew the legacy keys."""
+
+    def test_dollar_string_format_parses_cleanly(self):
+        """The exact response shape from a real cross-bracket fill on
+        2026-05-03 must produce a valid row, not a malformed-fill skip."""
+        from bot.daemon.fills_writer import FillsWriter
+        conn = init_db(":memory:")
+        w = FillsWriter(conn)
+        fill = _dollar_string_fill_dict()
+        row = w._fill_to_row(fill, live_mode=True)
+        assert row is not None, (
+            "dollar-string format must produce a valid row — pre-fix "
+            "this returned None and 18 production fills were dropped"
+        )
+        assert row["contracts"] == 1
+        # 0.0900 dollars = 9 cents
+        assert row["no_price_cents"] == 9
+        # 0.9100 dollars = 91 cents
+        assert row["yes_price_cents"] == 91
+        assert row["is_taker"] == 1
+        # Source tagged from client_order_id `mm_xb_*` → falls through
+        # to the `mm_*` legacy bucket per default_source_tagger.
+        assert row["source"] == "legacy"
+
+    def test_legacy_cents_int_format_still_parses(self):
+        """The original cents-int format must still work after the
+        defensive dual-format refactor."""
+        from bot.daemon.fills_writer import FillsWriter
+        conn = init_db(":memory:")
+        w = FillsWriter(conn)
+        row = w._fill_to_row(_valid_fill_dict(), live_mode=False)
+        assert row is not None
+        assert row["contracts"] == 10
+        assert row["yes_price_cents"] == 47
+        assert row["no_price_cents"] == 53
+
+    def test_parse_count_handles_both_shapes(self):
+        from bot.daemon.fills_writer import _parse_count
+        assert _parse_count({"count": 5}) == 5
+        assert _parse_count({"count_fp": "5.00"}) == 5
+        # Old field wins when both are present (defensive — newer
+        # libraries might emit both during migration).
+        assert _parse_count({"count": 3, "count_fp": "999.0"}) == 3
+        # Missing → None
+        assert _parse_count({}) is None
+        assert _parse_count({"count": None, "count_fp": None}) is None
+        # Garbage → None (don't crash)
+        assert _parse_count({"count_fp": "not a number"}) is None
+
+    def test_parse_price_cents_handles_both_shapes(self):
+        from bot.daemon.fills_writer import _parse_price_cents
+        # Cents int
+        assert _parse_price_cents({"yes_price": 91}, "yes") == 91
+        assert _parse_price_cents({"no_price": 9}, "no") == 9
+        # Dollar string
+        assert _parse_price_cents({"yes_price_dollars": "0.9100"}, "yes") == 91
+        assert _parse_price_cents({"no_price_dollars": "0.0900"}, "no") == 9
+        # Old field wins when both present
+        assert _parse_price_cents(
+            {"yes_price": 50, "yes_price_dollars": "0.99"}, "yes",
+        ) == 50
+        # Floating-point boundary (0.0900 must NOT round to 8)
+        assert _parse_price_cents({"no_price_dollars": "0.0900"}, "no") == 9
+        # Missing → None
+        assert _parse_price_cents({}, "yes") is None
+        # Garbage → None
+        assert _parse_price_cents(
+            {"yes_price_dollars": "junk"}, "yes",
+        ) is None
+
+    def test_warning_includes_raw_keys_when_malformed(self, caplog):
+        """When a fill is rejected, the log should include the actual
+        keys present so a future Kalshi-format drift is diagnosable
+        without re-instrumenting code."""
+        import logging
+        from bot.daemon.fills_writer import FillsWriter
+        conn = init_db(":memory:")
+        w = FillsWriter(conn)
+        bad_fill = {
+            "trade_id": "tx",
+            "order_id": "ox",
+            "ticker": "KXHIGHNY-26MAY03-B59.5",
+            # Missing every other required field.
+        }
+        with caplog.at_level(logging.WARNING):
+            row = w._fill_to_row(bad_fill, live_mode=False)
+        assert row is None
+        # The log message includes "raw_keys" so a Kalshi shape drift
+        # surfaces the unknown key set.
+        assert any(
+            "raw_keys" in (rec.getMessage() + str(rec.args))
+            for rec in caplog.records
+        )
 
 
 # ---------------------------------------------------------------------------
