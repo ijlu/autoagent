@@ -258,6 +258,24 @@ def _run_fills_sync(
         )
 
 
+def _run_cross_bracket_scoreboard(conn) -> None:
+    """Emit a daily cross-bracket performance summary to the daemon log.
+
+    Net P&L (already net of fees), win rate, contracts, and explicit
+    fees-paid breakdown from fills_ledger. One line per window-section
+    so dashboards can grep for [scoreboard] and chart over time.
+    """
+    from bot.observability.cross_bracket_scoreboard import (
+        build_scoreboard, render_scoreboard,
+    )
+    scoreboard = build_scoreboard(conn)
+    rendered = render_scoreboard(scoreboard, header="cross-bracket daily scoreboard")
+    # Multi-line: emit each line with [scoreboard] prefix so grep is easy
+    for line in rendered.splitlines():
+        if line.strip():
+            logger.info("[scoreboard] %s", line)
+
+
 def _run_cross_bracket_rearm(conn) -> None:
     """Refresh per-family ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h
     so the strategy keeps firing across daily restarts. Gated by global
@@ -1318,6 +1336,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_cross_bracket_rearm(conn),
         interval_s=12 * 3600,
         initial_delay_s=15.0,  # arm immediately on boot
+    )
+    # Cross-bracket performance scoreboard. First fire 5 min after boot
+    # (immediate baseline), then every 24h. Emits a multi-line summary
+    # to daemon.log with [scoreboard] prefix so dashboards can grep and
+    # chart over time. Net P&L is already net of fees (settlements writer
+    # subtracts them); fills_ledger fees are reported explicitly.
+    scheduler.register(
+        "cross_bracket_scoreboard",
+        lambda: _run_cross_bracket_scoreboard(conn),
+        interval_s=24 * 3600,
+        initial_delay_s=300.0,
     )
     # Dashboard regen — also daily, ~30min after the state evaluator
     # so the dashboard reflects fresh state-machine transitions.
