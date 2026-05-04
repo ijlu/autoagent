@@ -48,7 +48,7 @@ from bot.daemon.series_discovery import run_discovery as run_series_discovery
 from bot.daemon.shadow_integrity import run_shadow_integrity_check
 from bot.daemon.weather_handler import WeatherChangeHandler
 from bot.daemon.weather_quoter import WeatherQuoter
-from bot.db import init_db, kv_cleanup
+from bot.db import init_db, kv_cleanup, kv_set
 from bot.learning.fills_validator import compare_last_n_days, format_report
 from bot.learning.mm_promotion import (
     match_shadow_fills,
@@ -256,6 +256,33 @@ def _run_fills_sync(
             "[fills_sync] inserted=%d new rows (since_unix=%.0f)",
             inserted, since,
         )
+
+
+def _run_cross_bracket_rearm(conn) -> None:
+    """Refresh per-family ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h
+    so the strategy keeps firing across daily restarts. Gated by global
+    ``CROSS_BRACKET_LIVE`` — when that's off this is a no-op so we don't
+    silently re-arm after an operator turns the strategy off at the
+    global level.
+
+    Idempotent (kv_set is INSERT OR REPLACE). Lives here rather than in
+    cross_bracket_shadow.py because re-arming is a daemon-lifecycle
+    concern, not a per-cycle decision.
+    """
+    from bot.config import CROSS_BRACKET_LIVE
+    if not CROSS_BRACKET_LIVE:
+        logger.info("[cross_bracket_rearm] skipped — CROSS_BRACKET_LIVE=false")
+        return
+    families = (
+        "KXHIGHNY", "KXHIGHMIA", "KXHIGHCHI",
+        "KXHIGHLAX", "KXHIGHAUS", "KXHIGHDEN",
+    )
+    for fam in families:
+        kv_set(conn, f"cross_bracket_live:{fam}", True, 24 * 3600)
+    logger.info(
+        "[cross_bracket_rearm] refreshed %d weather families (TTL=24h)",
+        len(families),
+    )
 
 
 def _run_fills_validator(conn) -> None:
@@ -1279,6 +1306,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_cross_bracket_shadow(conn),
         interval_s=300.0,
         initial_delay_s=120.0,  # let first cycle settle before first run
+    )
+    # Cross-bracket per-family kv re-arm. Each
+    # ``cross_bracket_live:<FAMILY>`` key has TTL=24h; without an
+    # automatic refresh, an operator who armed a family yesterday would
+    # quietly stop trading them tomorrow. 12h cadence means even if one
+    # run fails, the next still keeps the keys alive within their TTL.
+    # Gated internally by CROSS_BRACKET_LIVE (the global kill switch).
+    scheduler.register(
+        "cross_bracket_rearm",
+        lambda: _run_cross_bracket_rearm(conn),
+        interval_s=12 * 3600,
+        initial_delay_s=15.0,  # arm immediately on boot
     )
     # Dashboard regen — also daily, ~30min after the state evaluator
     # so the dashboard reflects fresh state-machine transitions.
