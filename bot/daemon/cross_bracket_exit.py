@@ -58,22 +58,53 @@ EXIT_MIN_TTE_HOURS: float = float(
 
 # ── Position identification ────────────────────────────────────────────────────
 
+def _fetch_cb_order_ids() -> set[str]:
+    """Fetch our cross-bracket Kalshi order_ids by filtering /portfolio/orders
+    to the ``mm_xb_`` client_order_id prefix. Returns set of Kalshi order_ids.
+
+    We need this because Kalshi's /portfolio/fills response doesn't include
+    client_order_id (it's a property of the ORDER, not the fill). So we
+    can't filter fills_ledger directly by our prefix — fills_ledger.
+    client_order_id is null for fills synced from /portfolio/fills. The
+    canonical attribution comes from joining fills.order_id to orders.
+    """
+    out: set[str] = set()
+    cursor = None
+    # Bounded loop in case of pagination misbehavior
+    for _ in range(20):
+        path = "/portfolio/orders?limit=1000"
+        if cursor:
+            path += f"&cursor={cursor}"
+        try:
+            resp = api_get(path)
+        except Exception as exc:
+            logger.warning("[cb_exit] /portfolio/orders fetch failed: %s", exc)
+            return out
+        for order in resp.get("orders", []):
+            coid = order.get("client_order_id") or ""
+            if coid.startswith("mm_xb_"):
+                oid = order.get("order_id")
+                if oid:
+                    out.add(oid)
+        cursor = resp.get("cursor") or None
+        if not cursor:
+            break
+    return out
+
+
 def get_open_cb_positions(conn) -> list[dict]:
     """Return open cross-bracket positions with avg entry + total fees.
 
-    Cross-bracket positions are identified by the ``mm_xb_`` client_order_id
-    prefix on at least one BUY fill in fills_ledger for the ticker. This
-    excludes positions on the same ticker that came from manual posts or
-    other strategies.
+    Cross-bracket attribution flow:
+      1. Query Kalshi /portfolio/orders to find orders with
+         client_order_id LIKE 'mm_xb_%' (our cross-bracket POSTs)
+      2. Use their Kalshi-assigned order_ids to filter fills_ledger
+         (which has order_id but lacks client_order_id since the
+         fills endpoint doesn't include it)
+      3. Cross-reference with /portfolio/positions for net qty
     """
-    # Get our cross-bracket-tagged tickers from fills_ledger
-    cb_tickers = {
-        row[0] for row in conn.execute(
-            "SELECT DISTINCT ticker FROM fills_ledger "
-            "WHERE client_order_id LIKE 'mm_xb_%' AND action='buy'"
-        ).fetchall()
-    }
-    if not cb_tickers:
+    cb_order_ids = _fetch_cb_order_ids()
+    if not cb_order_ids:
         return []
 
     # Fetch current Kalshi positions
@@ -83,6 +114,19 @@ def get_open_cb_positions(conn) -> list[dict]:
         logger.warning("[cb_exit] portfolio/positions fetch failed: %s", exc)
         return []
     kalshi_positions = resp.get("market_positions") or resp.get("positions") or []
+
+    # Get the tickers we care about (where we have CB order activity)
+    cb_tickers = {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT ticker FROM fills_ledger "
+            "WHERE order_id IN ({}) AND action='buy'".format(
+                ",".join("?" * len(cb_order_ids))
+            ),
+            tuple(cb_order_ids),
+        ).fetchall()
+    }
+    if not cb_tickers:
+        return []
 
     out: list[dict] = []
     for pos in kalshi_positions:
@@ -100,19 +144,18 @@ def get_open_cb_positions(conn) -> list[dict]:
         side = "yes" if pos_val > 0 else "no"
         contracts = abs(pos_val)
 
-        # Compute avg entry price + total fees from fills_ledger BUY rows
-        # tagged mm_xb_. Per-side: NO position uses no_price_cents, YES uses yes.
+        # Compute avg entry from fills_ledger filtered to our CB orders
         price_col = "no_price_cents" if side == "no" else "yes_price_cents"
+        placeholders = ",".join("?" * len(cb_order_ids))
+        params = (ticker, side, *cb_order_ids)
         agg = conn.execute(
             f"SELECT SUM(contracts * {price_col}), SUM(contracts), SUM(fee_cents) "
             f"FROM fills_ledger "
-            f"WHERE ticker = ? AND client_order_id LIKE 'mm_xb_%' "
-            f"  AND action='buy' AND side = ?",
-            (ticker, side),
+            f"WHERE ticker = ? AND action='buy' AND side = ? "
+            f"  AND order_id IN ({placeholders})",
+            params,
         ).fetchone()
         if not agg or not agg[1] or agg[1] == 0:
-            # No fills_ledger entry but Kalshi says we have a position. Could
-            # be a fill that hasn't synced yet, or partial sync. Skip safely.
             continue
         total_cost, total_contracts, total_fees = agg
         avg_entry_cents = total_cost / max(1, total_contracts)

@@ -182,6 +182,44 @@ def _safe_client_order_id(settlement_key: str, leg_idx: int) -> str:
     return f"mm_xb_{safe_key}_{leg_idx}_{int(time.time() * 1000)}"
 
 
+def _fetch_existing_positions() -> dict[str, int]:
+    """Snapshot current Kalshi positions as {ticker: signed_position_qty}.
+
+    Positive = net YES holding, negative = net NO holding, zero = no
+    position. Used by the live-post path to prevent re-posting on a
+    bracket we already own (the strategy logs decisions every 5 min
+    and would otherwise post repeatedly each cycle the edge persists).
+
+    Returns empty dict on fetch failure; the caller treats unknown
+    positions as zero, so a fetch failure produces normal posting
+    behavior — fail-open. We accept that risk because the alternative
+    (fail-closed = no posting) silently breaks the strategy.
+    """
+    from bot.api import api_get
+    try:
+        resp = api_get("/portfolio/positions?limit=200")
+    except Exception as exc:
+        logger.warning(
+            "[cross_bracket_live] positions fetch failed: %s — proceeding "
+            "without position-cap protection (fail-open)", exc,
+        )
+        return {}
+    out: dict[str, int] = {}
+    positions = resp.get("market_positions") or resp.get("positions") or []
+    for pos in positions:
+        ticker = pos.get("ticker") or ""
+        if not ticker:
+            continue
+        raw = pos.get("position_fp") or pos.get("position", 0)
+        try:
+            qty = round(float(raw)) if raw is not None else 0
+        except (TypeError, ValueError):
+            qty = 0
+        if qty != 0:
+            out[ticker] = qty
+    return out
+
+
 def run_cross_bracket_shadow(conn) -> dict:
     """Score all currently-open weather markets via cross-bracket
     portfolio. Log each per-bracket decision to alpha_backtest with
@@ -203,6 +241,7 @@ def run_cross_bracket_shadow(conn) -> dict:
         "live_skipped_exposure_cap": 0,
         "live_skipped_leg_cap": 0,
         "live_skipped_family_off": 0,
+        "live_skipped_already_holding": 0,
     }
 
     try:
@@ -221,6 +260,14 @@ def run_cross_bracket_shadow(conn) -> dict:
 
     grouped = group_markets_by_settlement(markets)
     stats["settlements_scored"] = len(grouped)
+
+    # Snapshot current positions ONCE at the top of the cycle. We pass
+    # this through to the post path so the strategy can check "do we
+    # already hold this bracket?" before posting. Without this guard,
+    # the strategy posts a new order every 5 min on the same bracket
+    # while edge persists, accumulating exposure beyond the intended
+    # ≤4 legs/portfolio cap (which only counts within a single cycle).
+    existing_positions = _fetch_existing_positions()
 
     for settlement_key, group in grouped.items():
         try:
@@ -247,7 +294,8 @@ def run_cross_bracket_shadow(conn) -> dict:
 
         # Log + (conditionally) place orders. Each leg gets its own row,
         # all sharing the settlement_key as market_id.
-        _process_decisions(conn, settlement_key, group, decisions, stats)
+        _process_decisions(conn, settlement_key, group, decisions, stats,
+                           existing_positions=existing_positions)
 
     return stats
 
@@ -477,6 +525,7 @@ def _post_live_order(
 def _process_decisions(
     conn, settlement_key: str, group: list[dict],
     decisions: list, stats: dict,
+    existing_positions: Optional[dict] = None,
 ) -> None:
     """For each decision, log to alpha_backtest. Additionally, if live
     mode is on AND the family/TTE/edge/exposure gates pass, place a
@@ -573,6 +622,23 @@ def _process_decisions(
                 f"{CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS}c"
             )
             stats["live_skipped_exposure_cap"] += 1
+
+        # Existing-position gate: don't re-post on a bracket where we
+        # already have a position on the side we're about to buy. Without
+        # this, the strategy posts a new order every cycle while edge
+        # persists. Position sign convention: + = net YES holding,
+        # − = net NO holding. We're posting to BUY, so block if we already
+        # hold the same side.
+        if leg_can_go_live and existing_positions:
+            existing_qty = existing_positions.get(d.ticker, 0)
+            same_side_holding = (
+                (d.side == "yes" and existing_qty > 0)
+                or (d.side == "no" and existing_qty < 0)
+            )
+            if same_side_holding:
+                leg_can_go_live = False
+                live_skip_reason = f"already_holding:{d.side}={existing_qty}"
+                stats["live_skipped_already_holding"] += 1
 
         # ── Live path ──
         order_id: Optional[str] = None
