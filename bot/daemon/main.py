@@ -276,6 +276,27 @@ def _run_cross_bracket_scoreboard(conn) -> None:
             logger.info("[scoreboard] %s", line)
 
 
+def _run_cross_bracket_exit(conn) -> None:
+    """Evaluate open cross-bracket positions; post exit orders when
+    realized gain crosses threshold. Logs stats line for visibility.
+    No-op when CROSS_BRACKET_LIVE is off."""
+    from bot.daemon.cross_bracket_exit import run_exit_check
+    stats = run_exit_check(conn)
+    if stats["positions_checked"] > 0 or stats["exits_posted"] > 0:
+        logger.info(
+            "[cb_exit] checked=%d posted=%d skipped(no_book/no_gain/below/settle/pending)="
+            "%d/%d/%d/%d/%d failed=%d",
+            stats["positions_checked"],
+            stats["exits_posted"],
+            stats["exits_skipped_no_book"],
+            stats["exits_skipped_no_gain"],
+            stats["exits_skipped_below_threshold"],
+            stats["exits_skipped_close_to_settle"],
+            stats["exits_skipped_pending"],
+            stats["exits_failed"],
+        )
+
+
 def _run_cross_bracket_rearm(conn) -> None:
     """Refresh per-family ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h
     so the strategy keeps firing across daily restarts. Gated by global
@@ -1336,6 +1357,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_cross_bracket_rearm(conn),
         interval_s=12 * 3600,
         initial_delay_s=15.0,  # arm immediately on boot
+    )
+    # Cross-bracket position exit logic. Watches our open cross-bracket
+    # positions (identified by mm_xb_ client_order_id prefix in
+    # fills_ledger) and posts synthetic-sell limit orders when realized
+    # gain ≥ 50% of max upside or ≥25¢ absolute. Skips if TTE < 30 min
+    # (avoid settle-race) and idempotent via pending-order check. Runs
+    # 5 min after each cross_bracket_shadow (offset to avoid contending
+    # for the same orderbook lookups).
+    scheduler.register(
+        "cross_bracket_exit",
+        lambda: _run_cross_bracket_exit(conn),
+        interval_s=300.0,
+        initial_delay_s=240.0,  # 2 min after boot, between cross_bracket_shadow runs
     )
     # Cross-bracket performance scoreboard. First fire 5 min after boot
     # (immediate baseline), then every 24h. Emits a multi-line summary
