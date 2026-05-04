@@ -13,11 +13,24 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-from bot.api import cached_get
+import requests
+
+from bot.api import _CACHE, cached_get, rate_limit_wait
 from bot.config import TOMORROW_API_KEY
 from bot.daemon.stations import STATION_BY_CITY, STATION_BY_SERIES
 from bot.db import get_connection, kv_get, kv_set
 from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
+
+
+# Open-Meteo default-blend forecasts update at the same cadence as the
+# underlying global model (GFS at temperate-zone US lat/lons), which runs
+# every 6 hours. The default `cached_get` TTL is 60s — far shorter than
+# the data refresh — so we'd been re-fetching identical bytes every
+# ensemble cycle, burning ~8,600 calls/day per the daily-quota math.
+# Local cache with 5h 30min TTL aligns the fetch cadence to the data
+# cadence; same shape as hrrr / icon / ukmo / nbm. See deploy notes
+# 2026-04-30.
+_WEATHER_OM_CACHE_TTL = 19800
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -27,23 +40,39 @@ from bot.signals.weather_forecast import GaussianForecast, hours_until_settlemen
 # Broad city catalog for signal sources. A superset of the daemon's
 # tradeable-series registry (``bot.daemon.stations``) — includes cities
 # used by directional signals on markets we score but don't market-make
-# (phoenix, seattle, boston, etc.). Tradeable-city coordinates are
-# intentionally duplicated here: registry entries track the primary
-# METAR station (KNYC), while WEATHER_CITIES tracks downtown lat/lon
-# for the Open-Meteo / Tomorrow.io forecast endpoints, which grid to
-# city center rather than airport.
+# (phoenix, seattle, boston, etc.).
+#
+# 2026-05-04 — TRADEABLE-CITY LAT/LON UPDATED to match the settlement
+# station's coordinates from ``bot.daemon.stations``. The original
+# design used "downtown" lat/lon, with the rationale that forecast APIs
+# grid better to city center. But Kalshi settles on the AIRPORT METAR
+# (KNYC Central Park, KLAX, KMIA, etc.) and forecast grids that pull
+# from "downtown" produce systematically biased forecasts vs the
+# settlement station. Concrete example:
+#   * NYC at 40.71,-74.01 (Lower Manhattan) resolves NWS grid to
+#     "Hoboken, NJ" — different microclimate from KNYC.
+#   * LAX at 34.05,-118.24 (Downtown LA) resolves to "Vernon, CA",
+#     completely missing the marine layer that drives KLAX's daily
+#     high. Result: 7+ forecast sources show +5 to +10°F warm bias
+#     against KLAX truth.
+#   * Denver at 39.74,-104.99 resolves to "Glendale, CO", not KDEN.
+# Settlement-aligned coordinates are the source of truth.
+#
+# Non-tradeable directional cities (phoenix, seattle, boston, etc.) keep
+# their downtown coords — those markets aren't on Kalshi yet so settlement
+# alignment doesn't apply.
 WEATHER_CITIES = {
-    "nyc":          {"lat": 40.71, "lon": -74.01, "tz": "America/New_York"},
-    "new york":     {"lat": 40.71, "lon": -74.01, "tz": "America/New_York"},
-    "chicago":      {"lat": 41.88, "lon": -87.63, "tz": "America/Chicago"},
-    "miami":        {"lat": 25.76, "lon": -80.19, "tz": "America/New_York"},
-    "austin":       {"lat": 30.27, "lon": -97.74, "tz": "America/Chicago"},
-    "los angeles":  {"lat": 34.05, "lon": -118.24, "tz": "America/Los_Angeles"},
-    "la":           {"lat": 34.05, "lon": -118.24, "tz": "America/Los_Angeles"},
+    "nyc":          {"lat": 40.78, "lon": -73.97, "tz": "America/New_York"},  # KNYC
+    "new york":     {"lat": 40.78, "lon": -73.97, "tz": "America/New_York"},  # KNYC
+    "chicago":      {"lat": 41.79, "lon": -87.75, "tz": "America/Chicago"},   # KMDW
+    "miami":        {"lat": 25.79, "lon": -80.29, "tz": "America/New_York"},  # KMIA
+    "austin":       {"lat": 30.19, "lon": -97.67, "tz": "America/Chicago"},   # KAUS
+    "los angeles":  {"lat": 33.94, "lon": -118.41, "tz": "America/Los_Angeles"},  # KLAX
+    "la":           {"lat": 33.94, "lon": -118.41, "tz": "America/Los_Angeles"},  # KLAX
     "phoenix":      {"lat": 33.45, "lon": -112.07, "tz": "America/Phoenix"},
     "houston":      {"lat": 29.76, "lon": -95.37, "tz": "America/Chicago"},
     "dallas":       {"lat": 32.78, "lon": -96.80, "tz": "America/Chicago"},
-    "denver":       {"lat": 39.74, "lon": -104.99, "tz": "America/Denver"},
+    "denver":       {"lat": 39.86, "lon": -104.67, "tz": "America/Denver"},   # KDEN
     "atlanta":      {"lat": 33.75, "lon": -84.39, "tz": "America/New_York"},
     "seattle":      {"lat": 47.61, "lon": -122.33, "tz": "America/Los_Angeles"},
     "boston":        {"lat": 42.36, "lon": -71.06, "tz": "America/New_York"},
@@ -327,17 +356,40 @@ def _determine_day_index(title: str, market_data: dict | None = None,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_weather_forecast(city_key):
-    """Fetch 7-day forecast from Open-Meteo for the given city key."""
+    """Fetch 7-day forecast from Open-Meteo for the given city key.
+
+    Cached locally for ``_WEATHER_OM_CACHE_TTL`` seconds (~5.5h) — the
+    Open-Meteo default blend (GFS at US lats) only updates every 6h, so
+    a 60s TTL via cached_get was wasted bandwidth + quota. Same long-TTL
+    pattern as ``hrrr.py`` / ``icon.py`` / ``ukmo.py``.
+    """
     city = WEATHER_CITIES.get(city_key)
     if not city:
         return None
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
+    cache_key = f"weather_{city_key}"
+    now = time.time()
+    if cache_key in _CACHE:
+        data, ts = _CACHE[cache_key]
+        if now - ts < _WEATHER_OM_CACHE_TTL:
+            return data
+    from bot.signals.sources._openmeteo import forecast_url
+    url = forecast_url(
         f"latitude={city['lat']}&longitude={city['lon']}"
         f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
         f"&temperature_unit=fahrenheit&timezone={city['tz']}&forecast_days=7"
     )
-    return cached_get(f"weather_{city_key}", url, timeout=5)
+    try:
+        rate_limit_wait(url)
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            print(f"[weather] HTTP {r.status_code} for {city_key}")
+            return None
+        data = r.json()
+        _CACHE[cache_key] = (data, now)
+        return data
+    except Exception as e:
+        print(f"[weather] error for {city_key}: {type(e).__name__}: {e}")
+        return None
 
 
 def _open_meteo_sigma_for_day(day_idx: int) -> float:

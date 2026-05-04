@@ -36,8 +36,14 @@ _STATION_LST_OFFSET: dict[str, int] = {
 def time_of_day_gate(station: str, hours_left: float) -> tuple[bool, str, float]:
     """Gate based on local standard time of day.
 
-    Quote only during 7am-7pm LST.  Within that window, adjust spreads
-    based on how much temperature movement is still likely.
+    Quote only during the configured LST window. Within that window,
+    adjust spreads based on how much temperature movement is still likely.
+
+    The upper cutoff is overridable via env ``WEATHER_QUOTE_MAX_LST_HOUR``
+    (default 19, current behavior). Lower it (e.g. 17 or 15) when the
+    LST-hour vs market-Brier analysis shows the late-day window is
+    structurally negative-EV. As of 2026-04-30 the data showed v2 trails
+    market by Brier 0.27+ at LST ≥15 — see reports/CROSS_BRACKET_BACKTEST_2026-04-30.md.
 
     Parameters
     ----------
@@ -50,6 +56,16 @@ def time_of_day_gate(station: str, hours_left: float) -> tuple[bool, str, float]
     -------
     (should_quote, reason, spread_multiplier)
     """
+    import os as _os
+    try:
+        max_lst_hour = float(_os.environ.get("WEATHER_QUOTE_MAX_LST_HOUR", "19"))
+    except ValueError:
+        max_lst_hour = 19.0
+    # Clamp to a sane range so a typo in env can't accidentally disable
+    # the gate or block all hours. 5 = "5am LST" floor (no real reason
+    # to quote earlier); 23 = "11pm LST" ceiling (settlement boundary).
+    max_lst_hour = max(5.0, min(23.0, max_lst_hour))
+
     # Settlement day ends at 23:59 LST.
     # hours_left == 17 means it's ~7am;  hours_left == 5 means it's ~7pm.
     # So: lst_hour_approx ≈ 24 - hours_left  (not perfect, but good enough).
@@ -57,8 +73,11 @@ def time_of_day_gate(station: str, hours_left: float) -> tuple[bool, str, float]
 
     if lst_hour < 7.0:
         return (False, f"pre-7am LST ({lst_hour:.1f}h): temp hasn't started rising", 1.0)
-    if lst_hour >= 19.0:
-        return (False, f"past-7pm LST ({lst_hour:.1f}h): daily high locked in", 1.0)
+    if lst_hour >= max_lst_hour:
+        return (False,
+                f"past-{max_lst_hour:.0f}-LST ({lst_hour:.1f}h): "
+                f"high locked in / market beats us late-day",
+                1.0)
 
     # Inside the 7am-7pm window: adjust spread by sub-period
     if lst_hour < 10.0:

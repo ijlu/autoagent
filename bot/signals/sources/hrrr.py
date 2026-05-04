@@ -49,7 +49,13 @@ from bot.signals.weather_forecast import (
 )
 
 
-_HRRR_CACHE_TTL = 1800
+# HRRR runs hourly at HH:00Z; Open-Meteo typically publishes the new
+# run by HH:30Z. A 55-minute cache fits inside one model cycle — we'll
+# refresh at most once per hour per city, which matches the underlying
+# data cadence. Was 1800 (30 min); the shorter TTL drove ~1,400 redundant
+# fetches/day per city and the matching Open-Meteo 429s. See deploy
+# notes 2026-04-30.
+_HRRR_CACHE_TTL = 3300
 _HRRR_MODEL = "gfs_hrrr"
 
 
@@ -70,9 +76,11 @@ def _fetch_hrrr_forecast(city_key: str) -> Optional[dict]:
         data, ts = _CACHE[cache_key]
         if now - ts < _HRRR_CACHE_TTL:
             return data
-    # HRRR is hourly for ~2 days
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
+    # HRRR is hourly for ~2 days. URL routed through
+    # `_openmeteo.forecast_url` which switches to the commercial
+    # endpoint + apikey when OPENMETEO_API_KEY is set.
+    from bot.signals.sources._openmeteo import forecast_url
+    url = forecast_url(
         f"latitude={city['lat']}&longitude={city['lon']}"
         f"&hourly=temperature_2m"
         f"&temperature_unit=fahrenheit&timezone={city['tz']}&forecast_days=2"
@@ -108,15 +116,46 @@ def _daily_high_from_hourly_hrrr(
     return max(highs) if highs else None
 
 
-def _hrrr_sigma_for_day(day_idx: int) -> float:
-    """HRRR per-day forecast sigma in °F.
+# 2026-05-04 — per-city HRRR σ priors. The default 2.0°F is the
+# postmortem-corrected value; cities where HRRR was already
+# well-calibrated keep their old 1.2°F prior so the bump doesn't
+# uniformly down-weight HRRR for stations where it was the most
+# accurate source.
+#
+# Backtest evidence: KXHIGHDEN had Brier 0.083 with the old 1.2°F prior
+# and regressed to 0.093 (-12%) with the global 2.0°F bump because it
+# pulled weight away from HRRR (RMSE 2.47 at KDEN — actually fine) and
+# toward ICON/GEM/MetNo at KDEN (each with bias > 2°F, mixed direction).
+#
+# Cities whose post-truth-fix HRRR RMSE is materially under 3°F at
+# settlement keep the old prior. Others get the postmortem bump.
+_HRRR_SIGMA_PRIOR_BY_CITY: dict[str, float] = {
+    # KDEN: HRRR RMSE 2.47 at settlement — well-calibrated. Keep old.
+    "denver": 1.2,
+    # KMIA: HRRR RMSE 1.19 at settlement — best of any city. Keep old.
+    "miami": 1.2,
+    # KAUS: HRRR RMSE 1.27 at settlement — well-calibrated. Keep old.
+    "austin": 1.2,
+    # KNYC, KMDW, KLAX: bumped to 2.0°F (default below).
+}
+_HRRR_SIGMA_PRIOR_DEFAULT: float = 2.0
 
-    Fixed schedule from the v1 model: 1.2°F at day 0, +0.5°F per day out.
-    A3 will replace this with a skill-curve lookup fitted from snapshots;
-    the magic number stays here until the learned sigma is fresher and
-    demonstrably better.
+
+def _hrrr_sigma_for_day(day_idx: int, city_key: Optional[str] = None) -> float:
+    """HRRR per-day forecast sigma in °F, with optional per-city override.
+
+    The prior schedule is used when no learned σ is available in
+    kv_cache. The A3 skill-curve fitter (``fit_skill_curves`` in
+    ``tools/backfill_weather_effective_n.py``) overrides this per
+    (city, horizon_bucket) once enough settled data has accumulated.
+
+    ``city_key`` is the lower_underscore key into _HRRR_SIGMA_PRIOR_BY_CITY.
+    None falls back to the default. The 0.5°F-per-day decay tail is the
+    same for every city — it captures forecast horizon expansion.
     """
-    return 1.2 + day_idx * 0.5
+    base = _HRRR_SIGMA_PRIOR_BY_CITY.get(city_key, _HRRR_SIGMA_PRIOR_DEFAULT) \
+        if city_key else _HRRR_SIGMA_PRIOR_DEFAULT
+    return base + day_idx * 0.5
 
 
 def get_hrrr_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
@@ -167,7 +206,7 @@ def get_hrrr_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForeca
     if forecast_high is None:
         return None
 
-    sigma_f = _hrrr_sigma_for_day(day_idx)
+    sigma_f = _hrrr_sigma_for_day(day_idx, city_key)
     horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
 
     from bot.signals.sources._freshness import hrrr_latest_issued_at
@@ -225,7 +264,7 @@ def get_hrrr_estimate(ticker: str, market_data: dict) -> tuple:
     if forecast_high is None:
         return None, None
 
-    forecast_sigma = _hrrr_sigma_for_day(day_idx)
+    forecast_sigma = _hrrr_sigma_for_day(day_idx, city_key)
 
     is_bracket = "-B" in ticker_upper
     if is_bracket:

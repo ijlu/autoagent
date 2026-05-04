@@ -440,7 +440,16 @@ def fit_per_source(conn: sqlite3.Connection) -> list[SourceFit]:
 # ≥2 sources per group so OBS falls through to the MVP discount until
 # MADIS backfill lands.
 
-_MODEL_GROUP_SOURCES: tuple[str, ...] = ("weather", "hrrr", "nbm")
+# Sources used to fit the model-group pairwise error correlation.
+# Must mirror the membership of `weather_ensemble_v2._MODEL_GROUP` —
+# the live combine groups them, so the correlation fit must train on
+# the same membership. NBM was retired from the live combine on
+# 2026-04-29 but kept here as a member because we still have years of
+# Open-Meteo backfill rows for it that contribute to the rho estimate;
+# nws_point added 2026-04-30 alongside the live grouping.
+_MODEL_GROUP_SOURCES: tuple[str, ...] = (
+    "weather", "hrrr", "nbm", "nws_point",
+)
 
 
 @dataclass(frozen=True)
@@ -615,13 +624,21 @@ def fit_skill_curves(
     # lead_hours in the backfill is nominal (A2.5 defaults to 12h). We
     # bucket on it so the fit already lines up with the buckets the live
     # combiner queries.
+    #
+    # Restrict to sources currently in the live combine — same reason as
+    # in fit_mos_bias above: retired sources should not keep accumulating
+    # daily-refreshed σ keys that could poison the combine if re-enabled.
+    from bot.signals.weather_sources import GAUSSIAN_COMBINE_SOURCES as _LIVE
+    live_sources = tuple(_LIVE - {"metar"})
+    placeholders = ", ".join("?" for _ in live_sources)
     rows = conn.execute(
-        """SELECT source, city, lead_hours, forecast_mean_f, forecast_sigma_f,
-                  observed_high_f
-             FROM weather_gaussian_snapshots_backfill
-            WHERE observed_high_f IS NOT NULL
-              AND forecast_mean_f IS NOT NULL
-              AND source != 'metar'"""
+        f"""SELECT source, city, lead_hours, forecast_mean_f, forecast_sigma_f,
+                   observed_high_f
+              FROM weather_gaussian_snapshots_backfill
+             WHERE observed_high_f IS NOT NULL
+               AND forecast_mean_f IS NOT NULL
+               AND source IN ({placeholders})""",
+        live_sources,
     ).fetchall()
 
     pooled: dict[tuple[str, str], list[tuple[float, float, float]]] = {}
@@ -757,13 +774,16 @@ def report_skill_curves(fits: list[SkillFit]) -> str:
 _MOS_BIAS_KEY_PREFIX: str = "weather_mos_bias_"
 _MOS_BIAS_TTL_SEC: int = 45 * 86400
 _MOS_BIAS_MIN_SAMPLES: int = 8
-# Don't persist a bias whose |value| exceeds this — likely a corrupt cell
-# rather than a genuine systematic bias. Matches the reader's clamp.
-_MOS_BIAS_MAX_ABS_F: float = 5.0
-# Half-life in days for EWMA weight decay. 14d means a 14-day-old reading
-# counts half as much as today's; 28-day-old counts a quarter. Drift in a
-# forecast model gets fully tracked in ~2 weeks.
-_MOS_BIAS_EWMA_HALF_LIFE_DAYS: float = 14.0
+# Don't persist a bias whose |value| exceeds this — pathologically noisy.
+# 2026-05-03: bumped 5.0 → 8.0 so persistent regime biases (LAX marine
+# layer producing +5-7°F across multiple sources for a week) actually
+# get persisted instead of clamp-skipped. See weather_mos_materializer
+# for the full rationale.
+_MOS_BIAS_MAX_ABS_F: float = 8.0
+# Half-life in days for EWMA weight decay. 2026-05-03: shortened 14 → 5
+# so the bias tracks regime shifts (marine layer / heat dome) within a
+# week instead of being washed out across the prior 4-month average.
+_MOS_BIAS_EWMA_HALF_LIFE_DAYS: float = 5.0
 
 
 def _city_key(raw: str) -> str:
@@ -821,13 +841,22 @@ def fit_mos_bias(
     are dropped (observed == forecast by construction for the backfill
     entry, so error is identically 0).
     """
+    # Restrict the fit to sources currently in the live combine. Without
+    # this restriction the fitter keeps refreshing biases for retired
+    # sources (MADIS removed 2026-04-29 still got -5.0 bias keys persisted
+    # daily; if MADIS were ever re-enabled it would shift every prediction
+    # 5°F cool from a stale fit). Fit only what we trade.
+    from bot.signals.weather_sources import GAUSSIAN_COMBINE_SOURCES as _LIVE
+    live_sources = tuple(_LIVE - {"metar"})  # METAR's "error" is identically 0
+    placeholders = ", ".join("?" for _ in live_sources)
     rows = conn.execute(
-        """SELECT source, city, settlement_date,
-                  forecast_mean_f, observed_high_f
-             FROM weather_gaussian_snapshots_backfill
-            WHERE observed_high_f IS NOT NULL
-              AND forecast_mean_f IS NOT NULL
-              AND source != 'metar'"""
+        f"""SELECT source, city, settlement_date,
+                   forecast_mean_f, observed_high_f
+              FROM weather_gaussian_snapshots_backfill
+             WHERE observed_high_f IS NOT NULL
+               AND forecast_mean_f IS NOT NULL
+               AND source IN ({placeholders})""",
+        live_sources,
     ).fetchall()
 
     if ref_date_iso is None:

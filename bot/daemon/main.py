@@ -320,6 +320,8 @@ def _run_hourly_backfill(conn) -> None:
     """
     from bot.daemon.stations import STATIONS
     from tools.backfill_weather_effective_n import (
+        fit_metar_diurnal,
+        persist_diurnal_fit,
         replay_hourly_and_write,
         replay_regime_hourly_and_write,
         update_daily_high_from_cf6,
@@ -397,6 +399,27 @@ def _run_hourly_backfill(conn) -> None:
         f" failed_regime={','.join(regime_failures)}" if regime_failures else "",
         f" failed_cf6={','.join(cf6_failures)}" if cf6_failures else "",
     )
+
+    # ── Stage 3: per-(station, lst_hour) diurnal regression →  kv_cache ──
+    # Reads CF6-corrected daily_high_f from stage 2, fits
+    # daily_high = α + β·T(h) per (station, lst_hour) cell, persists
+    # to ``weather_metar_diurnal_<station>``. Without this stage the
+    # METAR `_get_diurnal_fit` reader (and the new nws_5min_diurnal
+    # source) silently fall back to None — discovered post-deploy
+    # 2026-05-02. The fitter was previously only invoked from the CLI
+    # tool's --persist-diurnal flag; nothing in the daemon called it.
+    try:
+        diurnal_fits = fit_metar_diurnal(conn)
+        keys = persist_diurnal_fit(conn, diurnal_fits)
+        logger.info(
+            "[hourly_backfill] diurnal: %d fits computed, %d station "
+            "rows persisted%s",
+            len(diurnal_fits), len(keys),
+            f" keys={','.join(keys)}" if keys else " (none — too few "
+            "samples or σ outside guard band)",
+        )
+    except Exception as exc:
+        logger.warning("[hourly_backfill] diurnal fit failed: %s", exc)
 
 
 def _run_mos_materializer(conn) -> None:
@@ -495,6 +518,29 @@ def _run_mos_materializer(conn) -> None:
             )
     except Exception as exc:
         logger.warning("[regime_residual_fitter] failed: %s", exc)
+
+    # Regime-conditional MOS bias for non-METAR sources. Sibling to the
+    # pooled `fit_and_persist_mos_bias` call above, but groups on regime
+    # in addition to (source, city) so HRRR's clear-day vs. overcast-day
+    # bias don't pool into a single number that's wrong for both. The
+    # ensemble's `_get_mos_bias` reads regime-conditional keys first when
+    # the live regime label is known, falling back to pooled — so this
+    # fitter is purely additive (absent keys = legacy behavior preserved).
+    try:
+        from bot.learning.mos_bias_regime_fitter import (
+            fit_and_persist_mos_bias_by_regime,
+        )
+        regime_bias_stats = fit_and_persist_mos_bias_by_regime(conn)
+        if regime_bias_stats["keys_written"] > 0:
+            logger.info(
+                "[mos_bias_regime_fitter] keys_written=%d cells_thin=%d "
+                "rows_processed=%d",
+                regime_bias_stats["keys_written"],
+                regime_bias_stats["cells_thin"],
+                regime_bias_stats["rows_processed"],
+            )
+    except Exception as exc:
+        logger.warning("[mos_bias_regime_fitter] failed: %s", exc)
 
     # Snapshots-based skill σ + MOS bias for sources missing from the
     # original Open-Meteo backfill (NWS Point, MADIS, etc.). Reads live
@@ -720,12 +766,18 @@ def _run_cross_bracket_shadow(conn) -> None:
 def _run_dashboard_regenerate(conn) -> None:
     """Regenerate the HTML dashboard. Runs daily; users SCP / view it
     on demand at /home/kalshi/autoagent/reports/dashboard.html.
+
+    2026-05-02: pass the daemon's shared `conn` so the dashboard
+    doesn't open + close a private one (which used to poison
+    `bot.db._PERSIST_CONN` and produce 5K+ "Cannot operate on a closed
+    database" errors per day across poller threads).
     """
     try:
         from tools.dashboard import generate_dashboard
         generate_dashboard(
             "/home/kalshi/autoagent/kalshi_trades.db",
             "/home/kalshi/autoagent/reports/dashboard.html",
+            conn=conn,
         )
         logger.info("[dashboard] regenerated")
     except Exception as exc:

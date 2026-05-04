@@ -18,6 +18,7 @@ from typing import Optional
 
 import requests
 
+from bot.api import rate_limit_wait
 from bot.daemon.stations import STATIONS
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,17 @@ logger = logging.getLogger(__name__)
 
 FORECAST_REFRESH_INTERVAL_S = 900  # 15 minutes
 REQUEST_TIMEOUT_S = 8
+
+# Minimum sleep between consecutive station fetches inside a single
+# refresh pass. Belt-and-suspenders on top of the per-domain
+# `rate_limit_wait` (config: open-meteo = 1.0s min interval, 3 burst).
+# Without this stagger, the refresh hit Open-Meteo with 6 stations in a
+# tight loop on every cycle — cold-start daemon log showed 6× HTTP 429
+# clustered at every 15-min refresh boundary on 2026-04-30. Even though
+# the daily quota is 10K calls (way above our footprint), Open-Meteo
+# enforces a 600/min ceiling that this burst was bumping. 200ms keeps
+# us well under at any plausible call count.
+_INTER_STATION_SLEEP_S: float = 0.2
 
 
 class ForecastCache:
@@ -36,8 +48,10 @@ class ForecastCache:
     idempotent scheduler hook.
     """
 
-    URL_TEMPLATE = (
-        "https://api.open-meteo.com/v1/forecast?"
+    # Query template (everything after the `?`). The full URL is built
+    # via `_openmeteo.forecast_url()` per fetch so it auto-routes to
+    # commercial endpoint + apikey when OPENMETEO_API_KEY is set.
+    QUERY_TEMPLATE = (
         "latitude={lat}&longitude={lon}"
         "&daily=temperature_2m_max"
         "&temperature_unit=fahrenheit"
@@ -72,16 +86,34 @@ class ForecastCache:
         return True
 
     def refresh(self) -> int:
-        """Fetch fresh forecasts for every primary station. Returns count updated."""
+        """Fetch fresh forecasts for every primary station. Returns count updated.
+
+        Rate-limited via two layers: ``rate_limit_wait`` enforces the
+        per-domain Open-Meteo budget (1.0s min interval, 3 burst), and
+        ``_INTER_STATION_SLEEP_S`` adds a small additional gap so the
+        6-station refresh doesn't fire as a tight loop. See the constant
+        docstring for the 2026-04-30 incident that motivated this.
+        """
         refreshed = 0
         new_values: dict[str, float] = {}
-        for station_id, cfg in STATIONS.items():
+        station_items = list(STATIONS.items())
+        for idx, (station_id, cfg) in enumerate(station_items):
             lat = cfg.lat
             lon = cfg.lon
             if lat is None or lon is None:
                 continue
+            # Inter-station stagger (skip before the very first fetch so
+            # the first refresh after startup isn't artificially delayed).
+            if idx > 0 and _INTER_STATION_SLEEP_S > 0:
+                time.sleep(_INTER_STATION_SLEEP_S)
             try:
-                url = self.URL_TEMPLATE.format(lat=lat, lon=lon)
+                from bot.signals.sources._openmeteo import forecast_url
+                url = forecast_url(self.QUERY_TEMPLATE.format(lat=lat, lon=lon))
+                # Per-domain rate-limit wait — same gate every other
+                # Open-Meteo caller in the codebase passes through
+                # (cached_get -> rate_limit_wait). forecast_cache used to
+                # bypass this and burst.
+                rate_limit_wait(url)
                 resp = requests.get(
                     url,
                     timeout=REQUEST_TIMEOUT_S,

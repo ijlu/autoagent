@@ -195,10 +195,53 @@ def _run_v2(memdb, monkeypatch, gaussians, afd_tuple=(None, None, None),
     _patch_collect(monkeypatch, gaussians)
     _patch_afd_bias(monkeypatch, afd_tuple)
     _patch_noaa(monkeypatch, noaa_tuple)
+    # Default AFD late-day gate to OFF in tests so wall-clock time
+    # doesn't make AFD-shift assertions flaky. Tests that specifically
+    # exercise the late-day gate can monkeypatch this back to True.
+    monkeypatch.setattr(v2, "_is_afd_late_day_skipped", lambda ticker: False)
     return v2.predict_v2(
         "KXHIGHNY-26APR23-T75",
         market if market is not None else _market(),
     )
+
+
+def test_v2_afd_shift_suppressed_past_peak_lst(memdb, monkeypatch):
+    """Regression for the 2026-05-01 evening warm-bias finding: AFD
+    parsed a "+2°F" forecaster commentary at LST 17 (post-peak) and
+    the resulting +1.5°F shift drove combined.μ above the actual
+    daily high. Past peak heating, AFD is purely additive noise —
+    the gate must suppress the shift entirely.
+    """
+    gs = [_g("hrrr", mean_f=75.0, sigma_f=2.0)]
+    # Force the late-day gate on. Same-shape AFD payload as the
+    # passing test below; the only difference is the gate.
+    _patch_collect(monkeypatch, gs)
+    _patch_afd_bias(monkeypatch, (2.0, 1.0, "afd:nyc_OKX_llm"))
+    _patch_noaa(monkeypatch, (None, None))
+    monkeypatch.setattr(v2, "_is_afd_late_day_skipped", lambda ticker: True)
+    p_late, tag_late = v2.predict_v2(
+        "KXHIGHNY-26APR23-T75", _market(),
+    )
+    # And the not-late case for reference.
+    monkeypatch.setattr(v2, "_is_afd_late_day_skipped", lambda ticker: False)
+    p_norm, tag_norm = v2.predict_v2(
+        "KXHIGHNY-26APR23-T75", _market(),
+    )
+    # Late-day path: no shift → prob = baseline (μ = 75 vs threshold 75 → 0.5)
+    assert abs(p_late - 0.5) < 0.05, (
+        f"late-day path should NOT shift: got p={p_late:.3f}"
+    )
+    # Normal-time path: AFD pushes warmer → above-75 prob jumps
+    assert p_norm > p_late + 0.1, (
+        f"normal-time AFD shift should raise prob meaningfully: "
+        f"normal={p_norm:.3f} late={p_late:.3f}"
+    )
+    # Functional contract: late-day path produces a probability
+    # indistinguishable from "no AFD" while the normal-time path's
+    # probability moves meaningfully. The suppression marker lives
+    # in the snapshot's afd_bias row (afd_tag), not the final
+    # provenance tag returned to the caller — verified separately
+    # via snapshot inspection.
 
 
 def test_v2_afd_bias_raises_prob_when_bias_positive(memdb, monkeypatch):
@@ -506,6 +549,159 @@ def test_get_learned_sigma_out_of_range_horizon_returns_none(memdb):
     assert v2._get_learned_sigma("hrrr", 200.0) is None  # out of range
 
 
+def _persist_skill_per_city(conn, source: str, city: str, bucket: str,
+                             sigma: float, bias: float = 0.0, n: int = 100):
+    """Per-(source, city, bucket) skill payload — mirrors the daily fitter."""
+    from bot.db import kv_set
+    kv_set(
+        conn, f"weather_skill_{source}_{city}_{bucket}",
+        {"sigma": sigma, "bias": bias, "n": n,
+         "fit_at": "2026-04-30T00:00:00Z",
+         "source_table": "weather_forecast_snapshots"},
+        ttl_seconds=86400,
+    )
+
+
+def test_per_city_sigma_used_when_sample_size_meets_threshold(memdb):
+    """A well-sampled per-(source, city) σ overrides the pooled key.
+
+    Spirit: when we have enough days to trust the per-city fit, prefer it
+    over pooled. Threshold is `_PER_CITY_SIGMA_MIN_SAMPLES` (60).
+    """
+    _persist_skill(memdb, "hrrr", "6_24", 1.20, n=684)            # pooled
+    _persist_skill_per_city(memdb, "hrrr", "nyc", "6_24", 0.90, n=100)
+    assert v2._get_learned_sigma("hrrr", 12.0, city_key="nyc") == pytest.approx(0.90)
+
+
+def test_per_city_sigma_falls_back_to_pooled_when_thin(memdb):
+    """A thin per-city fit (n < threshold) is dropped — pooled wins.
+
+    Regression guard: pre-fix, ``weather_skill_hrrr_los_angeles_0_6`` was
+    persisted with σ=6.02°F, bias=+5.5°F at n=18 (production kv on 2026-04-30)
+    while pooled HRRR was σ=1.20°F. The thin fit was honored, poisoning the
+    combine for LAX. The sample-size gate drops thin per-city fits.
+    """
+    _persist_skill(memdb, "hrrr", "0_6", 1.20, n=684)              # pooled
+    _persist_skill_per_city(memdb, "hrrr", "los_angeles", "0_6", 6.02,
+                             bias=5.5, n=18)                       # noisy thin fit
+    assert v2._get_learned_sigma(
+        "hrrr", 3.0, city_key="los_angeles"
+    ) == pytest.approx(1.20)
+
+
+def test_per_city_sigma_falls_back_when_n_field_missing(memdb):
+    """Defensive: a per-city payload missing the 'n' field is treated as
+    untrusted. Pooled is used instead.
+    """
+    from bot.db import kv_set
+    _persist_skill(memdb, "hrrr", "6_24", 1.20, n=684)
+    kv_set(memdb, "weather_skill_hrrr_chicago_6_24",
+           {"sigma": 0.5}, ttl_seconds=86400)  # no 'n' key
+    assert v2._get_learned_sigma(
+        "hrrr", 12.0, city_key="chicago"
+    ) == pytest.approx(1.20)
+
+
+def _persist_mos_bias_pooled(conn, source: str, city: str, bias: float):
+    from bot.db import kv_set
+    kv_set(conn, f"weather_mos_bias_{source}_{city}",
+           {"bias": bias, "n": 200, "eff_n": 200.0,
+            "fit_at": "2026-04-30T00:00:00Z"},
+           ttl_seconds=86400)
+
+
+def _persist_mos_bias_regime(conn, source: str, city: str,
+                              regime: str, bias: float):
+    from bot.db import kv_set
+    kv_set(conn, f"weather_mos_bias_{source}_{city}_{regime}",
+           {"bias": bias, "n": 80, "eff_n": 80.0,
+            "fit_at": "2026-04-30T00:00:00Z"},
+           ttl_seconds=86400)
+
+
+def test_mos_bias_pooled_lookup_no_regime(memdb):
+    """No regime_label → pooled key wins (legacy behavior preserved)."""
+    _persist_mos_bias_pooled(memdb, "hrrr", "nyc", 1.25)
+    assert v2._get_mos_bias("hrrr", "nyc") == pytest.approx(1.25)
+
+
+def test_mos_bias_regime_conditional_overrides_pooled(memdb):
+    """When regime key exists, it wins over pooled. Caller passes the
+    label observed in the current cycle.
+    """
+    _persist_mos_bias_pooled(memdb, "hrrr", "nyc", 1.25)
+    _persist_mos_bias_regime(memdb, "hrrr", "nyc", "clear|sw_wind", 0.40)
+    assert v2._get_mos_bias("hrrr", "nyc",
+                             regime_label="clear|sw_wind") == pytest.approx(0.40)
+    # Different regime → pooled fallback (no key for this regime).
+    assert v2._get_mos_bias("hrrr", "nyc",
+                             regime_label="overcast|n_wind") == pytest.approx(1.25)
+
+
+def test_mos_bias_unknown_regime_falls_back_to_pooled(memdb):
+    """``regime_label="unknown"`` is treated as no-regime so we don't
+    accidentally key on the sentinel string.
+    """
+    _persist_mos_bias_pooled(memdb, "hrrr", "nyc", 1.25)
+    _persist_mos_bias_regime(memdb, "hrrr", "nyc", "unknown", 99.0)
+    assert v2._get_mos_bias("hrrr", "nyc",
+                             regime_label="unknown") == pytest.approx(1.25)
+
+
+def test_mos_bias_clamped_to_max_abs(memdb):
+    """Sanity: a single outlier kv cell can't move the Gaussian by more
+    than ±_MOS_BIAS_MAX_ABS_F (5°F). Even a stale 99°F payload clamps."""
+    _persist_mos_bias_pooled(memdb, "hrrr", "nyc", 99.0)
+    assert v2._get_mos_bias("hrrr", "nyc") == pytest.approx(v2._MOS_BIAS_MAX_ABS_F)
+    _persist_mos_bias_pooled(memdb, "hrrr", "nyc", -99.0)
+    assert v2._get_mos_bias("hrrr", "nyc") == pytest.approx(-v2._MOS_BIAS_MAX_ABS_F)
+
+
+def test_pooled_sigma_does_not_require_min_samples(memdb):
+    """Pooled fits are already sample-aggregated across all cities — the
+    sample-size gate only applies to per-city keys. A small-n pooled key
+    is still honored.
+    """
+    _persist_skill(memdb, "ukmo", "6_24", 2.5, n=29)  # eval-seeded, small
+    assert v2._get_learned_sigma("ukmo", 12.0) == pytest.approx(2.5)
+    assert v2._get_learned_sigma("ukmo", 12.0,
+                                  city_key="austin") == pytest.approx(2.5)
+
+
+def test_group_membership_new_forecast_sources_in_model_group():
+    """2026-04-30: GEM, MetNo, ECMWF HRES added to combine. They're all
+    global NWP models with physics correlated to HRRR / NWS Point /
+    Open-Meteo / ICON / UKMO, so they MUST sit in _MODEL_GROUP for the
+    correlation discount to fire. Independence ρ vs HRRR (validated):
+    GEM 0.61, MetNo 0.73, ECMWF 0.53 — all clearly model-family.
+    """
+    assert v2._group_of("gem") == "model"
+    assert v2._group_of("metno") == "model"
+    assert v2._group_of("ecmwf") == "model"
+
+
+def test_group_membership_icon_ukmo_in_model_group():
+    """Regression: ICON and UKMO are global NWP models with physics
+    correlated to HRRR / NWS Point / Open-Meteo. They MUST sit in
+    _MODEL_GROUP so the correlation discount fires; otherwise they'd
+    sit in 'other' and double-count the model family in the precision
+    combine. Discovered + fixed 2026-04-30.
+    """
+    assert v2._group_of("hrrr") == "model"
+    assert v2._group_of("nws_point") == "model"
+    assert v2._group_of("weather") == "model"
+    assert v2._group_of("nbm") == "model"
+    assert v2._group_of("icon") == "model"
+    assert v2._group_of("ukmo") == "model"
+
+
+def test_group_membership_observation_sources():
+    """METAR + MADIS + nws_5min all read ASOS sensors → obs group."""
+    assert v2._group_of("metar") == "obs"
+    assert v2._group_of("madis") == "obs"
+    assert v2._group_of("nws_5min") == "obs"
+
+
 def test_apply_learned_sigma_overrides_prior(memdb):
     """With a persisted σ, _apply_learned_sigma returns a copy with
     sigma replaced; mean / horizon / source_name / source_tag preserved."""
@@ -635,6 +831,98 @@ def test_apply_sigma_inflation_factor_one_is_noop(monkeypatch, memdb):
     g = _g("hrrr", mean_f=78.0, sigma_f=1.5)
     inflated = v2._apply_sigma_inflation(g)
     assert inflated is g
+
+
+# ── Per-family σ inflation overrides ──────────────────────────────────
+
+
+def test_sigma_inflation_per_family_kv_override(monkeypatch, memdb):
+    """Per-family kv key wins over global kv. Confirmed via the per-
+    family Brier sweep (2026-05-03): each KXHIGH* family has its own
+    optimal σ multiplier. Global fallback ensures we never regress."""
+    from bot.db import kv_set
+
+    monkeypatch.delenv(v2._SIGMA_INFLATION_ENV, raising=False)
+    kv_set(memdb, v2._SIGMA_INFLATION_KEY, {"factor": 2.0}, ttl_seconds=3600)
+    kv_set(
+        memdb,
+        f"{v2._SIGMA_INFLATION_FAMILY_KEY_PREFIX}KXHIGHLAX",
+        {"factor": 4.0},
+        ttl_seconds=3600,
+    )
+    # KXHIGHLAX has a per-family override → 4.0
+    assert v2._get_sigma_inflation("KXHIGHLAX-26MAY03-T70") == 4.0
+    # KXHIGHCHI has no per-family override → falls through to global 2.0
+    assert v2._get_sigma_inflation("KXHIGHCHI-26MAY03-T55") == 2.0
+    # No ticker passed → global 2.0
+    assert v2._get_sigma_inflation() == 2.0
+
+
+def test_sigma_inflation_per_family_clamped(monkeypatch, memdb):
+    """Per-family override is clamped to [1.0, 4.0] just like global."""
+    from bot.db import kv_set
+
+    monkeypatch.delenv(v2._SIGMA_INFLATION_ENV, raising=False)
+    kv_set(
+        memdb,
+        f"{v2._SIGMA_INFLATION_FAMILY_KEY_PREFIX}KXHIGHDEN",
+        {"factor": 99.0},
+        ttl_seconds=3600,
+    )
+    assert v2._get_sigma_inflation("KXHIGHDEN-26MAY03-T70") == v2._SIGMA_INFLATION_MAX
+
+
+def test_sigma_inflation_per_family_can_set_to_one(monkeypatch, memdb):
+    """KXHIGHDEN's optimal factor from the Brier sweep is 1.0 (its
+    sources already agree). Setting per-family=1.0 must defeat any
+    inflated global, returning the source σ unchanged."""
+    from bot.db import kv_set
+
+    monkeypatch.delenv(v2._SIGMA_INFLATION_ENV, raising=False)
+    kv_set(memdb, v2._SIGMA_INFLATION_KEY, {"factor": 3.0}, ttl_seconds=3600)
+    kv_set(
+        memdb,
+        f"{v2._SIGMA_INFLATION_FAMILY_KEY_PREFIX}KXHIGHDEN",
+        {"factor": 1.0},
+        ttl_seconds=3600,
+    )
+    # KXHIGHDEN-anything → 1.0 (per-family)
+    assert v2._get_sigma_inflation("KXHIGHDEN-26MAY03-T70") == 1.0
+    # KXHIGHMIA-anything → 3.0 (global fallback)
+    assert v2._get_sigma_inflation("KXHIGHMIA-26MAY03-T80") == 3.0
+
+
+def test_apply_sigma_inflation_routes_by_family(monkeypatch, memdb):
+    """End-to-end: ``_apply_sigma_inflation`` reads per-family kv and
+    applies the right factor to the Gaussian's σ."""
+    from bot.db import kv_set
+
+    monkeypatch.delenv(v2._SIGMA_INFLATION_ENV, raising=False)
+    kv_set(
+        memdb,
+        f"{v2._SIGMA_INFLATION_FAMILY_KEY_PREFIX}KXHIGHLAX",
+        {"factor": 4.0},
+        ttl_seconds=3600,
+    )
+    kv_set(
+        memdb,
+        f"{v2._SIGMA_INFLATION_FAMILY_KEY_PREFIX}KXHIGHDEN",
+        {"factor": 1.0},
+        ttl_seconds=3600,
+    )
+    g = _g("combined_v2", mean_f=70.0, sigma_f=1.5, horizon_hours=8.0)
+    lax = v2._apply_sigma_inflation(g, ticker="KXHIGHLAX-26MAY03-T70")
+    den = v2._apply_sigma_inflation(g, ticker="KXHIGHDEN-26MAY03-T70")
+    assert lax.sigma_f == pytest.approx(6.0)  # 1.5 × 4.0
+    assert den is g  # factor=1.0 → identity short-circuit, original instance
+
+
+def test_family_from_ticker():
+    assert v2._family_from_ticker("KXHIGHMIA-26MAY03-T80") == "KXHIGHMIA"
+    assert v2._family_from_ticker("kxhighmia-26may03-t80") == "KXHIGHMIA"
+    assert v2._family_from_ticker(None) is None
+    assert v2._family_from_ticker("") is None
+    assert v2._family_from_ticker("nodash") == "NODASH"
 
 
 def test_predict_v2_inflation_widens_combined_sigma_in_snapshot(memdb, monkeypatch):
@@ -891,8 +1179,11 @@ def test_source_sigma_ceiling_caps_under_fit_sources(memdb, monkeypatch):
     monkeypatch.setattr(metar_mod, "get_metar_gaussian", lambda t, m: None)
     monkeypatch.setattr(madis_mod, "get_madis_gaussian", lambda t, m: None)
 
-    market_data = _market(title="Will NYC high exceed 90°F today?")
-    out = v2._collect_gaussians("KXHIGHNY-26APR23-T75", market_data)
+    # Use Austin — KXHIGHAUS has no per-city exclusions per the
+    # 2026-05-04 regression. KXHIGHNY now drops nws_point (cold-bias),
+    # which would make this test misleading.
+    market_data = _market(title="Will Austin high exceed 90°F today?")
+    out = v2._collect_gaussians("KXHIGHAUS-26APR23-T85", market_data)
     by_name = {g.source_name: g for g in out}
     # NWS Point's σ should be capped at _SOURCE_SIGMA_CEILING_F.
     assert by_name["nws_point"].sigma_f <= v2._SOURCE_SIGMA_CEILING_F + 1e-6
@@ -921,3 +1212,67 @@ def test_source_sigma_ceiling_does_not_affect_well_fit_sources(memdb, monkeypatc
     # HRRR σ=1.5 < ceiling=2.0 → unchanged (modulo skill σ override which
     # may or may not fire depending on kv state; both are <= 2.0).
     assert by_name["hrrr"].sigma_f <= v2._SOURCE_SIGMA_CEILING_F
+
+
+# ── TTE-aware σ inflation decay (2026-05-04) ──────────────────────────
+
+
+def test_decay_factor_full_when_tte_above_threshold():
+    """At TTE >= _TTE_FULL_H, the full base factor applies (no decay)."""
+    assert v2._decay_factor_for_tte(3.0, 12.0) == 3.0
+    assert v2._decay_factor_for_tte(3.0, 8.0) == 3.0
+    assert v2._decay_factor_for_tte(4.0, 100.0) == 4.0
+
+
+def test_decay_factor_one_when_tte_below_threshold():
+    """At TTE <= _TTE_NONE_H, factor decays fully to 1.0 (no inflation).
+
+    Postmortem motivation: with peak observed and outcome essentially
+    determined, σ should collapse toward observed-residual, not inflate.
+    """
+    assert v2._decay_factor_for_tte(3.0, 2.0) == 1.0
+    assert v2._decay_factor_for_tte(4.0, 0.5) == 1.0
+    assert v2._decay_factor_for_tte(3.0, 0.0) == 1.0
+
+
+def test_decay_factor_linear_between_thresholds():
+    """At the midpoint between _TTE_NONE_H (2h) and _TTE_FULL_H (8h),
+    factor is halfway between 1.0 and base."""
+    # base=3.0, tte=5.0 (midpoint) → factor = 1.0 + (3.0-1.0)*0.5 = 2.0
+    assert v2._decay_factor_for_tte(3.0, 5.0) == pytest.approx(2.0)
+    # base=4.0, tte=5.0 (midpoint) → factor = 1.0 + (4.0-1.0)*0.5 = 2.5
+    assert v2._decay_factor_for_tte(4.0, 5.0) == pytest.approx(2.5)
+
+
+def test_decay_factor_unknown_tte_uses_base():
+    """When tte_hours is None (caller didn't pass it), back-compat:
+    apply the full base factor. Pre-2026-05-04 callers pass None."""
+    assert v2._decay_factor_for_tte(3.0, None) == 3.0
+    assert v2._decay_factor_for_tte(4.0, None) == 4.0
+
+
+def test_decay_factor_base_one_is_noop_at_any_tte():
+    """A family with no inflation (factor=1.0, e.g. KXHIGHDEN) stays
+    at 1.0 across the TTE range — no point inflating then decaying
+    something that started at 1.0."""
+    for tte in [0.0, 1.0, 5.0, 8.0, 12.0, None]:
+        assert v2._decay_factor_for_tte(1.0, tte) == 1.0
+
+
+def test_apply_sigma_inflation_with_tte_decay(monkeypatch, memdb):
+    """End-to-end: a 3.0× factor combined with TTE=5.0h gives 2.0×
+    actual inflation."""
+    monkeypatch.setenv(v2._SIGMA_INFLATION_ENV, "3.0")
+    g = _g("combined_v2", mean_f=70.0, sigma_f=1.5, horizon_hours=8.0)
+    # TTE >= 8h: full inflation
+    full = v2._apply_sigma_inflation(g, ticker=None, tte_hours=10.0)
+    assert full.sigma_f == pytest.approx(4.5)  # 1.5 × 3.0
+    # TTE = 5h (midpoint): half decay
+    mid = v2._apply_sigma_inflation(g, ticker=None, tte_hours=5.0)
+    assert mid.sigma_f == pytest.approx(3.0)   # 1.5 × 2.0
+    # TTE = 2h (full decay): no inflation
+    none_ = v2._apply_sigma_inflation(g, ticker=None, tte_hours=2.0)
+    assert none_ is g  # short-circuit when factor==1.0
+    # TTE = None (back-compat): full inflation
+    bcompat = v2._apply_sigma_inflation(g, ticker=None, tte_hours=None)
+    assert bcompat.sigma_f == pytest.approx(4.5)

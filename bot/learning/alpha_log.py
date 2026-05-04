@@ -95,6 +95,11 @@ class DecisionType:
     WEATHER_QUOTER_SHADOW = "weather_quoter_shadow"
     SAFE_COMPOUNDER_SHADOW = "safe_compounder_shadow"
     SAFE_COMPOUNDER_LIVE = "safe_compounder_live"
+    # 2026-04-30: cross-bracket portfolio strategy distinguished from
+    # the legacy single-bracket directional path. Backtest validated
+    # 96-100% WR at TTE 4-6h pre-settle on 24 firings.
+    CROSS_BRACKET_SHADOW = "cross_bracket_shadow"
+    CROSS_BRACKET_LIVE = "cross_bracket_live"
 
 
 class DecisionOutcome:

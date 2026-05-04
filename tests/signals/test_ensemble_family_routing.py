@@ -30,7 +30,7 @@ def test_family_routed_ticker_bypasses_generic_sweep(monkeypatch):
     monkeypatch.setattr(ensemble, "route_family", fake_router)
     # Stub every generic source — none should be called.
     for attr in ("get_polymarket_estimate", "get_crypto_estimate",
-                 "get_weather_estimate", "get_tomorrow_weather_estimate",
+                 "get_weather_estimate", 
                  "get_noaa_alerts_for_market", "get_metar_observation_estimate",
                  "get_fred_estimate", "get_cleveland_fed_nowcast",
                  "get_bls_estimate", "get_fedwatch_estimate",
@@ -61,7 +61,7 @@ def test_router_returning_none_falls_through(monkeypatch):
 
     # Others return None so we don't have to stub them deeply
     for attr in ("get_crypto_estimate", "get_weather_estimate",
-                 "get_tomorrow_weather_estimate", "get_noaa_alerts_for_market",
+                  "get_noaa_alerts_for_market",
                  "get_metar_observation_estimate", "get_fred_estimate",
                  "get_cleveland_fed_nowcast", "get_bls_estimate",
                  "get_fedwatch_estimate", "get_sports_estimate",
@@ -84,7 +84,7 @@ def test_router_returning_none_prob_falls_through(monkeypatch):
         return (None, None)
     monkeypatch.setattr(ensemble, "get_polymarket_estimate", fake_poly)
     for attr in ("get_crypto_estimate", "get_weather_estimate",
-                 "get_tomorrow_weather_estimate", "get_noaa_alerts_for_market",
+                  "get_noaa_alerts_for_market",
                  "get_metar_observation_estimate", "get_fred_estimate",
                  "get_cleveland_fed_nowcast", "get_bls_estimate",
                  "get_fedwatch_estimate", "get_sports_estimate",
@@ -104,7 +104,7 @@ def test_router_exception_does_not_crash_ensemble(monkeypatch):
 
     # Generic sources all return None — should still yield a graceful return
     for attr in ("get_polymarket_estimate", "get_crypto_estimate",
-                 "get_weather_estimate", "get_tomorrow_weather_estimate",
+                 "get_weather_estimate", 
                  "get_noaa_alerts_for_market", "get_metar_observation_estimate",
                  "get_fred_estimate", "get_cleveland_fed_nowcast",
                  "get_bls_estimate", "get_fedwatch_estimate",

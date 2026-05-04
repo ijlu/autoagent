@@ -190,12 +190,15 @@ def test_materialize_due_writes_one_row_per_canonical_source(conn, fake_iem):
     # NY ticker; source set covers exactly the canonical Gaussian sources
     # (minus metar, which the materializer excludes).
     ticker = "KXHIGHNY-26APR23-T67"
-    # 2026-04-29: source set updated to match _MATERIALIZED_SOURCES (which
-    # is GAUSSIAN_COMBINE_SOURCES - metar). NBM, MADIS, Tomorrow dropped;
-    # ICON, UKMO, IEM 1-min added.
+    # 2026-04-29: source set updated to match _MATERIALIZED_SOURCES
+    # (which is GAUSSIAN_COMBINE_SOURCES - metar). NBM, MADIS, Tomorrow
+    # dropped; ICON, UKMO, IEM 1-min added.
+    # 2026-04-30: GEM, MetNo, ECMWF added after backtest validation
+    # (12% / 4% / 3% pooled MAE improvement).
     means = {
         "hrrr": 68.0, "nws_point": 68.5, "weather": 68.2,
-        "icon": 67.8, "ukmo": 67.2, "iem_1min": 67.5,
+        "icon": 67.8, "ukmo": 67.2,
+        "gem": 67.4, "metno": 67.6, "ecmwf": 68.1,
     }
     _populate_full_ticker(
         conn, ticker, recorded_at="2026-04-23T08:00:00Z", source_means=means,
@@ -396,8 +399,20 @@ def test_materialized_city_matches_v2_reader_key(conn, fake_iem):
 
 
 def _seed_backfill_for_skill(conn, *, n_days: int = 20) -> None:
-    """Insert n_days of synthetic forecast/observed pairs for hrrr+nbm+weather
-    at lead 12h with a shared per-day shock so error correlation is non-zero."""
+    """Insert n_days of synthetic forecast/observed pairs for the 4
+    model-group sources (hrrr+weather+nbm+nws_point) at lead 12h with
+    a shared per-day shock so error correlation is non-zero.
+
+    Why all four: ``fit_and_persist_group_correlation`` requires every
+    member of ``_MODEL_GROUP_SOURCES`` to fire on a given (city, date)
+    pair for it to count as a co-occurring sample. Seeding only a subset
+    silently zeros out the correlation fit.
+    Why we keep NBM here even though it's been retired from the live
+    combine: ``fit_skill_curves`` runs through a live-source filter
+    that drops NBM rows on persist, so the seed providing NBM data
+    doesn't contaminate downstream skill keys but does feed the
+    group_correlation fitter — which is what we want.
+    """
     import datetime as _dt
     import random as _random
     rng = _random.Random(0xCAFE)
@@ -407,7 +422,7 @@ def _seed_backfill_for_skill(conn, *, n_days: int = 20) -> None:
         date_iso = (_dt.date(2026, 4, 1) + _dt.timedelta(days=d)).isoformat()
         obs = 70.0 + d * 0.3
         common = rng.gauss(0.0, 1.0)
-        for src in ("hrrr", "nbm", "weather"):
+        for src in ("hrrr", "weather", "nbm", "nws_point"):
             fc = obs + common + rng.gauss(0.0, 0.5)
             rows.append((now_iso, src, "nyc", date_iso, 12, fc, 2.0, obs))
     conn.executemany(
@@ -741,3 +756,68 @@ def test_fit_skill_from_snapshots_handles_multiple_cities(tmp_path):
     # And MOS bias for each city.
     assert kv_get(conn, "weather_mos_bias_nws_point_nyc") is not None
     assert kv_get(conn, "weather_mos_bias_nws_point_miami") is not None
+
+
+def test_fit_skill_from_snapshots_skips_clamp_pegged_bias(tmp_path):
+    """Regression: when the EWMA bias hits the ±_MOS_BIAS_MAX_ABS_F (5°F)
+    magnitude clamp, the underlying data is too noisy to trust as a
+    bias correction. The fitter should skip persisting that cell rather
+    than write the clamped value, which would shift live predictions
+    by a clamp-pegged value (and was actively poisoning nws_point
+    predictions on 2026-04-30 — every city showed bias=-5.0).
+    """
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_skill_from_snapshots,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    # Seed nws_point with 30 samples whose mean residual is +8°F — well
+    # past the ±5°F clamp ceiling. The σ key should still be written
+    # (skill σ has its own clamp range), but the MOS bias key should
+    # be skipped + counted in mos_cells_clamped.
+    _seed_snapshots_for_skill_fit(
+        conn, source="nws_point",
+        city_series_pair=("KXHIGHNY", "KNYC"),
+        n_days=30, residual_std=0.5, residual_mean=8.0,
+    )
+
+    stats = fit_and_persist_skill_from_snapshots(conn)
+    assert stats.get("mos_cells_clamped", 0) >= 1
+    # No clamp-pegged MOS bias key should have been written.
+    assert kv_get(conn, "weather_mos_bias_nws_point_nyc") is None
+
+
+def test_fit_skill_from_snapshots_restricts_to_live_combine_sources(tmp_path):
+    """Regression: the snapshot-based fitter must restrict to
+    ``GAUSSIAN_COMBINE_SOURCES`` so retired sources (madis, nbm,
+    iem_1min) don't keep getting their MOS bias keys refreshed.
+    Pre-2026-04-30 the explicit ``sources`` default included madis +
+    nbm even though both had been removed from the live combine.
+    """
+    from bot.db import init_db, kv_get
+    from bot.learning.weather_mos_materializer import (
+        fit_and_persist_skill_from_snapshots,
+    )
+
+    conn = init_db(str(tmp_path / "kalshi.db"))
+    # Seed both a live source (nws_point in NY) and a retired source
+    # (madis in Chicago — different city so the metar_hourly_backfill
+    # UNIQUE(station, lst_date, lst_hour) constraint isn't tripped).
+    _seed_snapshots_for_skill_fit(
+        conn, source="nws_point",
+        city_series_pair=("KXHIGHNY", "KNYC"), n_days=30,
+        residual_std=1.0, residual_mean=0.5,
+    )
+    _seed_snapshots_for_skill_fit(
+        conn, source="madis",
+        city_series_pair=("KXHIGHCHI", "KMDW"), n_days=30,
+        residual_std=1.0, residual_mean=0.5,
+    )
+
+    fit_and_persist_skill_from_snapshots(conn)
+    # Live source: keys present.
+    assert kv_get(conn, "weather_mos_bias_nws_point_nyc") is not None
+    # Retired source: keys absent — even though we seeded data.
+    assert kv_get(conn, "weather_mos_bias_madis_chicago") is None
+    assert kv_get(conn, "weather_skill_madis_chicago_6_24") is None

@@ -412,11 +412,30 @@ def _compute_sigma_window(
         ).fetchall()
     residuals = [float(f) - float(a) for f, a in rows
                  if f is not None and a is not None]
-    if len(residuals) < 5:
+    # Sample-size + winsorize + cap guard. 2026-05-01: ICON / UKMO
+    # got auto-demoted at sigma=12.78 / 13.40°F after a single bad
+    # cold-start day fed 5-10 outlier-magnitude residuals into the
+    # std calc. Three layers of defense:
+    #   1. Require n ≥ 20 — a 5-sample window is too narrow to be
+    #      a real σ estimate in the first place.
+    #   2. Winsorize residuals at ±10°F. Anything beyond that is
+    #      almost certainly a fetch / parse anomaly, not a real
+    #      forecast error of 10+°F. Clipping caps single-outlier
+    #      damage rather than letting 1-2 days dominate the variance.
+    #   3. Hard-cap the returned σ at 8°F. Any cell whose true RMSE
+    #      is above 8°F is broken at the source and shouldn't be
+    #      pseudo-promoted to a "real" σ value the state machine
+    #      then trusts. Cap forces it into the demotion path with
+    #      a finite, recoverable σ that next-day re-fits can
+    #      replace cleanly once data is healthy.
+    if len(residuals) < 20:
         return None
-    mean = sum(residuals) / len(residuals)
-    var = sum((r - mean) ** 2 for r in residuals) / len(residuals)
-    return var ** 0.5
+    _RESID_CLIP = 10.0
+    clipped = [max(-_RESID_CLIP, min(_RESID_CLIP, r)) for r in residuals]
+    mean = sum(clipped) / len(clipped)
+    var = sum((r - mean) ** 2 for r in clipped) / len(clipped)
+    sigma = var ** 0.5
+    return min(sigma, 8.0)
 
 
 def refresh_metrics(conn: sqlite3.Connection) -> int:

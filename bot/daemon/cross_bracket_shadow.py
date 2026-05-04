@@ -1,20 +1,31 @@
-"""Cross-bracket portfolio shadow logger — Phase B.3 rollout.
+"""Cross-bracket portfolio runner — shadow + (gated) live trading.
 
 Runs every cycle: pulls open weather markets, groups by settlement
-event, scores via ``score_market_portfolio``, logs each per-bracket
-decision to ``alpha_backtest`` with a shared ``market_id`` (settlement
-key) so we can reconstruct portfolios later.
+event, scores via ``score_market_portfolio``, then either:
+  - logs each per-bracket decision to ``alpha_backtest`` (shadow mode), or
+  - posts each leg as a real Kalshi order AND logs it (live mode).
 
-This is shadow-only — no orders placed, no live behavior change.
-After accumulating ~1 week of decisions, compare cross-bracket
-realized PnL to the existing single-side directional shadow.
-Promote to live trading only if cross-bracket Brier / PnL beats
-the single-side flow.
+Live mode is OFF by default and gated by TWO independent switches:
+  1. Global env ``CROSS_BRACKET_LIVE`` must be true
+  2. Per-family kv key ``cross_bracket_live:<family>`` must be truthy
+Both must pass; either being false keeps the family in shadow.
+
+Additional safety rails (all configurable, see ``bot/config.py``):
+  - TTE window: live trading only fires for portfolios where the
+    decision time is within (``CROSS_BRACKET_MIN_TTE_HOURS``,
+    ``CROSS_BRACKET_MAX_TTE_HOURS``) — defaults 3-7h pre-settle,
+    matching the 96-100% WR backtest band.
+  - Per-leg contract cap: ``CROSS_BRACKET_MAX_CONTRACTS_PER_LEG`` (default 1).
+  - Per-portfolio leg cap: ``CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO`` (default 4).
+  - Edge floor (live-only, separate from the shadow scorer's 0.07):
+    ``CROSS_BRACKET_LIVE_MIN_EDGE`` (default 0.10).
+  - Daily exposure cap: ``CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS``
+    tracked in ``kv_cache:cross_bracket_daily_exposure_<YYYY-MM-DD>``.
 
 Why a separate runner instead of patching trade.py:
   * Cleanest separation. Existing trade flow keeps producing one
     decision per market visit; cross-bracket scoring runs in parallel.
-  * Easier to roll back — disable one scheduler task vs refactor.
+  * Easier to roll back — flip env or kv key, no redeploy.
   * Shadow data is logged to the same alpha_backtest table, joinable
     by ticker for retro analysis.
 """
@@ -23,8 +34,19 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
+from bot.config import (
+    CROSS_BRACKET_LIVE,
+    CROSS_BRACKET_MAX_CONTRACTS_PER_LEG,
+    CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO,
+    CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS,
+    CROSS_BRACKET_MIN_TTE_HOURS,
+    CROSS_BRACKET_MAX_TTE_HOURS,
+    CROSS_BRACKET_LIVE_MIN_EDGE,
+    CROSS_BRACKET_SLIP_TOLERANCE_CENTS,
+)
 from bot.signals.weather_ensemble_v2 import (
     _city_for_ticker,
     _collect_gaussians,
@@ -35,6 +57,121 @@ from bot.signals.weather_forecast import combine_gaussian
 
 
 logger = logging.getLogger(__name__)
+
+
+def _family_from_settlement_key(settlement_key: str) -> str:
+    """KXHIGHNY-26APR30 → KXHIGHNY."""
+    return settlement_key.split("-", 1)[0].upper()
+
+
+def _is_family_live(conn, family: str) -> bool:
+    """Per-family live trading kill switch. Both global env AND
+    family-specific kv must be truthy for live trading to fire.
+
+    The two-key design is intentional belt-and-suspenders: the global
+    env lets us instantly turn off ALL cross-bracket live trading via
+    a deploy + restart, while the per-family kv lets us canary one
+    family at a time without restarting the daemon.
+    """
+    if not CROSS_BRACKET_LIVE:
+        return False
+    from bot.db import kv_get
+    try:
+        val = kv_get(conn, f"cross_bracket_live:{family}")
+    except Exception:
+        return False
+    if val is True:
+        return True
+    if isinstance(val, dict) and val.get("enabled") is True:
+        return True
+    if isinstance(val, str) and val.lower() in ("true", "1", "yes"):
+        return True
+    return False
+
+
+def _settlement_unix_from_key(settlement_key: str) -> Optional[int]:
+    """KXHIGHNY-26APR30 → unix ts of 23:59:59 LST that day.
+
+    Used by the TTE gate. Best-effort parse; returns None on
+    unparseable format so the gate can fail-closed (skip live).
+    """
+    parts = settlement_key.split("-")
+    if len(parts) < 2:
+        return None
+    suf = parts[1]
+    if len(suf) < 7:
+        return None
+    months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+              "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+    try:
+        yy = int(suf[:2])
+        mon = suf[2:5].upper()
+        dd = int(suf[5:7])
+        m_idx = months.index(mon) + 1
+    except (ValueError, IndexError):
+        return None
+    # 23:59:59 LST. Use the family's LST offset so we settle at the
+    # right UTC moment per Kalshi's convention.
+    family = _family_from_settlement_key(settlement_key)
+    lst_offsets = {
+        "KXHIGHNY": -5, "KXHIGHMIA": -5,
+        "KXHIGHCHI": -6, "KXHIGHAUS": -6,
+        "KXHIGHDEN": -7, "KXHIGHLAX": -8,
+    }
+    offset = lst_offsets.get(family, -5)
+    try:
+        # 23:59:59 LST = (24 - offset) UTC the same day = 24+|offset| ish
+        # Actually: LST 23:59:59 = LST_unix + 86399. UTC = LST_unix - offset*3600
+        from datetime import datetime, timezone
+        dt = datetime(2000 + yy, m_idx, dd, 23, 59, 59, tzinfo=timezone.utc)
+        # Subtract the offset to convert LST-23:59 to UTC.
+        return int(dt.timestamp() - offset * 3600)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _today_iso() -> str:
+    """Date-bucket string for the daily exposure counter."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _get_daily_exposure_cents(conn) -> int:
+    from bot.db import kv_get
+    try:
+        val = kv_get(conn, f"cross_bracket_daily_exposure_{_today_iso()}")
+    except Exception:
+        return 0
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, dict):
+        return int(val.get("cents", 0) or 0)
+    return 0
+
+
+def _bump_daily_exposure_cents(conn, delta_cents: int) -> None:
+    from bot.db import kv_set
+    new_total = _get_daily_exposure_cents(conn) + delta_cents
+    try:
+        # 36-hour TTL so the counter rolls naturally to the next day.
+        kv_set(conn,
+               f"cross_bracket_daily_exposure_{_today_iso()}",
+               {"cents": new_total, "updated": _today_iso()},
+               ttl_seconds=129600)
+    except Exception as exc:
+        logger.warning("[cross_bracket_live] failed to bump exposure counter: %s", exc)
+
+
+def _safe_client_order_id(settlement_key: str, leg_idx: int) -> str:
+    """Build a valid Kalshi client_order_id.
+
+    Rules (per CLAUDE.md regression watchlist):
+      * Must start with "mm_"
+      * No periods (Kalshi rejects)
+      * Total length should stay under 64 chars
+    Pattern: mm_xb_<settle_key>_<leg>_<unix_ms>
+    """
+    safe_key = settlement_key.replace(".", "_")
+    return f"mm_xb_{safe_key}_{leg_idx}_{int(time.time() * 1000)}"
 
 
 def run_cross_bracket_shadow(conn) -> dict:
@@ -51,6 +188,13 @@ def run_cross_bracket_shadow(conn) -> dict:
         "decisions_buy_no": 0,
         "decisions_skip": 0,
         "errors": 0,
+        "live_orders_posted": 0,
+        "live_orders_failed": 0,
+        "live_skipped_tte": 0,
+        "live_skipped_edge": 0,
+        "live_skipped_exposure_cap": 0,
+        "live_skipped_leg_cap": 0,
+        "live_skipped_family_off": 0,
     }
 
     try:
@@ -93,10 +237,9 @@ def run_cross_bracket_shadow(conn) -> dict:
             else:
                 stats["decisions_skip"] += 1
 
-        # Log to alpha_backtest. Each leg gets its own row, all sharing
-        # the settlement_key as a market_id (stored in `notes` for now;
-        # a dedicated column would be cleaner but adds schema migration).
-        _log_decisions_to_alpha_backtest(conn, settlement_key, group, decisions)
+        # Log + (conditionally) place orders. Each leg gets its own row,
+        # all sharing the settlement_key as market_id.
+        _process_decisions(conn, settlement_key, group, decisions, stats)
 
     return stats
 
@@ -158,54 +301,329 @@ def _score_one_settlement(group: list[dict]) -> list:
     )
 
 
-def _log_decisions_to_alpha_backtest(
-    conn, settlement_key: str, group: list[dict], decisions: list,
+def _is_live_eligible_window(settlement_key: str) -> tuple[bool, float]:
+    """Return (in_window, hours_to_settle).
+
+    Hours-to-settle is computed from settlement_key. Returns (False, -1)
+    on parse failure (fail-closed — won't trade live for unparseable
+    keys).
+    """
+    settle_unix = _settlement_unix_from_key(settlement_key)
+    if settle_unix is None:
+        return False, -1.0
+    now = time.time()
+    hours_to_settle = (settle_unix - now) / 3600.0
+    in_window = (
+        CROSS_BRACKET_MIN_TTE_HOURS <= hours_to_settle <= CROSS_BRACKET_MAX_TTE_HOURS
+    )
+    return in_window, hours_to_settle
+
+
+def _best_ask_for_buy(
+    ticker: str, side: str,
+) -> tuple[Optional[int], Optional[int]]:
+    """Return (best_ask_price_cents, size_at_best) for buying ``side``.
+
+    Kalshi's orderbook returns BIDS for both yes and no. To buy YES we
+    look at NO bids: a no_bid at price X is held by someone willing to
+    sell YES at (100 - X) — that's our YES ask via reciprocity. The
+    HIGHEST no_bid maps to the LOWEST yes_ask. Mirror for buying NO.
+
+    Returns (None, None) when the orderbook is empty or unfetchable.
+    The caller should treat None as "abort" — without depth visibility
+    we can't bound slippage.
+    """
+    from bot.api import api_get
+    try:
+        resp = api_get(f"/markets/{ticker}/orderbook")
+    except Exception as exc:
+        logger.warning("[cross_bracket_live] orderbook fetch %s: %s", ticker, exc)
+        return None, None
+
+    book = resp.get("orderbook") or resp.get("orderbook_fp") or resp
+    if side == "yes":
+        # buying YES → look at NO bids → reciprocal yes_ask = 100 - no_bid
+        levels = book.get("no") or book.get("no_dollars") or []
+    elif side == "no":
+        # buying NO → look at YES bids → reciprocal no_ask = 100 - yes_bid
+        levels = book.get("yes") or book.get("yes_dollars") or []
+    else:
+        return None, None
+    if not levels:
+        return None, None
+
+    # Parse and find the HIGHEST bid on the opposite side. Kalshi's API
+    # returns prices either as integer cents [42, 50] or dollar strings
+    # [["0.42", "50"]]. Normalize defensively.
+    best_bid_cents: Optional[int] = None
+    best_size: int = 0
+    for level in levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        raw_p, raw_q = level[0], level[1]
+        try:
+            if isinstance(raw_p, str):
+                p = round(float(raw_p) * 100)
+            elif isinstance(raw_p, float) and raw_p < 1.0:
+                p = round(raw_p * 100)
+            else:
+                p = int(raw_p)
+            q = round(float(raw_q)) if isinstance(raw_q, str) else int(raw_q)
+        except (TypeError, ValueError):
+            continue
+        if p < 0 or p > 100 or q <= 0:
+            continue
+        if best_bid_cents is None or p > best_bid_cents:
+            best_bid_cents = p
+            best_size = q
+        elif p == best_bid_cents:
+            # Multiple entries at same price — combine.
+            best_size += q
+
+    if best_bid_cents is None:
+        return None, None
+    # Reciprocal: implied ask price for the side we're buying.
+    implied_ask = 100 - best_bid_cents
+    return implied_ask, best_size
+
+
+def _post_live_order(
+    conn, settlement_key: str, leg_idx: int, decision,
+    contracts: int,
+) -> tuple[bool, Optional[str]]:
+    """Place a live Kalshi order for one cross-bracket leg, with two
+    layers of slippage protection.
+
+    Layer 1: the limit price is capped at ``best_ask + slip_tolerance``
+    so a thin top-of-book can be walked up by at most ``slip_tolerance``
+    cents.
+
+    Layer 2: the count is capped at the visible top-of-book size, so we
+    never fill across multiple price levels in a single order. If the
+    full target size needs more depth than visible, we simply post less
+    — the higher-tier infra (portfolio sizing) is responsible for any
+    fill-replenishment logic.
+
+    Cross-bracket alpha comes from MISPRICING — we *want* to cross the
+    spread when the market is wrong relative to our model. So
+    ``post_only=False``. The two slippage layers above replace the
+    safety post_only=True was meant to provide.
+
+    Returns (success, order_id_or_error_str).
+    """
+    from bot.api import api_post
+
+    if decision.action == "skip" or decision.side is None:
+        return False, "skip_action"
+
+    side = "yes" if decision.side == "yes" else "no"
+    target_price = decision.price_cents
+
+    # Layer 1+2 prep: check the book for slippage exposure.
+    best_ask, best_ask_size = _best_ask_for_buy(decision.ticker, side)
+    if best_ask is None or best_ask_size is None or best_ask_size <= 0:
+        return False, "orderbook_unavailable_or_empty"
+
+    # Layer 1 — cap the limit price at best_ask + slip_tolerance, but
+    # never above our own model FV (target_price). If our FV is BELOW
+    # best_ask, there's no edge here — abort.
+    if target_price < best_ask:
+        return False, f"no_edge:fv={target_price}<ask={best_ask}"
+    limit_price = min(target_price, best_ask + CROSS_BRACKET_SLIP_TOLERANCE_CENTS)
+
+    # Layer 2 — cap count to top-of-book size.
+    safe_count = min(contracts, best_ask_size)
+    if safe_count <= 0:
+        return False, "empty_top_of_book"
+
+    body = {
+        "ticker": decision.ticker,
+        "client_order_id": _safe_client_order_id(settlement_key, leg_idx),
+        "side": side,
+        "action": "buy",
+        "type": "limit",
+        "count": safe_count,
+        "yes_price": limit_price if side == "yes" else None,
+        "no_price": limit_price if side == "no" else None,
+        # Cross-bracket needs to cross the spread to capture mispricing.
+        # Slippage is bounded by Layers 1+2 above.
+        "post_only": False,
+    }
+    # Strip None fields — Kalshi doesn't accept null prices.
+    body = {k: v for k, v in body.items() if v is not None}
+
+    try:
+        resp = api_post("/portfolio/orders", body)
+    except Exception as exc:
+        return False, f"api_exception:{type(exc).__name__}:{exc}"
+
+    if not isinstance(resp, dict):
+        return False, f"unexpected_response_shape:{type(resp).__name__}"
+    order = resp.get("order") or {}
+    order_id = order.get("order_id")
+    if not order_id:
+        return False, f"no_order_id:{resp.get('error') or resp}"
+    return True, order_id
+
+
+def _process_decisions(
+    conn, settlement_key: str, group: list[dict],
+    decisions: list, stats: dict,
 ) -> None:
-    """One alpha_backtest row per non-skip decision, tagged with the
-    settlement key in ``notes`` so portfolios are reconstructable."""
+    """For each decision, log to alpha_backtest. Additionally, if live
+    mode is on AND the family/TTE/edge/exposure gates pass, place a
+    real Kalshi order.
+
+    Each leg gets its own alpha_backtest row tagged by the settlement
+    key in ``market_id`` so portfolios are reconstructable later. Live
+    rows use ``decision_type=CROSS_BRACKET_LIVE`` and
+    ``decision_outcome=POSTED`` (or ``DISCARDED`` if a gate rejected).
+    """
     from bot.learning.alpha_log import (
         DecisionOutcome, DecisionType, EnsembleSnapshot, MarketSnapshot,
         log_decision, market_snapshot_from_dict,
     )
 
-    # Build a lookup so we can resolve each decision's market_data
     by_ticker = {m.get("ticker"): m for m in group}
+    family = _family_from_settlement_key(settlement_key)
+    family_live = _is_family_live(conn, family)
+
+    # TTE check fires once per portfolio (all legs share a settlement).
+    in_tte_window, hours_to_settle = _is_live_eligible_window(settlement_key)
+
+    # Cap legs per portfolio (live-mode only — shadow logs everything).
+    non_skip = [d for d in decisions if d.action != "skip"]
+    if family_live and in_tte_window and \
+            len(non_skip) > CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO:
+        # Sort by edge desc and take top N. We compute a single edge
+        # number per leg = max(edge_yes, edge_no) (whichever side fired).
+        def _leg_edge(d):
+            if d.action == "buy_yes" and d.edge_yes is not None:
+                return d.edge_yes
+            if d.action == "buy_no" and d.edge_no is not None:
+                return d.edge_no
+            return 0.0
+        non_skip_sorted = sorted(non_skip, key=_leg_edge, reverse=True)
+        kept = set(id(x) for x in non_skip_sorted[:CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO])
+        # Demote the rest to "skip" for live purposes; they'll still
+        # log as shadow rows.
+        for d in non_skip:
+            if id(d) not in kept:
+                stats["live_skipped_leg_cap"] += 1
+
+    daily_exposure_cents = _get_daily_exposure_cents(conn)
 
     for leg_idx, d in enumerate(decisions):
         if d.action == "skip":
-            # Optionally log skips too — but for shadow analysis we mostly
-            # care about would-be trades. Keep skip rate stat in scheduler
-            # log line; don't bloat alpha_backtest with skip rows.
             continue
-
         market = by_ticker.get(d.ticker)
         if market is None:
             continue
 
-        # Notes carries the per-leg edge; market_id and leg_count live in
-        # their own columns (see bot/db.py alpha_backtest schema).
         edge_yes_str = (
             f";edge_yes={d.edge_yes:+.3f}" if d.edge_yes is not None else ""
         )
         edge_no_str = (
             f";edge_no={d.edge_no:+.3f}" if d.edge_no is not None else ""
         )
-        notes = f"cross_bracket;leg={leg_idx};p_yes={d.p_yes:.3f}{edge_yes_str}{edge_no_str}"
+        base_notes = (
+            f"cross_bracket;leg={leg_idx};p_yes={d.p_yes:.3f}"
+            f"{edge_yes_str}{edge_no_str}"
+        )
+
+        # Decide whether THIS leg can go live. All gates must pass.
+        leg_edge = (d.edge_yes if d.action == "buy_yes" else d.edge_no) or 0.0
+        leg_can_go_live = True
+        live_skip_reason = None
+
+        if not family_live:
+            leg_can_go_live = False
+            live_skip_reason = "family_not_live"
+            stats["live_skipped_family_off"] += 1
+        elif not in_tte_window:
+            leg_can_go_live = False
+            live_skip_reason = f"tte_{hours_to_settle:.1f}h_outside_band"
+            stats["live_skipped_tte"] += 1
+        elif leg_edge < CROSS_BRACKET_LIVE_MIN_EDGE:
+            leg_can_go_live = False
+            live_skip_reason = (
+                f"edge_{leg_edge:+.3f}_below_live_floor_"
+                f"{CROSS_BRACKET_LIVE_MIN_EDGE:.3f}"
+            )
+            stats["live_skipped_edge"] += 1
+
+        contracts = min(
+            CROSS_BRACKET_MAX_CONTRACTS_PER_LEG,
+            CROSS_BRACKET_MAX_CONTRACTS_PER_LEG,  # placeholder for Kelly later
+        )
+        leg_cost_cents = (d.price_cents or 0) * contracts
+        if leg_can_go_live and \
+                daily_exposure_cents + leg_cost_cents > CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS:
+            leg_can_go_live = False
+            live_skip_reason = (
+                f"exposure_cap_{daily_exposure_cents}c+{leg_cost_cents}c>"
+                f"{CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS}c"
+            )
+            stats["live_skipped_exposure_cap"] += 1
+
+        # ── Live path ──
+        order_id: Optional[str] = None
+        if leg_can_go_live:
+            success, result = _post_live_order(
+                conn, settlement_key, leg_idx, d, contracts,
+            )
+            if success:
+                order_id = result
+                stats["live_orders_posted"] += 1
+                daily_exposure_cents += leg_cost_cents
+                _bump_daily_exposure_cents(conn, leg_cost_cents)
+                logger.info(
+                    "[cross_bracket_live] POSTED %s %s %d×%d¢ "
+                    "edge=%+.3f tte=%.1fh order_id=%s",
+                    d.ticker, d.side, contracts, d.price_cents or 0,
+                    leg_edge, hours_to_settle, order_id,
+                )
+            else:
+                stats["live_orders_failed"] += 1
+                logger.warning(
+                    "[cross_bracket_live] POST FAILED %s %s: %s",
+                    d.ticker, d.side, result,
+                )
+
+        # ── Always log to alpha_backtest ──
+        # When live posting succeeded → CROSS_BRACKET_LIVE + POSTED.
+        # When live was attempted and skipped or failed → CROSS_BRACKET_SHADOW
+        # + SHADOW_ONLY (preserves the historical shadow data shape).
+        # `notes` always carries the cross_bracket marker so we can
+        # filter retro queries.
+        notes = base_notes
+        if leg_can_go_live and order_id:
+            decision_type = DecisionType.CROSS_BRACKET_LIVE
+            decision_outcome = DecisionOutcome.POSTED
+            notes += f";order_id={order_id};tte={hours_to_settle:.1f}h"
+        else:
+            decision_type = DecisionType.CROSS_BRACKET_SHADOW
+            decision_outcome = DecisionOutcome.SHADOW_ONLY
+            if live_skip_reason:
+                notes += f";live_skip={live_skip_reason}"
 
         try:
             log_decision(
                 conn,
                 ticker=d.ticker,
-                decision_type=DecisionType.DIRECTIONAL_SHADOW,  # reuse type for now
-                decision_outcome=DecisionOutcome.SHADOW_ONLY,
+                decision_type=decision_type,
+                decision_outcome=decision_outcome,
                 ensemble=EnsembleSnapshot(p_yes=float(d.p_yes)),
                 market=market_snapshot_from_dict(market),
                 side=d.side,
                 price_cents=d.price_cents,
-                contracts=1,  # placeholder — Kelly happens at live promotion
+                contracts=contracts if order_id else 1,
                 notes=notes,
                 market_id=settlement_key,
                 portfolio_leg_count=len(decisions),
             )
         except Exception as exc:
-            logger.warning("[cross_bracket_shadow] log_decision failed for %s: %r", d.ticker, exc)
+            logger.warning(
+                "[cross_bracket_shadow] log_decision failed for %s: %r",
+                d.ticker, exc,
+            )

@@ -1,16 +1,21 @@
-"""UKMO (UK Met Office) forecast source via Open-Meteo.
+"""MET Norway forecast source via Open-Meteo.
 
-Live probe 2026-04-29 confirmed independence vs HRRR at 0.40. Eval MAE
-2.27°F across 6 stations × 30 days. Particularly strong on Atlantic-
-influenced weather (relevant for NYC, MIA, even LAX via Pacific).
+Validated 2026-04-30 (`tools/investigate_new_forecast_sources.py`,
+n=174 city-days, Apr 1–29 2026):
 
-Different from HRRR/GFS:
-  - UK Met Office's Unified Model (UM) — different physics suite
-  - Strong North Atlantic / mid-latitude observation network
-  - Independent data assimilation
+  - Pooled MAE: **1.96°F** (vs HRRR 1.33, GEM 1.80, ICON 2.18)
+  - Pooled bias: **−0.94°F** (slight cool bias)
+  - Pairwise residual ρ vs HRRR: 0.73, vs ICON: 0.75 (less independent
+    than GEM but still useful diversification)
+  - Ensemble impact: adding MetNo to (HRRR+ICON+UKMO) baseline cut
+    pooled MAE 1.79°F → 1.721°F (**−4%**)
 
-Pre-seeded σ + bias from eval via
-``tools/seed_source_priors_from_eval.py``. Starts in PROBATIONARY.
+MET Norway operates a Nordic-tuned model, useful as a third-party
+European voice independent of UKMO and ECMWF/ICON. Smaller marginal
+contribution than GEM but independent enough to be worth including.
+
+State machine starts in PROBATIONARY; auto-promotes to ACTIVE after
+50+ settled rows with non-regression on combined Brier.
 """
 
 from __future__ import annotations
@@ -31,56 +36,54 @@ from bot.signals.sources.weather import (
 from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
-# UKMO runs four times per day (00/06/12/18 UTC) with ~3-5h publish
-# latency. 5h 30min cache fits inside one cycle. Was 1800 (30 min);
-# the new TTL aligns to the data's actual update cadence. See deploy
-# notes 2026-04-30.
-_UKMO_CACHE_TTL = 19800
-_UKMO_MODEL = "ukmo_seamless"
+# MET Norway updates roughly every 6 hours. Same TTL as other 6-hourly
+# global models in our combine.
+_METNO_CACHE_TTL = 19800
+_METNO_MODEL = "metno_seamless"
 
 
-def _fetch_ukmo_forecast(city_key: str) -> Optional[dict]:
+def _fetch_metno_forecast(city_key: str) -> Optional[dict]:
     city = WEATHER_CITIES.get(city_key)
     if not city:
         return None
 
-    cache_key = f"ukmo::{city_key}"
+    cache_key = f"metno::{city_key}"
     now = time.time()
     if cache_key in _CACHE:
         data, ts = _CACHE[cache_key]
-        if now - ts < _UKMO_CACHE_TTL:
+        if now - ts < _METNO_CACHE_TTL:
             return data
 
-    # See icon.py for the timezone= rationale — same applies here.
     from bot.signals.sources._openmeteo import forecast_url
     url = forecast_url(
         f"latitude={city['lat']}&longitude={city['lon']}"
         f"&daily=temperature_2m_max"
         f"&temperature_unit=fahrenheit&timezone={city['tz']}&forecast_days=7"
-        f"&models={_UKMO_MODEL}"
+        f"&models={_METNO_MODEL}"
     )
     try:
         rate_limit_wait(url)
         r = requests.get(url, timeout=8)
         if r.status_code != 200:
-            print(f"[ukmo] HTTP {r.status_code}")
+            print(f"[metno] HTTP {r.status_code}")
             return None
         data = r.json()
         _CACHE[cache_key] = (data, now)
         return data
     except Exception as e:
-        print(f"[ukmo] error: {type(e).__name__}: {e}")
+        print(f"[metno] error: {type(e).__name__}: {e}")
         return None
 
 
-def _ukmo_sigma_for_day(day_idx: int) -> float:
-    """UKMO per-day prior σ. Eval MAE 2.27°F → σ_prior ~2.85°F. Per-city
-    learned σ in kv_cache overrides via ``_apply_learned_sigma``.
+def _metno_sigma_for_day(day_idx: int) -> float:
+    """MetNo per-day prior σ. Eval (n=174) MAE pooled across 6 stations
+    was 1.96°F → σ_prior 2.2°F base. Add 0.5°F per day out.
     """
-    return 2.85 + day_idx * 0.5
+    return 2.2 + day_idx * 0.5
 
 
-def get_ukmo_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
+def get_metno_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
+    """Return MetNo's daily-high distribution for the settlement day."""
     if market_data is None:
         return None
     title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
@@ -103,7 +106,7 @@ def get_ukmo_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForeca
     if day_idx is None:
         return None
 
-    forecast = _fetch_ukmo_forecast(city_key)
+    forecast = _fetch_metno_forecast(city_key)
     if not forecast:
         return None
     daily = forecast.get("daily", {})
@@ -117,13 +120,13 @@ def get_ukmo_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForeca
 
     tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
     date_label = dates[day_idx] if day_idx < len(dates) else "?"
-    sigma_f = _ukmo_sigma_for_day(day_idx)
+    sigma_f = _metno_sigma_for_day(day_idx)
     horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
 
     return GaussianForecast(
         mean_f=float(forecast_high),
         sigma_f=sigma_f,
         horizon_hours=horizon_hours,
-        source_name="ukmo",
-        source_tag=f"ukmo:{city_key}_{date_label}",
+        source_name="metno",
+        source_tag=f"metno:{city_key}_{date_label}",
     )

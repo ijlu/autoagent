@@ -75,7 +75,10 @@ from bot.signals.sources.prediction_markets import get_polymarket_estimate, get_
 from bot.signals.sources.crypto import get_crypto_estimate
 from bot.signals.sources.weather import (
     get_weather_estimate,
-    get_tomorrow_weather_estimate,
+    # get_tomorrow_weather_estimate — dropped from active path 2026-05-04;
+    # source kept in weather.py for code archeology. Re-import here only
+    # if the call site at line ~361 is uncommented, which requires fresh
+    # validation against post-lat/lon-fix data first.
     get_noaa_alerts_for_market,
 )
 from bot.signals.sources.economics import get_fred_estimate, get_cleveland_fed_nowcast, get_bls_estimate
@@ -358,9 +361,15 @@ def get_independent_estimate(
     if weather_prob is not None:
         estimates.append((weather_prob, weights.get("weather", 0.80), weather_src))
 
-    tmrw_prob, tmrw_src = _tracked_call("tomorrow", get_tomorrow_weather_estimate, ticker, market_data)
-    if tmrw_prob is not None:
-        estimates.append((tmrw_prob, weights.get("tomorrow", 0.82), tmrw_src))
+    # 2026-05-04: tomorrow.io dropped from the v1 ensemble path. Latest
+    # snapshot 2026-04-28 (deprecated days ago); regression showed -5.49°F
+    # bias at KNYC, -4.10°F at KMIA on residual data. The getter remains
+    # in `bot.signals.sources.weather` for code archeology but is no
+    # longer called from any active path. Re-enabling requires fresh
+    # validation on post-fix lat/lon data.
+    # tmrw_prob, tmrw_src = _tracked_call("tomorrow", get_tomorrow_weather_estimate, ticker, market_data)
+    # if tmrw_prob is not None:
+    #     estimates.append((tmrw_prob, weights.get("tomorrow", 0.82), tmrw_src))
 
     noaa_prob, noaa_src = _tracked_call("noaa", get_noaa_alerts_for_market, ticker, market_data)
     if noaa_prob is not None:

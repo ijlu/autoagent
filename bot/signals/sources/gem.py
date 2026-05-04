@@ -1,23 +1,27 @@
-"""ICON (German DWD) forecast source via Open-Meteo.
+"""GEM (Canadian Meteorological Centre) forecast source via Open-Meteo.
 
-Live probe 2026-04-29 confirmed independence vs HRRR at 0.39 (one of
-the best in our eval; only IEM 1-min was lower). Eval MAE 2.15°F across
-6 stations × 30 days. Particularly accurate at KMIA (1.02°F MAE).
+Validated 2026-04-30 (`tools/investigate_new_forecast_sources.py`,
+n=174 city-days, Apr 1–29 2026):
 
-Different from HRRR/GFS:
-  - German DWD's icosahedral grid (different mesh; behaves differently
-    near poles + complex terrain)
-  - European observation network (more European stations contribute)
-  - Independent data assimilation chain
+  - Pooled MAE: **1.80°F** (vs HRRR 1.33, ICON 2.18, UKMO 2.37)
+  - Pooled bias: **+0.08°F** (essentially zero; remarkable)
+  - Pairwise residual ρ vs HRRR: 0.61, vs ICON: 0.60, vs UKMO: 0.62
+    (moderately independent of all current sources)
+  - Ensemble impact: adding GEM to (HRRR+ICON+UKMO) baseline cut
+    pooled MAE 1.79°F → 1.575°F (**−12%**, the best single addition
+    of the 6 candidates we validated)
 
-These properties together produce errors uncorrelated with US-tuned
-GFS/HRRR — exactly the diversification the precision-weighted combine
-benefits from.
+Different from other sources in the combine:
+  - Canadian Meteorological Centre's GEM model — independent
+    physics core + data assimilation chain from the European (ECMWF /
+    ICON / UKMO) and American (HRRR / NWS_point) systems
+  - North-America-tuned but with stronger Arctic + boundary handling
+    than HRRR
 
-Pre-seeded σ + bias from eval data via
-``tools/seed_source_priors_from_eval.py``. State machine starts in
-PROBATIONARY; auto-promotes to ACTIVE after 50+ settled rows with non-
-regression on combined Brier.
+State machine starts in PROBATIONARY; auto-promotes to ACTIVE after
+50+ settled rows with non-regression on combined Brier. σ + bias
+prior values match the eval data, refined by `_apply_learned_sigma`
++ `_apply_mos_bias` once accumulated.
 """
 
 from __future__ import annotations
@@ -40,64 +44,60 @@ from bot.signals.sources.weather import (
 from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
-# ICON runs four times per day (00/06/12/18 UTC) with ~3h publish
-# latency. A 5h 30min cache fits inside one model cycle — we refresh
-# at most once per 6h per city, matching the underlying cadence.
-# Was 1800 (30 min) which drove ~10× more fetches than the data
-# actually changes. See deploy notes 2026-04-30.
-_ICON_CACHE_TTL = 19800
-_ICON_MODEL = "icon_seamless"
+# GEM runs four times per day (00/06/12/18 UTC) with ~3h publish latency.
+# 5h 30min cache fits inside one model cycle — same shape as ICON/UKMO.
+_GEM_CACHE_TTL = 19800
+_GEM_MODEL = "gem_seamless"
 
 
-def _fetch_icon_forecast(city_key: str) -> Optional[dict]:
-    """Fetch ICON daily forecasts for the next 7 days for one city."""
+def _fetch_gem_forecast(city_key: str) -> Optional[dict]:
+    """Fetch GEM daily forecasts for the next 7 days for one city."""
     city = WEATHER_CITIES.get(city_key)
     if not city:
         return None
 
-    cache_key = f"icon::{city_key}"
+    cache_key = f"gem::{city_key}"
     now = time.time()
     if cache_key in _CACHE:
         data, ts = _CACHE[cache_key]
-        if now - ts < _ICON_CACHE_TTL:
+        if now - ts < _GEM_CACHE_TTL:
             return data
 
-    # CRITICAL: pass timezone= so daily_max is computed over the LST day,
-    # not UTC. Without this, ICON's "daily max" can span the wrong window
-    # and add ~1-3°F of artificial error (verified 2026-04-29 in eval).
+    # timezone= is critical: daily_max is over the LST day, not UTC.
     from bot.signals.sources._openmeteo import forecast_url
     url = forecast_url(
         f"latitude={city['lat']}&longitude={city['lon']}"
         f"&daily=temperature_2m_max"
         f"&temperature_unit=fahrenheit&timezone={city['tz']}&forecast_days=7"
-        f"&models={_ICON_MODEL}"
+        f"&models={_GEM_MODEL}"
     )
     try:
         rate_limit_wait(url)
         r = requests.get(url, timeout=8)
         if r.status_code != 200:
-            print(f"[icon] HTTP {r.status_code}")
+            print(f"[gem] HTTP {r.status_code}")
             return None
         data = r.json()
         _CACHE[cache_key] = (data, now)
         return data
     except Exception as e:
-        print(f"[icon] error: {type(e).__name__}: {e}")
+        print(f"[gem] error: {type(e).__name__}: {e}")
         return None
 
 
-def _icon_sigma_for_day(day_idx: int) -> float:
-    """ICON per-day prior σ. Eval (n=174) MAE pooled across 6 stations
-    was 2.15°F → σ_prior 2.5°F base. Add 0.5°F per day out.
+def _gem_sigma_for_day(day_idx: int) -> float:
+    """GEM per-day prior σ. Eval (n=174) MAE pooled across 6 stations
+    was 1.80°F → σ_prior 2.0°F base. Add 0.5°F per day out.
 
-    The pre-seeded learned σ in kv_cache (per-city, by station) overrides
-    this prior in production via ``_apply_learned_sigma``.
+    Tighter than ICON's 2.5°F base because GEM's MAE is meaningfully
+    lower in the validation. The pre-seeded learned σ in kv_cache
+    (per-city) overrides this prior once accumulated.
     """
-    return 2.5 + day_idx * 0.5
+    return 2.0 + day_idx * 0.5
 
 
-def get_icon_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
-    """Return ICON's daily-high distribution for the settlement day."""
+def get_gem_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForecast]:
+    """Return GEM's daily-high distribution for the settlement day."""
     if market_data is None:
         return None
     title = (market_data.get("title") or market_data.get("subtitle") or "").lower()
@@ -120,7 +120,7 @@ def get_icon_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForeca
     if day_idx is None:
         return None
 
-    forecast = _fetch_icon_forecast(city_key)
+    forecast = _fetch_gem_forecast(city_key)
     if not forecast:
         return None
     daily = forecast.get("daily", {})
@@ -134,13 +134,13 @@ def get_icon_gaussian(ticker: str, market_data: dict) -> Optional[GaussianForeca
 
     tz_offset = _CITY_LST_OFFSET.get(city_key, -5)
     date_label = dates[day_idx] if day_idx < len(dates) else "?"
-    sigma_f = _icon_sigma_for_day(day_idx)
+    sigma_f = _gem_sigma_for_day(day_idx)
     horizon_hours = hours_until_settlement_end(tz_offset, day_idx)
 
     return GaussianForecast(
         mean_f=float(forecast_high),
         sigma_f=sigma_f,
         horizon_hours=horizon_hours,
-        source_name="icon",
-        source_tag=f"icon:{city_key}_{date_label}",
+        source_name="gem",
+        source_tag=f"gem:{city_key}_{date_label}",
     )

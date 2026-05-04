@@ -533,6 +533,65 @@ def get_metar_gaussian(ticker: str, market_data: dict) -> GaussianForecast | Non
     # replace the naive blend + hours_left σ schedule with the learned
     # predictor. Daily high can only rise, so clamp μ ≥ running_high.
     lst_hour_now = _get_lst_now(station).hour
+
+    # ── Past-peak clamp ─────────────────────────────────────────────
+    # When (a) we're past the typical peak heating window AND
+    # (b) the running max is meaningfully above the latest reading,
+    # the day's peak has already happened and we're cooling. Pin μ to
+    # running_high and shrink σ — anything else (diurnal fit, blended
+    # forecast) only adds noise on a locked-in day. Verified live
+    # 2026-05-01: KXHIGHLAX evening had METAR.μ=71.85°F vs running_high
+    # 69.08°F (2.77°F warmer than the actual peak) because the diurnal
+    # fit predicted continued warming when temp had clearly turned over.
+    #
+    # The LST gate (≥14) prevents false positives in the morning when
+    # a passing cloud or brief cold-front gust can transiently push
+    # the running_high above current temp. After 2pm LST, that pattern
+    # is much more likely to be the real day-peak transition.
+    #
+    # _PAST_PEAK_DELTA_F: how far below running_high the current temp
+    # has to be before we declare "past peak". 2°F is conservative —
+    # normal sub-hourly METAR jitter is well under 1°F, so a 2°F gap
+    # is clear cooling not measurement noise.
+    _PAST_PEAK_LST_HOUR = 14
+    _PAST_PEAK_DELTA_F = 2.0
+    _PAST_PEAK_SIGMA_F = 0.3
+    is_past_peak = (
+        lst_hour_now >= _PAST_PEAK_LST_HOUR
+        and (running_high - temp_f) >= _PAST_PEAK_DELTA_F
+    )
+    if is_past_peak:
+        expected_eventual_high = running_high
+        sigma_f = _PAST_PEAK_SIGMA_F
+        # Snapshot side-channel so downstream telemetry can attribute
+        # the σ value to past-peak rather than the regime-σ tier.
+        _RESIDUAL_TIER_META[station] = {
+            "regime_label": regime_label,
+            "regime_tier_used": "past_peak_clamp",
+            "regime_sigma_f": _PAST_PEAK_SIGMA_F,
+            "pooled_sigma_f": None,
+        }
+        # Skip the rest of the σ/μ resolution — past-peak short-circuits
+        # the diurnal fit and the blended-mu paths.
+        lst_offset = lst_offset_for_station(station)
+        horizon_hours = hours_until_settlement_end(lst_offset, day_idx=0)
+        issued_at_unix: Optional[float] = None
+        if obs_time:
+            try:
+                issued_at_unix = datetime.fromisoformat(
+                    obs_time.replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError):
+                issued_at_unix = None
+        return GaussianForecast(
+            mean_f=expected_eventual_high,
+            sigma_f=sigma_f,
+            horizon_hours=horizon_hours,
+            source_name="metar",
+            source_tag=f"metar:{station}_past_peak",
+            issued_at=issued_at_unix,
+        )
+
     fit = _get_diurnal_fit(station, lst_hour_now)
     if fit is not None:
         alpha, beta, rmse = fit

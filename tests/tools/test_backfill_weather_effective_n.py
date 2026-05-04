@@ -475,7 +475,10 @@ def test_group_fit_math_mean_pairwise_rho(memdb):
         ])
     _insert_backfill_rows(memdb, rows)
 
-    fit = bf.fit_group_correlation(memdb)
+    # 2026-04-30: default group_sources gained nws_point — pass the
+    # legacy 3-source group explicitly so this test keeps exercising
+    # only the math it was designed for.
+    fit = bf.fit_group_correlation(memdb, group_sources=("weather", "hrrr", "nbm"))
     assert fit is not None
     assert fit.sources == ("weather", "hrrr", "nbm")
     assert fit.n_pairs == 5
@@ -500,7 +503,7 @@ def test_group_fit_perfectly_correlated_matches_mvp(memdb):
             ))
     _insert_backfill_rows(memdb, rows)
 
-    fit = bf.fit_group_correlation(memdb)
+    fit = bf.fit_group_correlation(memdb, group_sources=("weather", "hrrr", "nbm"))
     assert fit is not None
     assert fit.rho == pytest.approx(1.0, abs=1e-9)
     assert fit.n_eff == pytest.approx(1.0, abs=1e-9)
@@ -531,7 +534,7 @@ def test_group_fit_drops_rows_missing_a_member(memdb):
     ]
     _insert_backfill_rows(memdb, rows)
 
-    fit = bf.fit_group_correlation(memdb)
+    fit = bf.fit_group_correlation(memdb, group_sources=("weather", "hrrr", "nbm"))
     assert fit is not None
     assert fit.n_pairs == 3   # 04-01, 04-03, 04-04 had all three; 04-02 dropped
 
@@ -1080,7 +1083,13 @@ def test_fit_mos_bias_pools_by_source_city_only(memdb):
 
 
 def test_fit_mos_bias_splits_only_by_source_and_city(memdb):
-    """Two sources × two cities → 4 cells regardless of date / season."""
+    """Two live sources × two cities → 4 cells regardless of date / season.
+
+    2026-04-29: ``fit_mos_bias`` started filtering by
+    ``GAUSSIAN_COMBINE_SOURCES`` so retired sources don't keep
+    accumulating fits. NBM was retired same day, so this test now
+    uses ``weather`` (Open-Meteo) as the second source — both are in
+    the live combine, both should produce fits."""
     rows = [
         # hrrr/nyc — bias +2
         ("hrrr", "nyc", "2026-01-01", 82.0, 80.0),
@@ -1088,17 +1097,17 @@ def test_fit_mos_bias_splits_only_by_source_and_city(memdb):
         # hrrr/miami — bias +3
         ("hrrr", "miami", "2026-01-05", 75.0, 72.0),
         ("hrrr", "miami", "2026-07-05", 78.0, 75.0),
-        # nbm/nyc — bias -1
-        ("nbm", "nyc", "2026-01-01", 81.0, 82.0),
-        ("nbm", "nyc", "2026-07-01", 82.0, 83.0),
+        # weather/nyc — bias -1
+        ("weather", "nyc", "2026-01-01", 81.0, 82.0),
+        ("weather", "nyc", "2026-07-01", 82.0, 83.0),
     ]
     _insert_bias_rows(memdb, rows)
     fits = {(f.source, f.city): f for f in
             bf.fit_mos_bias(memdb, half_life_days=float("inf"))}
     assert fits[("hrrr", "nyc")].bias_f == pytest.approx(2.0)
     assert fits[("hrrr", "miami")].bias_f == pytest.approx(3.0)
-    assert fits[("nbm", "nyc")].bias_f == pytest.approx(-1.0)
-    assert ("nbm", "miami") not in fits  # No data; not invented.
+    assert fits[("weather", "nyc")].bias_f == pytest.approx(-1.0)
+    assert ("weather", "miami") not in fits  # No data; not invented.
 
 
 def test_fit_mos_bias_ewma_weights_recent_rows_more(memdb):

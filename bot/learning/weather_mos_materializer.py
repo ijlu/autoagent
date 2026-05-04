@@ -45,8 +45,22 @@ logger = logging.getLogger(__name__)
 _MOS_BIAS_KEY_PREFIX: str = "weather_mos_bias_"
 _MOS_BIAS_TTL_SEC: int = 45 * 86400
 _MOS_BIAS_MIN_SAMPLES: int = 8
-_MOS_BIAS_MAX_ABS_F: float = 5.0
-_MOS_BIAS_EWMA_HALF_LIFE_DAYS: float = 14.0
+# 2026-05-03: bumped from 5.0 to 8.0. Persistent regime-driven biases
+# (LAX marine layer producing +5.83°F warm bias on HRRR over 7 days,
+# +5.77 on weather, +6.97 on UKMO) were being clamp-pegged at 5.0 and
+# logged-and-skipped by the persist guard, leaving combined_v2 with
+# uncorrected +1.28°F overall bias. With 8.0 the same regimes get a
+# real correction; the noise-rejection role of the clamp is preserved
+# for genuinely pathological values (>8°F sustained).
+_MOS_BIAS_MAX_ABS_F: float = 8.0
+# 2026-05-03: shortened from 14.0 to 5.0 days. The 14-day half-life
+# averaged-out persistent regime shifts (e.g. LA's marine layer
+# producing +5°F warm bias for a week was being diluted by 100+ days
+# of clear-day near-zero bias, leaving the stored correction at
+# +0.19°F). 5.0 days weighs the last 5 days at 50%, last 10 days at
+# 75% — fast enough to track week-long regime shifts, slow enough to
+# avoid daily noise.
+_MOS_BIAS_EWMA_HALF_LIFE_DAYS: float = 5.0
 
 
 @dataclass
@@ -79,17 +93,28 @@ def fit_and_persist_mos_bias(
     Returns a stats dict with ``cells_fitted``, ``keys_written``, ``cells_thin``.
     """
     ref_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Restrict to live combine sources (2026-04-30) — same reasoning
+    # as the sibling fitters: retired sources keep accumulating biases
+    # from historical backfill rows, and re-enabling them would
+    # silently apply stale fits to live predictions.
+    live_sources = tuple(GAUSSIAN_COMBINE_SOURCES - {"metar"})
+    if not live_sources:
+        return {"cells_fitted": 0, "keys_written": 0, "cells_thin": 0,
+                "cells_clamped": 0}
+    placeholders = ", ".join("?" for _ in live_sources)
     try:
         rows = conn.execute(
-            """SELECT source, city, settlement_date, forecast_mean_f, observed_high_f
-                 FROM weather_gaussian_snapshots_backfill
-                WHERE observed_high_f IS NOT NULL
-                  AND forecast_mean_f IS NOT NULL
-                  AND source != 'metar'"""
+            f"""SELECT source, city, settlement_date, forecast_mean_f, observed_high_f
+                  FROM weather_gaussian_snapshots_backfill
+                 WHERE observed_high_f IS NOT NULL
+                   AND forecast_mean_f IS NOT NULL
+                   AND source IN ({placeholders})""",
+            live_sources,
         ).fetchall()
     except Exception as exc:
         logger.warning("[mos_fitter] backfill query failed: %s", exc)
-        return {"cells_fitted": 0, "keys_written": 0, "cells_thin": 0, "error": str(exc)}
+        return {"cells_fitted": 0, "keys_written": 0, "cells_thin": 0,
+                "cells_clamped": 0, "error": str(exc)}
 
     per_cell: dict[tuple[str, str], list[tuple[float, float]]] = {}
     for src, city, date_iso, fcst, obs in rows:
@@ -110,12 +135,23 @@ def fit_and_persist_mos_bias(
 
     keys_written = 0
     cells_thin = 0
+    cells_clamped = 0
     with db_write_ctx(conn):
         for f in fits:
             if f.eff_n < _MOS_BIAS_MIN_SAMPLES:
                 cells_thin += 1
                 continue
-            if abs(f.bias_f) > _MOS_BIAS_MAX_ABS_F:
+            # Clamp guard (2026-04-30): hitting the magnitude limit means
+            # the underlying data is too noisy to trust — skip + log
+            # rather than persist a clamp-pegged value that would
+            # systematically shift live predictions.
+            if abs(f.bias_f) >= _MOS_BIAS_MAX_ABS_F:
+                cells_clamped += 1
+                logger.warning(
+                    "[mos_fitter] %s/%s clamp-pegged bias=%.2f (n=%d) — "
+                    "skipping persist; underlying backfill data too noisy",
+                    f.source, f.city, f.bias_f, f.n,
+                )
                 continue
             key = f"{_MOS_BIAS_KEY_PREFIX}{f.source}_{_city_key(f.city)}"
             kv_set(conn, key, {
@@ -124,7 +160,8 @@ def fit_and_persist_mos_bias(
             }, _MOS_BIAS_TTL_SEC)
             keys_written += 1
 
-    return {"cells_fitted": len(fits), "keys_written": keys_written, "cells_thin": cells_thin}
+    return {"cells_fitted": len(fits), "keys_written": keys_written,
+            "cells_thin": cells_thin, "cells_clamped": cells_clamped}
 
 
 def fit_and_persist_skill_curves(conn: sqlite3.Connection) -> dict:
@@ -259,8 +296,7 @@ def _settlement_date_from_ticker_simple(ticker: str) -> Optional[str]:
 def fit_and_persist_skill_from_snapshots(
     conn: sqlite3.Connection,
     *,
-    sources: tuple[str, ...] = ("hrrr", "nbm", "weather", "open_meteo",
-                                 "nws_point", "madis", "metar"),
+    sources: Optional[tuple[str, ...]] = None,
     min_samples: int = 15,
     winsorize_pct: float = 0.02,
 ) -> dict:
@@ -276,8 +312,28 @@ def fit_and_persist_skill_from_snapshots(
     Skips cells with fewer than ``min_samples`` samples to avoid
     whiplashing live σ off sparse data. Returns counts:
     ``{"skill_keys_written": int, "skill_cells_thin": int,
-       "mos_keys_written": int, "mos_cells_thin": int}``.
+       "mos_keys_written": int, "mos_cells_thin": int,
+       "mos_cells_clamped": int}``.
+
+    Source restriction (2026-04-30): when ``sources`` is None (the
+    default), the fitter restricts to ``GAUSSIAN_COMBINE_SOURCES`` —
+    the live combine list. Pre-fix, the explicit tuple included
+    retired sources (madis, nbm) so their kv keys kept getting
+    refreshed daily. If MADIS/NBM were ever re-enabled, the live
+    combine would pick up stale fits that may not reflect current
+    upstream data quality.
+
+    Clamp guard (2026-04-30): when the post-winsorize EWMA bias hits
+    the ±5°F magnitude clamp, we skip persisting that cell. Hitting
+    the clamp is a strong signal of underlying data-quality issues
+    (e.g. nws_point snapshot rows showed -14°F single-day errors that
+    pulled the EWMA mean to the limit; persisting -5 then shifts every
+    nws_point prediction +5°F live, which is wrong on the days the
+    fit isn't representative). Better to skip + log + leave the
+    Gaussian unshifted than to apply a clamp-pegged correction.
     """
+    if sources is None:
+        sources = tuple(GAUSSIAN_COMBINE_SOURCES)
     # Pull DISTINCT (source, ticker) — one snapshot per ticker per source.
     # Multiple snapshots are recorded as the day progresses (every quote
     # cycle), but they share the same observed daily high. Counting each
@@ -337,6 +393,7 @@ def fit_and_persist_skill_from_snapshots(
     skill_cells_thin = 0
     mos_keys_written = 0
     mos_cells_thin = 0
+    mos_cells_clamped = 0
 
     with db_write_ctx(conn):
         # Skill σ: one kv key per (source, city, bucket). Winsorize residuals.
@@ -381,9 +438,20 @@ def fit_and_persist_skill_from_snapshots(
                 hi = sr[n - 1 - int(n * winsorize_pct)]
                 residuals = [max(lo, min(hi, r)) for r in residuals]
             mean_r = sum(residuals) / n
-            bias_clamped = max(-5.0, min(5.0, mean_r))
+            # Clamp guard: hitting the ±5°F limit means the underlying
+            # data is too noisy to trust as a bias. Skip persisting
+            # rather than shift live predictions by a clamp-pegged value.
+            # See the function docstring for the nws_point case study.
+            if abs(mean_r) >= _MOS_BIAS_MAX_ABS_F:
+                mos_cells_clamped += 1
+                logger.warning(
+                    "[snapshot_mos] %s/%s clamp-pegged bias=%.2f (n=%d) — "
+                    "skipping persist; underlying snapshot data too noisy",
+                    src, city, mean_r, n,
+                )
+                continue
             payload = {
-                "bias": bias_clamped,
+                "bias": mean_r,
                 "n": n,
                 "eff_n": float(n),
                 "fit_at": datetime.now(timezone.utc).isoformat(),
@@ -401,6 +469,7 @@ def fit_and_persist_skill_from_snapshots(
         "skill_cells_thin": skill_cells_thin,
         "mos_keys_written": mos_keys_written,
         "mos_cells_thin": mos_cells_thin,
+        "mos_cells_clamped": mos_cells_clamped,
     }
 
 
@@ -564,12 +633,23 @@ _DEFAULT_MAX_BACK_DAYS: int = 14
 # Canonical source names that participate in the Gaussian combine. The
 # combined_v2 row and afd_bias row in ``weather_forecast_snapshots`` are
 # excluded — they aren't bias-correctable Gaussian forecasters.
-_MATERIALIZED_SOURCES: frozenset[str] = GAUSSIAN_COMBINE_SOURCES - {"metar"}
-# METAR is excluded: it's the observation source, not a forecast. The
-# ``forecast_mean`` value on a METAR snapshot is effectively the current
-# observation, not a forward prediction — fitting bias against itself
-# would be circular. (The historical backfill applies the same exclusion
-# in ``fit_mos_bias`` via ``WHERE source != 'metar'``.)
+_MATERIALIZED_SOURCES: frozenset[str] = GAUSSIAN_COMBINE_SOURCES - {
+    # Observation sources — they don't predict, so MOS bias fitting
+    # would be circular. METAR's "forecast" is the running observation;
+    # nws_5min and its derivatives all share the same physical sensor.
+    # nws_5min_analog stays in this exclusion set even though it was
+    # demoted out of GAUSSIAN_COMBINE_SOURCES on 2026-05-02 — if it's
+    # ever re-enabled, it remains an observation-derived source that
+    # shouldn't get MOS fitting.
+    "metar", "nws_5min", "nws_5min_diurnal", "nws_5min_analog",
+}
+# METAR + nws_5min are excluded: they're observation sources, not
+# forecasts. The ``forecast_mean`` value on an observation snapshot
+# is effectively the current temperature reading, not a forward
+# prediction — fitting bias against itself would be circular. (The
+# historical backfill applies the same exclusion in ``fit_mos_bias``
+# via the GAUSSIAN_COMBINE_SOURCES filter, which excludes metar and
+# treats observation sources separately.)
 
 
 def _settlement_date_from_ticker(ticker: str) -> Optional[str]:

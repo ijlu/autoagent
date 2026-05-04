@@ -41,16 +41,34 @@ def test_registry_contents_pinned():
         "hrrr", "nbm", "nws_point", "weather",
         "metar", "madis", "afd",
         "icon", "ukmo", "iem_1min",  # added 2026-04-29 (Phase B.2)
+        "gem", "metno", "ecmwf", "nws_5min",  # added 2026-04-30
+        "nws_5min_diurnal", "nws_5min_analog",  # added 2026-05-02
     })
     # GAUSSIAN_COMBINE_SOURCES — sources that fire in the live combine.
     # NBM and MADIS deprecated 2026-04-29 (NBM is duplicate of weather;
     # MADIS warming heuristic broken). ICON/UKMO added same day.
     # IEM_1MIN deliberately excluded: ~24h IEM publication latency means
     # it can never produce live data for today's market.
+    # 2026-04-30: GEM, MetNo, ECMWF added after backtest validation
+    # (12% / 4% / 3% pooled MAE improvement on the 30-day eval).
+    # nws_5min wired in same day after live verification confirmed
+    # the publication-lag handling (`issued_at` + staleness inflation)
+    # behaves correctly. NWS api.weather.gov serves 5-min ASOS
+    # observations free, no auth, no rate limit.
+    # 2026-05-02: nws_5min_diurnal + nws_5min_analog added — both
+    # forecasters built on top of the same 5-min observation feed.
     assert GAUSSIAN_COMBINE_SOURCES == frozenset({
         "hrrr", "nws_point", "weather", "metar",
         "icon", "ukmo",
+        "gem", "metno", "ecmwf",
+        "nws_5min", "nws_5min_diurnal",
+        # 2026-05-02: nws_5min_analog demoted to SHADOW (registered
+        # in CANONICAL but not in the live combine) — feature-vintage
+        # bug + insufficient regime coverage. See weather_sources.py
+        # for the full rationale.
     })
+    assert "nws_5min_analog" in CANONICAL_WEATHER_SOURCES
+    assert "nws_5min_analog" not in GAUSSIAN_COMBINE_SOURCES
     assert "iem_1min" not in GAUSSIAN_COMBINE_SOURCES
     assert NBM not in GAUSSIAN_COMBINE_SOURCES
     assert MADIS not in GAUSSIAN_COMBINE_SOURCES
@@ -171,3 +189,63 @@ def test_kv_cache_prefixes_have_no_legacy_drift():
 
     assert v2._MOS_BIAS_KEY_PREFIX == bf._MOS_BIAS_KEY_PREFIX
     assert v2._SKILL_KEY_PREFIX == bf._SKILL_KEY_PREFIX
+
+
+# ── Per-city source exclusions (2026-05-04 postmortem regression) ────
+
+
+def test_per_city_exclusions_known_pinned():
+    """Pin EXCLUDED_SOURCES_BY_CITY entries against the regression that
+    drove them. Removing or adding entries should be intentional + backed
+    by fresh evidence (regression bias > 3°F, n >= 30, multi-day
+    persistence). See weather_sources.py docstring for the methodology.
+    """
+    from bot.signals.weather_sources import EXCLUDED_SOURCES_BY_CITY
+
+    # NYC: nws_point cold-bias -5.86°F (regression 2026-05-04)
+    assert "nws_point" in EXCLUDED_SOURCES_BY_CITY["nyc"]
+
+    # Chicago: nws_point -5.79°F, nws_5min -7.35°F
+    assert "nws_point" in EXCLUDED_SOURCES_BY_CITY["chicago"]
+    assert "nws_5min" in EXCLUDED_SOURCES_BY_CITY["chicago"]
+
+    # Miami: nws_point -3.07°F, nws_5min -4.21°F
+    assert "nws_point" in EXCLUDED_SOURCES_BY_CITY["miami"]
+    assert "nws_5min" in EXCLUDED_SOURCES_BY_CITY["miami"]
+
+    # LAX: metno +9.67°F, gem +8.86°F (worst marine-layer outliers)
+    assert "metno" in EXCLUDED_SOURCES_BY_CITY["los_angeles"]
+    assert "gem" in EXCLUDED_SOURCES_BY_CITY["los_angeles"]
+
+    # KAUS, KDEN: no exclusions (all biases within ±3°F per regression)
+    assert "austin" not in EXCLUDED_SOURCES_BY_CITY or \
+        len(EXCLUDED_SOURCES_BY_CITY.get("austin", set())) == 0
+    assert "denver" not in EXCLUDED_SOURCES_BY_CITY or \
+        len(EXCLUDED_SOURCES_BY_CITY.get("denver", set())) == 0
+
+
+def test_is_excluded_for_city():
+    """The lookup helper must (a) return True when both city + source
+    match, (b) return False on missing city, missing source, or None."""
+    from bot.signals.weather_sources import is_excluded_for_city
+
+    # Positive cases — actually excluded
+    assert is_excluded_for_city("nws_point", "nyc") is True
+    assert is_excluded_for_city("nws_point", "chicago") is True
+    assert is_excluded_for_city("metno", "los_angeles") is True
+
+    # Negative — source allowed for that city
+    assert is_excluded_for_city("hrrr", "nyc") is False
+    assert is_excluded_for_city("metar", "los_angeles") is False
+
+    # Negative — city has no entry
+    assert is_excluded_for_city("nws_point", "austin") is False
+    assert is_excluded_for_city("nws_point", "denver") is False
+
+    # Defensive — None inputs
+    assert is_excluded_for_city("nws_point", None) is False
+    assert is_excluded_for_city(None, "nyc") is False
+    assert is_excluded_for_city(None, None) is False
+
+    # Defensive — unknown city defaults to "not excluded"
+    assert is_excluded_for_city("nws_point", "atlantis") is False

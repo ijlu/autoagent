@@ -100,13 +100,40 @@ class TestTimeOfDayGate:
         # hours_left=5 -> lst_hour=19
         ok, reason, mult = time_of_day_gate("KJFK", hours_left=5.0)
         assert ok is False
-        assert "past-7pm" in reason
+        assert "past-19" in reason
 
     def test_10pm_rejected(self):
         # hours_left=2 -> lst_hour=22
         ok, reason, mult = time_of_day_gate("KJFK", hours_left=2.0)
         assert ok is False
-        assert "past-7pm" in reason
+        assert "past-19" in reason
+
+    def test_max_lst_hour_env_override_tightens_window(self, monkeypatch):
+        """WEATHER_QUOTE_MAX_LST_HOUR env should lower the upper cutoff.
+        Default is 19; setting to 15 should reject 4pm LST (which the
+        default would still allow).
+        """
+        monkeypatch.setenv("WEATHER_QUOTE_MAX_LST_HOUR", "15")
+        # hours_left=8 → lst_hour=16, would be 1.2x multiplier under default.
+        ok, reason, _ = time_of_day_gate("KJFK", hours_left=8.0)
+        assert ok is False
+        assert "past-15" in reason
+
+    def test_max_lst_hour_env_clamps_pathological(self, monkeypatch):
+        """A typo in env (e.g., 999) gets clamped to 23 — never disables
+        the gate entirely.
+        """
+        monkeypatch.setenv("WEATHER_QUOTE_MAX_LST_HOUR", "999")
+        ok, _, _ = time_of_day_gate("KJFK", hours_left=2.0)  # lst_hour=22
+        # Cutoff clamped to 23, so 22 is still inside window.
+        assert ok is True
+
+    def test_max_lst_hour_env_invalid_falls_back_to_default(self, monkeypatch):
+        """A non-numeric env value falls back to default 19."""
+        monkeypatch.setenv("WEATHER_QUOTE_MAX_LST_HOUR", "not_a_number")
+        ok, reason, _ = time_of_day_gate("KJFK", hours_left=5.0)  # lst_hour=19
+        assert ok is False
+        assert "past-19" in reason
 
     def test_different_station_accepted(self):
         # Gate doesn't currently use station for LST calc (hours_left is pre-computed).

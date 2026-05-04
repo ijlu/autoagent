@@ -19,8 +19,28 @@ echo "Redeploying code to $SERVER..."
 # or the new unified daemon — whichever happens to be live at the moment).
 ssh "root@${SERVER}" "systemctl stop kalshi-bot.timer kalshi-bot.service kalshi-weather-daemon.service kalshi-daemon.service 2>/dev/null || true"
 
-# Sync Python files, bot/ package, tests/, context/, and .env
-# Use --filter rules: include dirs first, then files, then exclude rest
+# Sanity check: prod must have a .env file before we proceed. We
+# deliberately do NOT sync .env from local (see below) — it must be
+# managed manually on the VPS so prod-only secrets (OPENMETEO_API_KEY,
+# WEATHER_QUOTE_MAX_LST_HOUR, etc.) survive redeploys cleanly.
+if ! ssh "root@${SERVER}" "[ -f /home/kalshi/autoagent/.env ]"; then
+    echo "ERROR: /home/kalshi/autoagent/.env does not exist on $SERVER."
+    echo "Create it manually (chmod 600) before redeploying. See:"
+    echo "  reports/CROSS_BRACKET_CANARY_PROCEDURE.md (env_setup section)"
+    exit 1
+fi
+
+# Sync Python files, bot/ package, tests/, context/, deploy scripts.
+# .env is INTENTIONALLY EXCLUDED — see 2026-05-01 incident below.
+#
+# 2026-05-01: previously included .env in the rsync, which silently
+# overwrote prod with whatever happened to be in local .env. That
+# stripped OPENMETEO_API_KEY mid-day right after we paid for the
+# commercial tier. .env is now prod-only; secrets stay where they
+# were set + redeploys never touch them. The trade-off: when adding
+# a new env var that the daemon needs, you must also `ssh` to prod
+# and `echo VAR=value >> .env` (then restart). One-time cost per new
+# env var, vs continuously losing prod secrets to local stale state.
 rsync -avz --progress \
     --filter='- __pycache__/' \
     --filter='- *.pyc' \
@@ -32,13 +52,10 @@ rsync -avz --progress \
     --include='scripts/' --include='scripts/***' \
     --include='tools/' --include='tools/***' \
     --include='*.py' \
-    --include='.env' \
     --include='.gitignore' \
+    --exclude='.env' \
     --exclude='*' \
     "$BOT_DIR/" "root@${SERVER}:/home/kalshi/autoagent/"
-
-# Fix .env key path for server
-ssh "root@${SERVER}" "sed -i 's|/Users/jlu/.kalshi_private_key.pem|/home/kalshi/.kalshi_private_key.pem|' /home/kalshi/autoagent/.env"
 
 # Phase 0 (2026-04-16): remove the market-maker package and associated files.
 # These were deleted locally but rsync (without --delete) leaves them on the VPS.

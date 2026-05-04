@@ -50,6 +50,55 @@ MM_DRY_RUN = os.environ.get("MM_DRY_RUN", "true").lower() in ("true", "1", "yes"
 # Phase 1 shadow-to-live gate for weather MM. Default false — shadow mode only.
 # Flipped to true only once the step-9 shadow backtest proves out.
 WEATHER_MM_LIVE = os.environ.get("WEATHER_MM_LIVE", "false").lower() in ("true", "1", "yes")
+
+# Cross-bracket portfolio live-trading gate (separate from MM).
+# Default false — cross-bracket runs in shadow-log mode unless this
+# env is true AND the per-family kv `cross_bracket_live:<family>` is
+# also truthy. Both checks must pass; either alone keeps the family
+# in shadow. Backtest validated 96-100% WR at TTE 4-6h pre-settle
+# on 24 firings (n=24 is small — start with 1 family canary mode).
+CROSS_BRACKET_LIVE = os.environ.get("CROSS_BRACKET_LIVE", "false").lower() in ("true", "1", "yes")
+
+# Cross-bracket safety rails. Hard caps independent of phase config —
+# even if the phase ramps to higher position size, cross-bracket
+# specifically is bounded by these knobs while we accumulate live data.
+CROSS_BRACKET_MAX_CONTRACTS_PER_LEG = int(
+    os.environ.get("CROSS_BRACKET_MAX_CONTRACTS_PER_LEG", "1")
+)
+CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO = int(
+    os.environ.get("CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO", "4")
+)
+# Daily exposure cap (cents) — sum of (contracts × price) across all
+# cross-bracket fills today. Conservative $5/day to start; ramp once
+# we see live alpha holds.
+CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS = int(
+    os.environ.get("CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS", "500")
+)
+# TTE window (hours pre-settle) where cross-bracket has demonstrated
+# alpha. Outside this window the strategy is shadow-only regardless
+# of live flags. The 4-6h band is where the 96-100% WR was measured.
+CROSS_BRACKET_MIN_TTE_HOURS = float(
+    os.environ.get("CROSS_BRACKET_MIN_TTE_HOURS", "3.0")
+)
+CROSS_BRACKET_MAX_TTE_HOURS = float(
+    os.environ.get("CROSS_BRACKET_MAX_TTE_HOURS", "7.0")
+)
+# Edge floor (we already gate at 0.07 in score_market_portfolio, but
+# the live path can be tightened further). Higher than shadow's gate
+# = more conservative live behavior.
+CROSS_BRACKET_LIVE_MIN_EDGE = float(
+    os.environ.get("CROSS_BRACKET_LIVE_MIN_EDGE", "0.10")
+)
+# Slippage tolerance: when posting a live cross-bracket order, the limit
+# price is capped at ``best_ask + this``. With Kalshi's 1¢ tick, +2¢
+# means we'll accept walking up at most 2 levels past best ask before
+# the rest of the order rests as a limit (and is silently NOT filled if
+# the book stays past that). Larger = more execution certainty, more
+# slippage. Smaller = tighter pricing, more abandoned orders. 2¢ matches
+# the existing trade.py slip tolerance.
+CROSS_BRACKET_SLIP_TOLERANCE_CENTS = int(
+    os.environ.get("CROSS_BRACKET_SLIP_TOLERANCE_CENTS", "2")
+)
 # A6: route WeatherQuoter fair-value through `weather_ensemble_v2.predict_v2` instead
 # of the v1 METAR-only logistic CDF. Shadow-first: flag toggles the FV path, live
 # posting is still gated by WEATHER_MM_LIVE. Falls back to v1 on v2 errors / None.
@@ -288,6 +337,20 @@ SOURCE_MAX_HORIZON_DAYS = {
 # ══════════════════════════════════════════════════════════════════════════════
 # External API keys
 # ══════════════════════════════════════════════════════════════════════════════
+# Open-Meteo commercial API key. When set, all Open-Meteo callers
+# route through the commercial endpoint (customer-api.open-meteo.com)
+# and include the key as `?apikey=...`. When empty, callers fall
+# through to the free non-commercial endpoint (api.open-meteo.com)
+# which has 10K calls/day, 5K/hour, 600/min, 300K/month limits.
+#
+# Trading is technically commercial use of Open-Meteo; the free tier
+# is non-commercial only. Once we go live we should be on the paid
+# tier for both compliance and to eliminate the 429 throttle that
+# affects 7 of our 10 ensemble sources at peak load.
+#
+# Sign-up: https://open-meteo.com/en/pricing → Standard or Professional.
+# Set the key in `.env` on the VPS (chmod 600), restart the daemon.
+OPENMETEO_API_KEY = os.environ.get("OPENMETEO_API_KEY", "")
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 BLS_API_KEY = os.environ.get("BLS_API_KEY", "")
 BEA_API_KEY = os.environ.get("BEA_API_KEY", "")

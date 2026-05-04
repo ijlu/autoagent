@@ -100,12 +100,52 @@ class TestHRRRGaussian:
         monkeypatch.setattr(hrrr, "_daily_high_from_hourly_hrrr", lambda f, d: 82.0)
         g = hrrr.get_hrrr_gaussian("KXHIGHNY-26APR20-T75", _market())
         _assert_gaussian_shape(g, expected_source="hrrr", expected_mean=82.0)
-        # sigma schedule: 1.2 + day_idx*0.5 → day 0 = 1.2
-        assert abs(g.sigma_f - 1.2) < 1e-6
+        # sigma schedule: 2.0 + day_idx*0.5 → day 0 = 2.0.
+        # 2026-05-04: bumped 1.2 → 2.0 after KXHIGHNY canary postmortem.
+        # Measured RMSE was ~3.5°F post truth-fix. The old 1.2°F prior
+        # (barely inflated to 1.31°F by staleness) gave HRRR ~27% weight
+        # in the precision-weighted combine when honest sources had ~12%.
+        # See bot/signals/sources/hrrr.py docstring for the rationale.
+        assert abs(g.sigma_f - 2.0) < 1e-6
 
     def test_sigma_monotonic_in_day_idx(self):
         # Day-0 sigma should be strictly less than day-1 sigma
         assert hrrr._hrrr_sigma_for_day(0) < hrrr._hrrr_sigma_for_day(1)
+
+    def test_per_city_sigma_priors_keep_well_calibrated_cities_at_old_value(self):
+        """2026-05-04: per-city carve-out so the postmortem 1.2 → 2.0 σ
+        bump doesn't break cities where HRRR was already well-calibrated.
+
+        Backtest evidence:
+          - KDEN: HRRR RMSE 2.47 at settlement (n=1426), HRRR's σ bump
+            caused the global combine to regress -12% on KXHIGHDEN
+            because weight shifted away from the most-accurate source.
+          - KMIA: HRRR RMSE 1.19 — the best of any city.
+          - KAUS: HRRR RMSE 1.27 — well-calibrated.
+        These cities keep the original 1.2°F prior. NYC, Chicago, LAX
+        get the 2.0°F bump (where measured HRRR RMSE was 1.7-6.1°F)."""
+        # Cities that keep the old 1.2°F prior (well-calibrated)
+        for city in ("denver", "miami", "austin"):
+            assert hrrr._hrrr_sigma_for_day(0, city) == 1.2, (
+                f"{city} HRRR σ should remain at 1.2°F (well-calibrated)"
+            )
+
+        # Cities that get the postmortem bump
+        for city in ("nyc", "chicago", "los_angeles"):
+            assert hrrr._hrrr_sigma_for_day(0, city) == 2.0, (
+                f"{city} HRRR σ should be at the postmortem 2.0°F prior"
+            )
+
+        # Day-1 decay applies to both
+        assert hrrr._hrrr_sigma_for_day(1, "denver") == 1.7
+        assert hrrr._hrrr_sigma_for_day(1, "nyc") == 2.5
+
+    def test_per_city_sigma_unknown_city_uses_default(self):
+        """A city not in the map (e.g. typo'd 'sand_diego') uses the
+        default 2.0°F prior — fail-safe."""
+        assert hrrr._hrrr_sigma_for_day(0, "atlantis") == 2.0
+        assert hrrr._hrrr_sigma_for_day(0, None) == 2.0
+        assert hrrr._hrrr_sigma_for_day(0) == 2.0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -383,6 +423,108 @@ class TestMETARGaussian:
         # μ = max(α + β·T, running_high) = max(75.0, 55.0) = 75.0
         assert abs(g.mean_f - 75.0) < 1e-6
         assert abs(g.sigma_f - 3.0) < 1e-6
+
+    def test_past_peak_clamp_pins_mu_to_running_high_in_late_day(self, monkeypatch):
+        """Regression for the 2026-05-01 evening warm-bias finding:
+        when LST ≥ 14 AND running_high − current ≥ 2°F, the day's peak
+        has happened and METAR.μ must equal running_high (not the
+        diurnal fit's prediction).
+
+        Live evidence: KXHIGHLAX at LST 18 had running_high=69.08°F,
+        current temp = ~63°F, but METAR.μ = 71.85°F because the
+        diurnal fit predicted continued warming. That dragged combined
+        ensemble +5°F above the actual peak.
+        """
+        # Current temp 18°C ≈ 64°F, running_high 70°F. Cooling state.
+        obs = {"temp": 18.0, "reportTime": "2026-05-01T22:00:00Z"}
+        monkeypatch.setattr(
+            metar_observations, "_fetch_metar_data", lambda: [obs],
+        )
+        monkeypatch.setattr(
+            metar_observations, "_extract_station_obs",
+            lambda data, station: obs,
+        )
+        monkeypatch.setattr(
+            metar_observations, "_update_running_daily_high",
+            lambda s, t, o: {"high_f": 70.0, "date": "2026-05-01"},
+        )
+        monkeypatch.setattr(
+            metar_observations, "_get_forecast_high",
+            lambda s, r: 78.0,  # forecast was warm — should NOT win
+        )
+        # LST hour 18 (past 2pm gate)
+        import datetime as _dt
+        monkeypatch.setattr(
+            metar_observations, "_get_lst_now",
+            lambda station: _dt.datetime(
+                2026, 5, 1, 18, 0,
+                tzinfo=_dt.timezone(_dt.timedelta(hours=-5)),
+            ),
+        )
+        # A diurnal fit exists that would predict 75°F — but past-peak
+        # clamp must short-circuit and pin μ to running_high.
+        monkeypatch.setattr(
+            metar_observations, "_get_diurnal_fit",
+            lambda station, lst_hour: (20.0, 1.1, 3.0),
+        )
+        g = metar_observations.get_metar_gaussian(
+            "KXHIGHNY-26MAY01-T70", _market(),
+        )
+        assert g is not None
+        assert g.mean_f == 70.0, f"expected μ pinned to running_high, got {g.mean_f}"
+        # σ should be tight (we know the day's high) — much tighter than
+        # the diurnal fit's RMSE=3.0 or the schedule σ at hours_left=2.
+        assert g.sigma_f < 1.0, (
+            f"past-peak σ should be tight; got {g.sigma_f:.2f}°F"
+        )
+        assert "past_peak" in g.source_tag
+
+
+    def test_past_peak_clamp_does_not_fire_in_morning(self, monkeypatch):
+        """Morning false-positive guard: even with running_high above
+        current temp by 2°F+, pre-LST-14 we should NOT clamp — the
+        pattern could be a brief cold front gust or cloud passage,
+        not the day's peak.
+        """
+        obs = {"temp": 18.0, "reportTime": "2026-05-01T13:00:00Z"}  # 8 AM LST
+        monkeypatch.setattr(
+            metar_observations, "_fetch_metar_data", lambda: [obs],
+        )
+        monkeypatch.setattr(
+            metar_observations, "_extract_station_obs",
+            lambda data, station: obs,
+        )
+        monkeypatch.setattr(
+            metar_observations, "_update_running_daily_high",
+            lambda s, t, o: {"high_f": 70.0, "date": "2026-05-01"},
+        )
+        monkeypatch.setattr(
+            metar_observations, "_get_forecast_high",
+            lambda s, r: 78.0,
+        )
+        import datetime as _dt
+        monkeypatch.setattr(
+            metar_observations, "_get_lst_now",
+            lambda station: _dt.datetime(
+                2026, 5, 1, 8, 0,  # LST 8 AM, well before peak
+                tzinfo=_dt.timezone(_dt.timedelta(hours=-5)),
+            ),
+        )
+        # Diurnal fit present: should be used (NOT clamped).
+        monkeypatch.setattr(
+            metar_observations, "_get_diurnal_fit",
+            lambda station, lst_hour: (20.0, 1.1, 3.0),
+        )
+        g = metar_observations.get_metar_gaussian(
+            "KXHIGHNY-26MAY01-T70", _market(),
+        )
+        assert g is not None
+        # μ should follow diurnal fit: 20 + 1.1 × 64.4 = 90.84, but
+        # capped at max(predicted, running_high) = max(90.84, 70) = 90.84
+        assert g.mean_f > 80.0, (
+            f"morning state should follow diurnal fit, not clamp; got μ={g.mean_f}"
+        )
+
 
     def test_diurnal_fit_respects_running_high_floor(self, monkeypatch):
         """Daily high can only rise — when α + β·T < running_high, μ

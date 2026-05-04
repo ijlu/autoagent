@@ -34,7 +34,13 @@ from bot.signals.sources.weather import (
 from bot.signals.weather_forecast import GaussianForecast, hours_until_settlement_end
 
 
-_NBM_CACHE_TTL = 1800  # 30 min
+# NBM runs four times per day (00/06/12/18 UTC) with ~2-3h publish
+# latency. 5h 30min cache fits inside one cycle. Was 1800 (30 min).
+# (NBM is currently NOT in GAUSSIAN_COMBINE_SOURCES per the 2026-04-29
+# revert — Open-Meteo's "gfs_seamless" turned out to be byte-identical
+# to the default Open-Meteo blend at temperate-zone US lat/lons. The
+# constant is kept honest in case it's re-wired.)
+_NBM_CACHE_TTL = 19800
 _NBM_MODEL = "gfs_seamless"  # Open-Meteo's NBM-backed seamless forecast
 
 
@@ -58,8 +64,8 @@ def _fetch_nbm_forecast(city_key: str) -> Optional[dict]:
         if now - ts < _NBM_CACHE_TTL:
             return data
 
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
+    from bot.signals.sources._openmeteo import forecast_url
+    url = forecast_url(
         f"latitude={city['lat']}&longitude={city['lon']}"
         f"&daily=temperature_2m_max,temperature_2m_min"
         f"&temperature_unit=fahrenheit&timezone={city['tz']}&forecast_days=7"

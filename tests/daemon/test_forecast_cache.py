@@ -28,6 +28,17 @@ def _ok_response(temp_f: float) -> MagicMock:
     return resp
 
 
+@pytest.fixture(autouse=True)
+def _fast_rate_limiter(monkeypatch):
+    """Auto-applied: zero out the inter-station sleep + the per-domain
+    rate-limit wait so tests run instantly. The actual rate-limit
+    behavior is exercised in `test_refresh_invokes_rate_limiter` below.
+    """
+    monkeypatch.setattr("bot.daemon.forecast_cache._INTER_STATION_SLEEP_S", 0.0)
+    monkeypatch.setattr("bot.daemon.forecast_cache.rate_limit_wait",
+                        lambda url: None)
+
+
 class TestBasics:
     def test_empty_cache_returns_none(self):
         cache = ForecastCache()
@@ -104,6 +115,54 @@ class TestRefresh:
         assert cache.snapshot() == {}
         # last_refresh stamp still moves so refresh_if_stale doesn't spin
         assert cache.last_refresh() > 0
+
+    @patch("bot.daemon.forecast_cache.requests.get")
+    def test_refresh_invokes_rate_limiter_per_station(self, mock_get, monkeypatch):
+        """Regression: each station's HTTP fetch must pass through
+        ``rate_limit_wait`` first. Pre-2026-04-30 the refresh bypassed
+        the per-domain Open-Meteo limiter (1.0s, 3-burst) and bursted
+        all 6 stations in a tight loop, producing the recurring HTTP
+        429 cluster on the live VPS.
+        """
+        rate_limit_calls: list[str] = []
+        monkeypatch.setattr(
+            "bot.daemon.forecast_cache.rate_limit_wait",
+            lambda url: rate_limit_calls.append(url),
+        )
+        mock_get.return_value = _ok_response(70.0)
+
+        cache = ForecastCache()
+        cache.refresh()
+
+        assert len(rate_limit_calls) == len(STATIONS)
+        for url in rate_limit_calls:
+            assert "open-meteo.com" in url
+
+    @patch("bot.daemon.forecast_cache.requests.get")
+    def test_refresh_staggers_between_stations(self, mock_get, monkeypatch):
+        """Regression: consecutive station fetches must be separated by
+        at least ``_INTER_STATION_SLEEP_S`` so a tight burst doesn't
+        bump the per-minute Open-Meteo cap. We measure by counting
+        ``time.sleep`` invocations rather than wall-clock time so the
+        test is deterministic.
+        """
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            "bot.daemon.forecast_cache._INTER_STATION_SLEEP_S", 0.123,
+        )
+        monkeypatch.setattr(
+            "bot.daemon.forecast_cache.time.sleep",
+            lambda s: sleeps.append(s),
+        )
+        mock_get.return_value = _ok_response(70.0)
+
+        cache = ForecastCache()
+        cache.refresh()
+
+        # First fetch fires immediately; remaining N-1 fetches sleep first.
+        # The fixture-level rate_limit_wait stub is a no-op so its sleeps
+        # don't show up here — only the inter-station stagger does.
+        assert sleeps == [0.123] * (len(STATIONS) - 1)
 
     @patch("bot.daemon.forecast_cache.requests.get")
     def test_empty_temps_skipped(self, mock_get):

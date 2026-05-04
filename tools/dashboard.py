@@ -544,13 +544,32 @@ def _render_system_health(data: dict) -> str:
 
 
 # ── Main ──────────────────────────────────────────────────────────────
-def generate_dashboard(db_path: str, output_path: str) -> None:
-    # Ensure all expected tables exist — init_db is idempotent. This
-    # makes the dashboard tolerant of older DB snapshots that pre-date
-    # newer schema additions (weather_source_state, etc.).
-    import bot.db as db_mod
-    db_mod._PERSIST_CONN = None
-    conn = db_mod.init_db(db_path)
+def generate_dashboard(
+    db_path: str, output_path: str,
+    conn: "sqlite3.Connection | None" = None,
+) -> None:
+    """Render the HTML dashboard.
+
+    When called from the daemon (scheduled task), pass the shared
+    persistent connection via ``conn=`` so we don't create + close a
+    new one — the previous behavior was poisoning ``bot.db._PERSIST_CONN``
+    by reassigning it via ``init_db()`` and then closing the new conn,
+    leaving every subsequent ``kv_get/kv_set`` call from poller threads
+    using a closed connection. Verified live 2026-05-02 via 5,162
+    "Cannot operate on a closed database" errors over a 24-hour window.
+
+    When called from the CLI (no conn passed), creates a private
+    read-only connection that doesn't touch the module-level state.
+    Either path is a no-op for the daemon's persistent connection.
+    """
+    import sqlite3
+    own_conn = False
+    if conn is None:
+        # CLI / standalone use: open a PRIVATE connection that doesn't
+        # touch bot.db._PERSIST_CONN. Read-only (uri=ro) so we can't
+        # accidentally write to a snapshot DB during ad-hoc inspection.
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        own_conn = True
     try:
         sections_html = []
         plot_scripts = []
@@ -599,7 +618,10 @@ def generate_dashboard(db_path: str, output_path: str) -> None:
         out.write_text(html)
         print(f"[dashboard] wrote {len(html)} bytes to {output_path}")
     finally:
-        conn.close()
+        # Only close the conn if we opened it. The daemon's shared
+        # conn must outlive this call.
+        if own_conn:
+            conn.close()
 
 
 def main():

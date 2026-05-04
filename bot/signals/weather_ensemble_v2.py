@@ -67,8 +67,32 @@ from bot.signals.weather_forecast import (
 # Fits are produced by ``tools/backfill_weather_effective_n.py
 # --persist-effective-n`` and read from kv_cache under the key
 # ``weather_group_corr_<group>``.
-_MODEL_GROUP: frozenset[str] = frozenset({"hrrr", "nbm", "nws_point", "weather"})
-_OBS_GROUP: frozenset[str] = frozenset({"metar", "madis"})
+# 2026-04-30: ICON and UKMO added to _MODEL_GROUP. They're global NWP
+# models trained on similar physics + reanalysis data as HRRR / NWS Point /
+# Open-Meteo, so they belong in the model-correlation group. Pre-fix they
+# fell into _group_of() == "other" which had no correlation discount, so
+# each contributed full-weight precision and effectively double-counted
+# the model family. Verified live: `_group_of('icon') == 'model'` after
+# this change. Pinned by tests/signals/test_weather_ensemble_v2.py.
+# 2026-04-30 (later): GEM, METNO, ECMWF added — same NWP family, same
+# group routing. Validated independence ρ vs HRRR: GEM 0.61, MetNo 0.73,
+# ECMWF 0.53 — all clearly correlated enough to belong with the models.
+_MODEL_GROUP: frozenset[str] = frozenset(
+    {"hrrr", "nbm", "nws_point", "weather", "icon", "ukmo",
+     "gem", "metno", "ecmwf"}
+)
+# 2026-04-30: nws_5min added as a sub-hourly observation channel parallel
+# to METAR. Both read the same ASOS sensor family; group correlation
+# discount applies. METAR remains the canonical hourly observation;
+# nws_5min adds 5-min resolution during the peak heating window.
+# 2026-05-02: nws_5min_diurnal added — METAR's diurnal regression
+# fed by 5-min readings. Same physical sensor family as METAR + nws_5min
+# so group correlation discount applies. nws_5min_analog is registered
+# here for forward-compat (it shares the same sensor data) but is
+# currently NOT in the live combine — see _collect_gaussians for why.
+_OBS_GROUP: frozenset[str] = frozenset({
+    "metar", "madis", "nws_5min", "nws_5min_diurnal", "nws_5min_analog",
+})
 
 _GROUP_RHO_KEY_PREFIX: str = "weather_group_corr_"
 # When no fit has ever been persisted, fall back to the MVP.
@@ -130,28 +154,57 @@ def _get_learned_sigma(
     except RuntimeError:
         return None
 
-    keys_to_try: list[str] = []
-    if city_key:
-        keys_to_try.append(f"{_SKILL_KEY_PREFIX}{source_name}_{city_key}_{bucket}")
-    keys_to_try.append(f"{_SKILL_KEY_PREFIX}{source_name}_{bucket}")
+    # Two-pass lookup: per-(source, city, bucket) first, then pooled
+    # (source, bucket). The per-city key is gated on a minimum sample
+    # size (_PER_CITY_SIGMA_MIN_SAMPLES) — thin fits routinely produce
+    # noise σ values 3-5x off pooled (see constant docstring).
+    per_city_key = (
+        f"{_SKILL_KEY_PREFIX}{source_name}_{city_key}_{bucket}"
+        if city_key else None
+    )
+    pooled_key = f"{_SKILL_KEY_PREFIX}{source_name}_{bucket}"
 
-    for key in keys_to_try:
+    def _read_sigma(key: str, require_min_samples: bool) -> Optional[float]:
         try:
             payload = kv_get(conn, key)
         except Exception:
-            continue
+            return None
         if not isinstance(payload, dict):
-            continue
+            return None
+        if require_min_samples:
+            n = payload.get("n")
+            if not isinstance(n, (int, float)) or n < _PER_CITY_SIGMA_MIN_SAMPLES:
+                return None
         sigma = payload.get("sigma")
         if not isinstance(sigma, (int, float)):
-            continue
+            return None
         sigma_f = float(sigma)
         # Reject pathological σ. Weather-source RMSE stays in 0.1-15°F; outside
         # that range we suspect a stale / corrupt fit and fall back.
         if not (0.1 <= sigma_f <= 15.0):
-            continue
+            return None
         return sigma_f
-    return None
+
+    if per_city_key is not None:
+        sigma_per_city = _read_sigma(per_city_key, require_min_samples=True)
+        if sigma_per_city is not None:
+            return sigma_per_city
+    return _read_sigma(pooled_key, require_min_samples=False)
+
+
+# Sample-size gate on per-(source, city) σ fits.
+#
+# Per-city skill σ values fit on small n (n<60 days) are noisy enough that
+# they routinely produce nonsense — e.g. ``weather_skill_hrrr_los_angeles_0_6``
+# was fit at σ=6.0°F + bias=+5.5°F on n=18, while pooled HRRR sits at σ=1.20°F
+# on n=684. The thin-cell payload is technically a "fit" but it's a sample-
+# variance overshoot, not a real signal.
+#
+# Below this floor we drop the per-city key and fall back to pooled. 60 was
+# chosen by inspection of the persisted kv values on 2026-04-30: at n≥60 the
+# (source, city) σ values cluster within 1.5x of pooled; below that they
+# spread 3-5x.
+_PER_CITY_SIGMA_MIN_SAMPLES: int = 60
 
 
 # ── Source staleness assumption (B) ──────────────────────────────────
@@ -302,8 +355,11 @@ def _apply_learned_sigma_with_flag(
 # biases — until then, pool. EWMA half-life weighting handles drift naturally.
 _MOS_BIAS_KEY_PREFIX: str = "weather_mos_bias_"
 # Cap on |bias| we'll apply even if the fit says more. Protects against
-# a single outlier cell pulling the ensemble too far.
-_MOS_BIAS_MAX_ABS_F: float = 5.0
+# a single outlier cell pulling the ensemble too far. 2026-05-03: bumped
+# 5.0 → 8.0 so persistent regime biases get applied (e.g. LAX marine
+# layer producing sustained +5-7°F warm bias across HRRR/weather/UKMO).
+# Must stay in sync with weather_mos_materializer + backfill_weather_*.
+_MOS_BIAS_MAX_ABS_F: float = 8.0
 
 
 def _city_key(raw: str) -> str:
@@ -323,31 +379,78 @@ def _city_for_ticker(ticker: str) -> Optional[str]:
     return _city_key(ws.city)
 
 
-def _get_mos_bias(source_name: str, city_key: str) -> Optional[float]:
-    """Return the persisted EWMA bias (°F) for this (source, city).
+def _get_mos_bias(
+    source_name: str, city_key: str,
+    regime_label: Optional[str] = None,
+) -> Optional[float]:
+    """Return the persisted EWMA bias (°F) for this (source, city, [regime]).
 
-    None when no fit present or payload malformed; caller leaves the
-    Gaussian untouched in that case.
+    Two-tier lookup: if ``regime_label`` is supplied AND a regime-conditional
+    key exists for it, that wins. Otherwise falls back to the pooled
+    (source, city) bias. Returns None when neither key is present so the
+    caller leaves the Gaussian untouched.
+
+    Why regime-conditional: MOS bias is not constant across weather regimes.
+    HRRR may run +0.5°F warm on clear days but +1.8°F warm on overcast days;
+    pooling these gives a single number that's wrong for both conditions.
+    On 2026-04-30 we saw a residual −0.88°F cool bias on settlement winners
+    even after pooled MOS subtraction — likely a regime-mixing artifact.
+    Regime-conditional keys are produced by
+    ``bot.learning.mos_bias_regime_fitter``.
     """
     try:
         conn = get_connection()
     except RuntimeError:
         return None
-    key = f"{_MOS_BIAS_KEY_PREFIX}{source_name}_{city_key}"
+
+    keys_to_try: list[str] = []
+    if regime_label and regime_label != "unknown":
+        keys_to_try.append(
+            f"{_MOS_BIAS_KEY_PREFIX}{source_name}_{city_key}_{regime_label}"
+        )
+    keys_to_try.append(f"{_MOS_BIAS_KEY_PREFIX}{source_name}_{city_key}")
+
+    for key in keys_to_try:
+        try:
+            payload = kv_get(conn, key)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        bias = payload.get("bias")
+        if not isinstance(bias, (int, float)):
+            continue
+        bias_f = float(bias)
+        if not math.isfinite(bias_f):
+            continue
+        # Clamp — an outlier cell should never move the Gaussian by > cap.
+        return max(-_MOS_BIAS_MAX_ABS_F, min(_MOS_BIAS_MAX_ABS_F, bias_f))
+    return None
+
+
+def _current_regime_label_for_city(city_key: str) -> Optional[str]:
+    """Look up the regime label active for ``city_key`` right now.
+
+    Reads METAR's per-station regime telemetry side-channel (populated
+    when METAR's Gaussian is built earlier in the same cycle). Returns
+    None when no METAR Gaussian fired yet for this city — the caller
+    falls back to pooled MOS bias.
+    """
     try:
-        payload = kv_get(conn, key)
+        from bot.daemon.stations import STATION_BY_CITY
+        from bot.signals.sources.metar_observations import get_residual_tier_meta
     except Exception:
         return None
-    if not isinstance(payload, dict):
+    ws = STATION_BY_CITY.get(city_key) if hasattr(STATION_BY_CITY, "get") else None
+    if ws is None:
         return None
-    bias = payload.get("bias")
-    if not isinstance(bias, (int, float)):
+    meta = get_residual_tier_meta(ws.icao) if ws else None
+    if not isinstance(meta, dict):
         return None
-    bias_f = float(bias)
-    if not math.isfinite(bias_f):
+    label = meta.get("regime_label")
+    if not isinstance(label, str) or not label or label == "unknown":
         return None
-    # Clamp — an outlier cell should never move the Gaussian by > cap.
-    return max(-_MOS_BIAS_MAX_ABS_F, min(_MOS_BIAS_MAX_ABS_F, bias_f))
+    return label
 
 
 def _apply_mos_bias(
@@ -366,7 +469,10 @@ def _apply_mos_bias(
     """
     if city_key is None:
         return g
-    bias = _get_mos_bias(g.source_name, city_key)
+    # Regime-conditional lookup first (when the active regime label is
+    # known for this city), pooled fallback inside _get_mos_bias.
+    regime_label = _current_regime_label_for_city(city_key)
+    bias = _get_mos_bias(g.source_name, city_key, regime_label=regime_label)
     if bias is None:
         return g
     return g.shifted(-bias)
@@ -408,6 +514,13 @@ def _get_group_rho(group_name: str) -> float:
 # override it, clamped to [1.0, 4.0]. Set kv → 1.5 if shadow data
 # diverges and we need a fast band-aid before refitting.
 _SIGMA_INFLATION_KEY: str = "weather_sigma_inflation"
+# Per-family override: ``weather_sigma_inflation_<KXHIGHMIA>`` etc. Read
+# first; falls through to the global key when absent. Set by the per-
+# family Brier sweep (tools/sigma_inflation_per_family.py); each family's
+# combined-σ has a different optimal multiplier because the underlying
+# source-disagreement profile differs (LAX marine layer → very wide
+# optimal; DEN well-calibrated → no inflation needed).
+_SIGMA_INFLATION_FAMILY_KEY_PREFIX: str = "weather_sigma_inflation_"
 _SIGMA_INFLATION_ENV: str = "WEATHER_SIGMA_INFLATION"
 _SIGMA_INFLATION_DEFAULT: float = 1.0
 _SIGMA_INFLATION_MIN: float = 1.0
@@ -418,29 +531,69 @@ def _clamp_inflation(x: float) -> float:
     return max(_SIGMA_INFLATION_MIN, min(_SIGMA_INFLATION_MAX, x))
 
 
-def _get_sigma_inflation() -> float:
+def _payload_to_factor(payload: object) -> Optional[float]:
+    """Extract a numeric factor from a kv payload. Accepts both
+    ``{"factor": float}`` and bare-number shapes; returns None when the
+    payload is missing or unparseable so the caller can fall through to
+    the next layer."""
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        f = payload.get("factor")
+        if isinstance(f, (int, float)) and math.isfinite(f):
+            return float(f)
+        return None
+    if isinstance(payload, (int, float)) and math.isfinite(payload):
+        return float(payload)
+    return None
+
+
+def _family_from_ticker(ticker: Optional[str]) -> Optional[str]:
+    """Extract the family prefix from a Kalshi ticker. ``KXHIGHMIA-…``
+    → ``KXHIGHMIA``. Returns None when input is missing/malformed."""
+    if not ticker:
+        return None
+    base = ticker.split("-")[0].strip().upper()
+    return base or None
+
+
+def _get_sigma_inflation(ticker: Optional[str] = None) -> float:
     """Resolve the σ-inflation factor.
 
-    Precedence: kv_cache (``weather_sigma_inflation``) → env
-    (``WEATHER_SIGMA_INFLATION``) → constant (``_SIGMA_INFLATION_DEFAULT``).
+    Precedence:
+      1. kv_cache ``weather_sigma_inflation_<FAMILY>`` (per-family override)
+      2. kv_cache ``weather_sigma_inflation`` (global override)
+      3. env ``WEATHER_SIGMA_INFLATION``
+      4. constant ``_SIGMA_INFLATION_DEFAULT``
+
     Clamped to [_SIGMA_INFLATION_MIN, _SIGMA_INFLATION_MAX]; non-finite
-    or non-numeric payloads fall through to the next layer.
+    or non-numeric payloads fall through to the next layer. ``ticker`` is
+    optional — when None or unparseable, only the global/env/default
+    layers are consulted.
     """
     try:
         conn = get_connection()
     except RuntimeError:
         conn = None
     if conn is not None:
+        family = _family_from_ticker(ticker)
+        if family:
+            try:
+                fam_payload = kv_get(
+                    conn, f"{_SIGMA_INFLATION_FAMILY_KEY_PREFIX}{family}",
+                )
+            except Exception:
+                fam_payload = None
+            fam_factor = _payload_to_factor(fam_payload)
+            if fam_factor is not None:
+                return _clamp_inflation(fam_factor)
         try:
             payload = kv_get(conn, _SIGMA_INFLATION_KEY)
         except Exception:
             payload = None
-        if isinstance(payload, dict):
-            f = payload.get("factor")
-            if isinstance(f, (int, float)) and math.isfinite(f):
-                return _clamp_inflation(float(f))
-        elif isinstance(payload, (int, float)) and math.isfinite(payload):
-            return _clamp_inflation(float(payload))
+        global_factor = _payload_to_factor(payload)
+        if global_factor is not None:
+            return _clamp_inflation(global_factor)
 
     env = os.environ.get(_SIGMA_INFLATION_ENV)
     if env:
@@ -453,12 +606,57 @@ def _get_sigma_inflation() -> float:
     return _clamp_inflation(_SIGMA_INFLATION_DEFAULT)
 
 
-def _apply_sigma_inflation(g: GaussianForecast) -> GaussianForecast:
+# 2026-05-04 — σ inflation is TTE-aware. Pre-peak (TTE > _TTE_FULL_H) the
+# full per-family inflation factor applies because forecasts genuinely
+# disagree about the eventual peak. Post-peak (TTE < _TTE_NONE_H) the
+# answer is essentially observed; the right thing for σ is to COLLAPSE
+# toward the observation, not inflate. Linear decay between the two.
+#
+# Postmortem rationale: KXHIGHNY canary 2026-05-03 lost $1.45 because at
+# TTE=5.9h the daemon applied σ × 3.0 to a combined μ that disagreed
+# 2-3°F with already-observed peak. Wide σ said "any 1°F bracket has
+# only 7-8% probability" exactly when reality had locked in the answer.
+_TTE_FULL_H: float = 8.0
+_TTE_NONE_H: float = 2.0
+
+
+def _decay_factor_for_tte(
+    base_factor: float, tte_hours: Optional[float],
+) -> float:
+    """Decay the per-family σ inflation factor as time-to-settlement
+    shrinks. ``base_factor`` is the kv-resolved factor (1.0-4.0).
+    ``tte_hours`` is hours-to-settle in the LST settlement window.
+
+    Returns ``base_factor`` when TTE >= _TTE_FULL_H or unknown.
+    Returns 1.0 when TTE <= _TTE_NONE_H.
+    Linear interpolation between, capped at the original base.
+    """
+    if tte_hours is None or tte_hours >= _TTE_FULL_H:
+        return base_factor
+    if tte_hours <= _TTE_NONE_H:
+        return 1.0
+    span = _TTE_FULL_H - _TTE_NONE_H
+    progress = (tte_hours - _TTE_NONE_H) / span  # 0 at TTE_NONE, 1 at TTE_FULL
+    return 1.0 + (base_factor - 1.0) * progress
+
+
+def _apply_sigma_inflation(
+    g: GaussianForecast,
+    ticker: Optional[str] = None,
+    tte_hours: Optional[float] = None,
+) -> GaussianForecast:
     """Multiply the combined Gaussian's σ by the resolved inflation factor.
+
+    Per-family override is consulted when ``ticker`` is provided. The
+    factor is then decayed toward 1.0 based on ``tte_hours`` so post-peak
+    quotes don't suffer the wide-σ-spreads-mass-across-impossible-brackets
+    pathology. When ``tte_hours`` is None, full base factor applies
+    (back-compat for callers that don't pass it).
 
     Mean / horizon / provenance are preserved.
     """
-    factor = _get_sigma_inflation()
+    base_factor = _get_sigma_inflation(ticker)
+    factor = _decay_factor_for_tte(base_factor, tte_hours)
     if factor == 1.0:
         return g
     return g.with_sigma(g.sigma_f * factor)
@@ -581,6 +779,40 @@ def get_and_reset_snapshot_health_stats() -> dict[str, int]:
     return stats
 
 
+def _is_afd_late_day_skipped(ticker: str) -> bool:
+    """True when the AFD shift should be suppressed for this ticker
+    because we're past peak heating in the ticker's local time.
+
+    AFD encodes the forecaster's commentary on how the day will unfold.
+    Past LST 14 the daily high is mostly observed; AFD shifts after
+    that just add noise. Verified live 2026-05-01: post-peak AFD added
+    ~+1.5°F warm bias to evening combined μ for KMIA / KLAX where the
+    day's high had already passed.
+
+    Pulled out as a module-level function so tests can monkey-patch
+    deterministically — without it, test outcomes depend on wall-clock
+    time when pytest runs, which is the kind of flakiness we don't want.
+    """
+    try:
+        from bot.daemon.stations import (
+            lst_offset_for_station, station_for_ticker,
+        )
+        ws = station_for_ticker(ticker)
+        if ws is None:
+            return False
+        lst_offset = lst_offset_for_station(ws.icao)
+        lst_now = datetime.now(timezone.utc) + (
+            datetime.now(timezone.utc) - datetime.now(timezone.utc)  # zero
+        )
+        # Compute LST hour explicitly without relying on tz arithmetic
+        # confusion — UTC + offset_hours is the LST clock.
+        from datetime import timedelta as _td
+        lst = datetime.now(timezone.utc) + _td(hours=lst_offset)
+        return lst.hour >= 14
+    except Exception:
+        return False
+
+
 def _logit(p: float) -> float:
     p = max(1e-6, min(1 - 1e-6, p))
     return math.log(p / (1.0 - p))
@@ -652,9 +884,15 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
     granularity; a flaky HRRR fetch shouldn't drop the entire ensemble.
     """
     city_key = _city_for_ticker(ticker)
+    from bot.signals.sources.ecmwf import get_ecmwf_gaussian
+    from bot.signals.sources.gem import get_gem_gaussian
     from bot.signals.sources.hrrr import get_hrrr_gaussian
     from bot.signals.sources.icon import get_icon_gaussian
     from bot.signals.sources.metar_observations import get_metar_gaussian
+    from bot.signals.sources.metno import get_metno_gaussian
+    from bot.signals.sources.nws_5min import get_nws_5min_gaussian
+    from bot.signals.sources.nws_5min_analog import get_nws_5min_analog_gaussian
+    from bot.signals.sources.nws_5min_diurnal import get_nws_5min_diurnal_gaussian
     from bot.signals.sources.nws_point import get_nws_point_gaussian
     from bot.signals.sources.ukmo import get_ukmo_gaussian
     from bot.signals.sources.weather import get_weather_gaussian
@@ -710,14 +948,50 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
     # after 50+ settled rows with non-regression on combined Brier.
     # IEM 1-min was added then removed same day (24h publication
     # latency makes it useless as live observation).
+    # 2026-04-30: GEM, MetNo, ECMWF added. Validation in
+    # tools/investigate_new_forecast_sources.py (n=174 city-days):
+    #   GEM:   pooled MAE 1.80°F, ensemble Δ -0.215°F (-12%, best)
+    #   MetNo: pooled MAE 1.96°F, ensemble Δ -0.069°F (-4%)
+    #   ECMWF: pooled MAE 2.72°F, ensemble Δ -0.052°F (-3%, but
+    #          residual ρ=0.34 with ICON — most independent of all)
+    # All three start in PROBATIONARY via state_machine pre-seed;
+    # auto-promote to ACTIVE after 50+ settled rows with non-regression.
     getters = [
         ("hrrr", get_hrrr_gaussian),
         ("nws_point", get_nws_point_gaussian),
         ("weather", get_weather_gaussian),
         ("icon", get_icon_gaussian),
         ("ukmo", get_ukmo_gaussian),
+        ("gem", get_gem_gaussian),
+        ("metno", get_metno_gaussian),
+        ("ecmwf", get_ecmwf_gaussian),
         ("metar", get_metar_gaussian),
+        # 2026-04-30: nws_5min wired in. Sub-hourly ASOS observations
+        # via NWS api.weather.gov. 5-min granularity, 15-25 min
+        # publication lag (the source widens σ via the issued_at
+        # path + staleness_inflation when readings are old).
+        ("nws_5min", get_nws_5min_gaussian),
+        # 2026-05-02: nws_5min_diurnal feeds the freshest 5-min reading
+        # through METAR's existing per-(station, lst_hour) diurnal
+        # regression. Updates every 5 min instead of METAR's 60-min
+        # pace while reusing the 90+ days of CF6-corrected fit data.
+        ("nws_5min_diurnal", get_nws_5min_diurnal_gaussian),
+        # nws_5min_analog removed from live combine 2026-05-02:
+        # post-deploy probe revealed (1) feature-vintage bug — the
+        # AVG-across-ticker-lifetime statistic collapses to long-range
+        # outlooks rather than morning-of consensus, so neighbors are
+        # picked on stale features; (2) only 35 historical days,
+        # peaks 78-88°F, can't span today's 93-95°F regime. Needs
+        # latest-snapshot vintage strategy + ~4-6 weeks more history.
+        # Module + tests retained for re-enable when both land.
+        # ("nws_5min_analog", get_nws_5min_analog_gaussian),
     ]
+    # 2026-05-04: per-city source exclusions land here. After we know
+    # the city, drop sources the regression flagged as structurally
+    # biased for that station (e.g., nws_point for KNYC at -5.86°F,
+    # gem/metno at KLAX at +9°F). See weather_sources.EXCLUDED_SOURCES_BY_CITY.
+    from bot.signals.weather_sources import is_excluded_for_city
+
     out: list[GaussianForecast] = []
     for name, fn in getters:
         try:
@@ -726,6 +1000,11 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
             print(f"[weather_ensemble_v2] {name} raised {type(e).__name__}: {e}")
             continue
         if g is None:
+            continue
+        if is_excluded_for_city(name, city_key):
+            # Source ran (so its predictions are still recorded in
+            # snapshots upstream of this filter) but is dropped from
+            # the live combine for this city.
             continue
         if g.source_name != name and not name.startswith("__"):
             # Defensive: source misidentified itself. Fix here so downstream
@@ -1094,31 +1373,46 @@ def predict_v2(
     # 4. AFD bias shift (bias-space, not prob-space)
     afd_bias_f: Optional[float] = None
     afd_tag: Optional[str] = None
+    afd_late_day_skipped = _is_afd_late_day_skipped(ticker)
+
     try:
         from bot.signals.sources.afd import get_afd_bias
 
         bias_val, afd_conf, bias_tag = get_afd_bias(ticker, market_data)
         if bias_val is not None and afd_conf is not None:
-            # Confidence-weighted shift: low-confidence keyword matches
-            # contribute little, high-confidence LLM reads more. Capped at
-            # ±_MAX_AFD_SHIFT_ABS_F to keep a runaway parse from blowing
-            # the combined mean past climatology.
-            effective_shift = bias_val * afd_conf
-            effective_shift = max(
-                -_MAX_AFD_SHIFT_ABS_F,
-                min(_MAX_AFD_SHIFT_ABS_F, effective_shift),
-            )
-            combined = combined.shifted(effective_shift)
-            afd_bias_f = effective_shift
-            afd_tag = bias_tag
+            if afd_late_day_skipped:
+                # Log the parse for snapshot continuity but apply 0
+                # shift. afd_tag preserves the original parse so the
+                # snapshot writer can still record what AFD said.
+                afd_bias_f = 0.0
+                afd_tag = f"{bias_tag}:suppressed_past_peak"
+            else:
+                # Confidence-weighted shift: low-confidence keyword
+                # matches contribute little, high-confidence LLM reads
+                # more. Capped at ±_MAX_AFD_SHIFT_ABS_F to keep a runaway
+                # parse from blowing the combined mean past climatology.
+                effective_shift = bias_val * afd_conf
+                effective_shift = max(
+                    -_MAX_AFD_SHIFT_ABS_F,
+                    min(_MAX_AFD_SHIFT_ABS_F, effective_shift),
+                )
+                combined = combined.shifted(effective_shift)
+                afd_bias_f = effective_shift
+                afd_tag = bias_tag
     except Exception as e:
         print(f"[weather_ensemble_v2] afd_bias error: {type(e).__name__}: {e}")
 
     # 4b. Inflate combined σ to compensate for too-tight source priors.
-    # See _SIGMA_INFLATION_DEFAULT note for the empirical rationale; this
-    # is a temporary global correction until A3 skill-curve fits override
-    # σ per (source, horizon).
-    combined = _apply_sigma_inflation(combined)
+    # Pass ticker so the per-family override (set 2026-05-03 from the
+    # Brier sweep) applies. KXHIGHDEN gets factor=1.0 (no-op, sources
+    # already agree); LAX/CHI/AUS get factor=4.0; MIA/NY get 3.0.
+    # Also pass horizon_hours so the factor decays toward 1.0 post-peak
+    # (added 2026-05-04 after the KXHIGHNY canary postmortem). Wide σ
+    # post-peak misallocates probability across impossible brackets when
+    # observations have already locked in the answer.
+    combined = _apply_sigma_inflation(
+        combined, ticker=ticker, tte_hours=combined.horizon_hours,
+    )
 
     # 4c. Enforce running-high floor: daily HIGH cannot be below already-
     # observed running max. Belt-and-suspenders with C: even with the
