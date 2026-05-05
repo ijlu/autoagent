@@ -50,6 +50,7 @@ from bot.config import (
 from bot.signals.weather_ensemble_v2 import (
     _city_for_ticker,
     _collect_gaussians,
+    _apply_metar_post_peak_override,
     _weighted_inputs_with_group_discount,
     _COMBINED_SIGMA_FLOOR_F,
 )
@@ -337,9 +338,17 @@ def _score_one_settlement(group: list[dict]) -> list:
         return []
 
     sample = group[0]
-    gaussians = _collect_gaussians(sample.get("ticker", ""), sample)
+    ticker = sample.get("ticker", "")
+    gaussians = _collect_gaussians(ticker, sample)
     if not gaussians:
         return []
+
+    # 2026-05-05 (Phase 3d/3e): apply METAR post-peak fast-path BEFORE
+    # combine, same as predict_v2's step 1b. Without this, cross-bracket
+    # was scoring with wide-σ combined while WeatherQuoter (which goes
+    # through predict_v2) was using the tight METAR-only override —
+    # different μ/σ for the same market on the same cycle.
+    gaussians = _apply_metar_post_peak_override(gaussians, ticker)
 
     weighted = _weighted_inputs_with_group_discount(gaussians)
     combined = combine_gaussian(weighted, combined_name="combined_v2")
