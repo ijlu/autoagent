@@ -3614,9 +3614,28 @@ def record_settlements(conn):
                 strat = dir_row[1]
                 est_prob = dir_row[2]
             else:
-                # Not in our DB — might be a personal trade or from before bot started
-                skipped_notours += 1
-                continue
+                # Cross-bracket fallback: cross-bracket POSTs don't write to
+                # mm_orders / safe_compounder_orders / trades — they live in
+                # alpha_backtest (notes='cross_bracket;...') with fills landing
+                # in fills_ledger via fills_writer. Detect by joining fills_ledger
+                # to /portfolio/orders' cross-bracket-tagged order_ids.
+                # See bot/daemon/cross_bracket_exit.get_open_cb_positions for the
+                # canonical attribution flow used by the exit task.
+                cb_row = conn.execute(
+                    "SELECT AVG(CASE WHEN side='no' THEN no_price_cents "
+                    "                ELSE yes_price_cents END), "
+                    "       MAX(side) "
+                    "FROM fills_ledger WHERE ticker = ? AND action = 'buy'",
+                    (ticker,)
+                ).fetchone()
+                if cb_row and cb_row[0] is not None:
+                    strat = "cross_bracket"
+                    est_prob = None
+                    pc = int(round(cb_row[0]))
+                else:
+                    # Not in our DB — likely a personal trade or pre-bot.
+                    skipped_notours += 1
+                    continue
 
             # Parse settlement data from Kalshi API
             revenue = int(s.get("revenue", 0))

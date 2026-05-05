@@ -526,6 +526,102 @@ class TestMETARGaussian:
         )
 
 
+    def test_past_peak_hard_hour_gate_fires_at_18_lst_regardless_of_delta(self, monkeypatch):
+        """Regression for 2026-05-04 cross-bracket losses:
+
+        At LST 18+ (6pm local), past-peak clamp must fire even when
+        current temp is ≥ running_high (delta < threshold). MIA had
+        running_high=81 and current=80 (delta=1°F < old 2°F threshold)
+        at 5pm LST, so the clamp didn't engage and the diurnal fit
+        projected high to 85.84°F — driving combined μ way above
+        reality. The hard-hour gate ensures by 6pm any city is
+        treated as past-peak.
+        """
+        # Current temp 27°C ≈ 80.6°F, running_high 81°F. Only 0.4°F gap —
+        # well below the (post-fix) 1.0°F delta threshold.
+        obs = {"temp": 27.0, "reportTime": "2026-05-04T22:00:00Z"}
+        monkeypatch.setattr(
+            metar_observations, "_fetch_metar_data", lambda: [obs],
+        )
+        monkeypatch.setattr(
+            metar_observations, "_extract_station_obs",
+            lambda data, station: obs,
+        )
+        monkeypatch.setattr(
+            metar_observations, "_update_running_daily_high",
+            lambda s, t, o: {"high_f": 81.0, "date": "2026-05-04"},
+        )
+        monkeypatch.setattr(
+            metar_observations, "_get_forecast_high",
+            lambda s, r: 85.0,
+        )
+        # LST hour 18 — exactly at hard-hour gate
+        import datetime as _dt
+        monkeypatch.setattr(
+            metar_observations, "_get_lst_now",
+            lambda station: _dt.datetime(
+                2026, 5, 4, 18, 0,
+                tzinfo=_dt.timezone(_dt.timedelta(hours=-5)),
+            ),
+        )
+        # Diurnal fit predicts continued warming — must NOT win
+        monkeypatch.setattr(
+            metar_observations, "_get_diurnal_fit",
+            lambda station, lst_hour: (20.0, 1.1, 3.0),
+        )
+        g = metar_observations.get_metar_gaussian(
+            "KXHIGHMIA-26MAY04-B82.5", _market(),
+        )
+        assert g is not None, "metar source should fire post-peak"
+        assert g.mean_f == 81.0, (
+            f"hard-hour gate must pin μ to running_high, got {g.mean_f}"
+        )
+        assert g.sigma_f < 1.0, f"σ should be tight, got {g.sigma_f:.2f}"
+        assert "past_peak" in g.source_tag
+
+    def test_past_peak_clamp_fires_with_1f_delta_post_fix(self, monkeypatch):
+        """The 2026-05-05 fix lowered _PAST_PEAK_DELTA_F from 2.0 to 1.0.
+        At LST 14+ with a 1°F gap (current cooler than running_high),
+        clamp must fire. Pre-fix this case fell through to the diurnal
+        fit and over-projected on AUS/MIA-class climates."""
+        # Current temp 26.0°C = 78.8°F, running_high 80.0°F → 1.2°F gap (above 1.0 threshold)
+        obs = {"temp": 26.0, "reportTime": "2026-05-04T19:00:00Z"}
+        monkeypatch.setattr(
+            metar_observations, "_fetch_metar_data", lambda: [obs],
+        )
+        monkeypatch.setattr(
+            metar_observations, "_extract_station_obs",
+            lambda data, station: obs,
+        )
+        monkeypatch.setattr(
+            metar_observations, "_update_running_daily_high",
+            lambda s, t, o: {"high_f": 80.0, "date": "2026-05-04"},
+        )
+        monkeypatch.setattr(
+            metar_observations, "_get_forecast_high",
+            lambda s, r: 85.0,
+        )
+        import datetime as _dt
+        monkeypatch.setattr(
+            metar_observations, "_get_lst_now",
+            lambda station: _dt.datetime(
+                2026, 5, 4, 15, 0,  # LST 3pm — past 14 gate, before 18 hard
+                tzinfo=_dt.timezone(_dt.timedelta(hours=-5)),
+            ),
+        )
+        monkeypatch.setattr(
+            metar_observations, "_get_diurnal_fit",
+            lambda station, lst_hour: (20.0, 1.1, 3.0),
+        )
+        g = metar_observations.get_metar_gaussian(
+            "KXHIGHMIA-26MAY04-B82.5", _market(),
+        )
+        assert g is not None
+        assert abs(g.mean_f - 80.0) < 0.1, (
+            f"1°F-delta clamp post-fix must pin μ, got {g.mean_f}"
+        )
+        assert "past_peak" in g.source_tag
+
     def test_diurnal_fit_respects_running_high_floor(self, monkeypatch):
         """Daily high can only rise — when α + β·T < running_high, μ
         clamps to running_high (predicted morning implies low but the

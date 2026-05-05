@@ -1441,8 +1441,24 @@ def predict_v2(
     # brackets too. 0.5°F balances tightness (we still concentrate most
     # mass in the right bracket when we know it) vs robustness (we
     # don't catastrophically miss when we're slightly off).
-    if combined.sigma_f < _COMBINED_SIGMA_FLOOR_F:
-        combined = combined.with_sigma(_COMBINED_SIGMA_FLOOR_F)
+    # Regime-aware floor: when the metar source is in past-peak mode
+    # (μ pinned to running_high, σ=0.30°F), the day is effectively
+    # decided and inflating σ to 1.0°F smears probability across
+    # brackets that are physically very unlikely. Detect via the
+    # metar source's tag suffix and let the precision-weighted σ
+    # come through (with a tighter 0.4°F floor). 2026-05-05 cross-
+    # bracket post-mortem: KXHIGHLAX-B68.5 NO bought because model
+    # said P(high in [68, 69]) = 7% at σ=5.94°F when reality landed
+    # in that bracket; with regime-aware floor σ would have been
+    # ~0.4°F and bracket prob ~70%, no edge to fire on.
+    metar_in_past_peak = any(
+        g.source_name == "metar"
+        and "past_peak" in (g.source_tag or "")
+        for g in gaussians
+    )
+    floor = 0.4 if metar_in_past_peak else _COMBINED_SIGMA_FLOOR_F
+    if combined.sigma_f < floor:
+        combined = combined.with_sigma(floor)
 
     # 5. Project combined Gaussian onto the market.
     # Option C (H3 conditional, 2026-04-29): only pass METAR's μ as the
