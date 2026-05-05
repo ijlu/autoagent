@@ -3616,15 +3616,26 @@ def record_settlements(conn):
             else:
                 # Cross-bracket fallback: cross-bracket POSTs don't write to
                 # mm_orders / safe_compounder_orders / trades — they live in
-                # alpha_backtest (notes='cross_bracket;...') with fills landing
-                # in fills_ledger via fills_writer. Detect by joining fills_ledger
-                # to /portfolio/orders' cross-bracket-tagged order_ids.
-                # See bot/daemon/cross_bracket_exit.get_open_cb_positions for the
-                # canonical attribution flow used by the exit task.
+                # alpha_backtest (notes='cross_bracket;...'). We must filter
+                # by alpha_backtest cross_bracket entries (NOT fills_ledger
+                # alone) because fills_ledger contains all account fills
+                # including the operator's manual trades — using fills_ledger
+                # as sole attribution mis-tagged a manual KXHIGHAUS-B84.5
+                # YES trade as cross_bracket on 2026-05-05.
+                cb_decision = conn.execute(
+                    "SELECT 1 FROM alpha_backtest "
+                    "WHERE ticker = ? AND notes LIKE 'cross_bracket;%' "
+                    "  AND decision_outcome = 'posted' LIMIT 1",
+                    (ticker,)
+                ).fetchone()
+                if not cb_decision:
+                    skipped_notours += 1
+                    continue
+                # Pull avg fill price from fills_ledger (joined via the
+                # cross-bracket-attested ticker).
                 cb_row = conn.execute(
                     "SELECT AVG(CASE WHEN side='no' THEN no_price_cents "
-                    "                ELSE yes_price_cents END), "
-                    "       MAX(side) "
+                    "                ELSE yes_price_cents END) "
                     "FROM fills_ledger WHERE ticker = ? AND action = 'buy'",
                     (ticker,)
                 ).fetchone()
@@ -3633,7 +3644,6 @@ def record_settlements(conn):
                     est_prob = None
                     pc = int(round(cb_row[0]))
                 else:
-                    # Not in our DB — likely a personal trade or pre-bot.
                     skipped_notours += 1
                     continue
 
