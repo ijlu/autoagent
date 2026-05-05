@@ -956,10 +956,20 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
     #          residual ρ=0.34 with ICON — most independent of all)
     # All three start in PROBATIONARY via state_machine pre-seed;
     # auto-promote to ACTIVE after 50+ settled rows with non-regression.
+    # 2026-05-05: `weather` removed from the live combine. Per-city
+    # scorecard analysis (reports/PER_SOURCE_INVESTIGATION_2026-05-05.md +
+    # POSTFIX_REASSESSMENT_2026-05-05.md) showed corr(hrrr, weather) =
+    # 0.994 (NY) / 1.000 (LAX) at peak window — both are Open-Meteo
+    # (gfs_hrrr vs default blend). Default blend at US lat/lons IS GFS,
+    # so `weather` was duplicating the HRRR signal and halving the
+    # effective weight of every other source.
+    # Module + getter retained in code; if drift between the two endpoints
+    # ever needs monitoring, re-enable as a separate snapshot-only path
+    # (don't re-add to the combine).
     getters = [
         ("hrrr", get_hrrr_gaussian),
         ("nws_point", get_nws_point_gaussian),
-        ("weather", get_weather_gaussian),
+        # ("weather", get_weather_gaussian),  # dropped 2026-05-05 (dup of hrrr)
         ("icon", get_icon_gaussian),
         ("ukmo", get_ukmo_gaussian),
         ("gem", get_gem_gaussian),
@@ -1129,6 +1139,168 @@ _SANITY_GATE_F: float = 5.0
 
 
 _OBSERVATION_SOURCE_NAMES: frozenset[str] = frozenset({"metar", "iem_1min"})
+
+
+# ─── METAR post-peak fast-path (2026-05-05) ─────────────────────────────────
+#
+# Phase 3c counterfactual ([reports/PHASE_3C_COUNTERFACTUAL_2026-05-05.md])
+# showed that even with the May 3 lat/lon fix, post-fix combined σ at peak
+# time is 5-7°F. The Gaussian projection onto narrow 2°F brackets gives
+# every bracket ~10-15% probability — which the cross-bracket strategy
+# interprets as "huge edge" against market prices that correctly reflect
+# real-time METAR. Result: continued losses on the SAME settlements that
+# pre-fix data also lost.
+#
+# Fix: when local solar time is past the city's typical peak hour AND
+# METAR has a current observation AND the running max has been stable
+# long enough that "peak surprise" is unlikely, replace the entire
+# combine input with a single METAR-only Gaussian (μ = METAR running
+# max, σ = 1.0°F). The 1°F σ captures residual uncertainty (METAR
+# sample-rate misses an actual peak by 0.5-2°F on ~20% of days per
+# scorecard `frac_within_1F` data).
+#
+# Why this is correct: post-peak, the day's daily high is essentially set
+# and we observed it. NWP forecasts at this point add NOISE not info.
+# The combine's precision-weighting was averaging sharp METAR (σ~0.3) with
+# wide NWPs (σ~3) and producing moderate combined σ — losing the sharpness
+# METAR alone offered.
+#
+# 2026-05-05 (Phase 3e): replaced fixed peak+2 buffer with adaptive
+# stability detection. Per-city rules in
+# bot.learning.cross_bracket_lst_gate.POST_PEAK_RULE_BY_SERIES encode
+# the validated insight that later LST hours need less stability proof
+# (solar heating has decayed), while earlier LST hours need more
+# stability to catch convective/marine multi-modal days. Stability
+# (hours since running max last increased) is read from the METAR
+# poller's kv_cache state.
+
+# σ to assign the synthetic METAR-only Gaussian when fast-path fires.
+# 1.0°F captures the ~20% of days where official daily-high exceeds
+# hourly METAR running max by ≥1°F (sample-rate misses, late spikes).
+_METAR_POST_PEAK_SIGMA_F: float = 1.0
+
+
+def _apply_metar_post_peak_override(
+    gaussians: list[GaussianForecast],
+    ticker: str,
+    *,
+    now_ts: Optional[float] = None,
+    last_increase_lst_hour_override: Optional[int] = None,
+) -> list[GaussianForecast]:
+    """Post-peak: replace the combine input with a single METAR-only
+    Gaussian. Returns ``gaussians`` unchanged if any condition fails.
+
+    Conditions for fast-path to fire:
+      1. LST at decision time is ≥ peak_hour + ``_METAR_POST_PEAK_BUFFER_HOURS``
+         on the **target settlement day** (not next day's pre-peak).
+      2. A METAR Gaussian is present in ``gaussians`` (i.e., the
+         observation channel is currently working).
+      3. METAR's mean is finite and inside a sane temperature band.
+
+    When the override fires, returned list has exactly one element with
+    ``source_name = "metar_post_peak_override"`` so downstream snapshot
+    writers tag rows with the override's identity.
+
+    ``now_ts`` is exposed for testing — production callers should leave
+    it None (uses ``time.time()``).
+    """
+    if not gaussians:
+        return gaussians
+
+    # Late imports to avoid cycles (cross_bracket_lst_gate imports from
+    # bot.daemon, which can recursively pull weather modules).
+    try:
+        from bot.daemon.stations import station_for_ticker
+        from bot.learning.cross_bracket_lst_gate import (
+            get_running_high_state, is_post_peak_safe,
+        )
+        from tools.lst_align import lst_hour, lst_date
+    except Exception:
+        return gaussians
+
+    station = station_for_ticker(ticker)
+    if station is None:
+        return gaussians
+
+    metar = next((g for g in gaussians if g.source_name == "metar"), None)
+    if metar is None:
+        return gaussians
+    if not math.isfinite(metar.mean_f):
+        return gaussians
+    # Sanity: METAR must report a temperature in Earth-likely range
+    if not (-50.0 <= metar.mean_f <= 150.0):
+        return gaussians
+
+    # Identify the target settlement-day LST date from the ticker.
+    target_lst_date = _target_lst_date_from_ticker(ticker, station.lst_offset)
+    if target_lst_date is None:
+        return gaussians
+
+    if now_ts is None:
+        import time as _time
+        now_ts = _time.time()
+    cur_lst_hour = lst_hour(now_ts, lst_offset=station.lst_offset)
+    cur_lst_date = lst_date(now_ts, lst_offset=station.lst_offset)
+
+    # Must be on the target day; pre-peak of the previous day or
+    # post-settle next day disable the fast-path.
+    if cur_lst_date != target_lst_date:
+        return gaussians
+
+    # Stability detection: read METAR poller's persisted last-increase
+    # hour from kv_cache. If unavailable (poller hasn't run today), fall
+    # back to a conservative LST 18 threshold rather than firing blind.
+    # Tests inject ``last_increase_lst_hour_override`` to bypass kv_cache.
+    if last_increase_lst_hour_override is not None:
+        last_inc = last_increase_lst_hour_override
+    else:
+        state = get_running_high_state(station.icao, target_lst_date)
+        last_inc = state.get("last_increase_lst_hour", -1) if state else -1
+    if last_inc < 0:
+        if cur_lst_hour < 18:
+            return gaussians
+        stability_hours = 0  # conservative fallback
+    else:
+        stability_hours = max(0, cur_lst_hour - last_inc)
+
+    if not is_post_peak_safe(station.series, cur_lst_hour, stability_hours):
+        return gaussians
+
+    # Conditions met — build the synthetic Gaussian.
+    overridden = GaussianForecast(
+        mean_f=metar.mean_f,
+        sigma_f=_METAR_POST_PEAK_SIGMA_F,
+        horizon_hours=metar.horizon_hours,
+        source_name="metar_post_peak_override",
+        source_tag=(
+            f"metar_post_peak:lst{cur_lst_hour:02d}_stable{stability_hours}h"
+        ),
+    )
+    return [overridden]
+
+
+def _target_lst_date_from_ticker(
+    ticker: str, lst_offset: int,
+) -> Optional[str]:
+    """Parse the settlement LST date from a ticker like
+    ``KXHIGHNY-26MAY04-B72.5`` → ``"2026-05-04"``."""
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    raw = parts[1]
+    if len(raw) != 7:
+        return None
+    months = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    }
+    try:
+        yr = 2000 + int(raw[:2])
+        mon = months[raw[2:5].upper()]
+        day = int(raw[5:7])
+        return f"{yr:04d}-{mon:02d}-{day:02d}"
+    except (ValueError, KeyError):
+        return None
 
 
 def _apply_sanity_gate(gaussians: list[GaussianForecast]) -> list[GaussianForecast]:
@@ -1355,6 +1527,13 @@ def predict_v2(
     gaussians = _collect_gaussians(ticker, market_data)
     if not gaussians:
         return None, None
+
+    # 1b. METAR post-peak fast-path: post-peak, the day's high is locked
+    # and METAR observed it. Replacing the combine input with METAR-only
+    # avoids the precision-weighted-combine pathology where wide-σ NWPs
+    # dilute METAR's sharpness. See _apply_metar_post_peak_override
+    # docstring + reports/PHASE_3C_COUNTERFACTUAL_2026-05-05.md.
+    gaussians = _apply_metar_post_peak_override(gaussians, ticker)
 
     # 2. Parse market to know how to project. Bail if we can't resolve
     # the threshold or bracket bounds — a Gaussian we can't project is

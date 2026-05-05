@@ -375,6 +375,90 @@ def _is_live_eligible_window(settlement_key: str) -> tuple[bool, float]:
     return in_window, hours_to_settle
 
 
+def _is_in_lst_gate(settlement_key: str) -> tuple[bool, str]:
+    """Return (in_gate, reason) for the per-city LST + stability gate.
+
+    Cross-bracket fires only when the METAR post-peak fast-path is
+    safely armed for this city — i.e., either current LST is past the
+    "always-arm" hour, or the running max has been stable enough hours
+    that "peak surprise" risk is < 5% per the empirical city rules.
+
+    Why same condition as fast-path: when fast-path can't arm, the
+    combine falls back to wide-σ NWP-blended μ which correctly reflects
+    forecast uncertainty for the strategy's purposes. But the strategy
+    will then read that wide σ as "huge edge against market" and fire
+    the wrong side. Phase 3c counterfactual showed this is the loss
+    mechanism. So: gate cross-bracket on the same data the fast-path
+    uses, ensuring the combine is METAR-tight whenever the strategy
+    fires.
+
+    Returns (False, reason) on parse failure, missing METAR state, or
+    unsafe stability. Fails closed.
+    """
+    from bot.learning.cross_bracket_lst_gate import (
+        get_running_high_state, is_post_peak_safe,
+    )
+    from bot.daemon.stations import station_for_ticker
+    from tools.lst_align import lst_hour, lst_date
+
+    family = _family_from_settlement_key(settlement_key)
+    if family is None:
+        return False, "lst_unparseable_family"
+    station = station_for_ticker(f"{family}-stub-Bstub")
+    if station is None:
+        return False, "lst_unknown_station"
+
+    target_lst = _target_lst_date_from_settlement_key(settlement_key)
+    if target_lst is None:
+        return False, "lst_unparseable_settle_date"
+
+    now = time.time()
+    cur_lst_hour = lst_hour(now, lst_offset=station.lst_offset)
+    cur_lst_date = lst_date(now, lst_offset=station.lst_offset)
+
+    if cur_lst_date != target_lst:
+        return False, f"lst_date_{cur_lst_date}_vs_target_{target_lst}"
+
+    # Read METAR poller's persisted running-high state. If absent (poller
+    # didn't run today, kv_cache wiped), fall back to LST 18 as a
+    # universal "definitely past peak" hour for all 6 currently-traded
+    # cities — conservative.
+    state = get_running_high_state(station.icao, target_lst)
+    if state is None or state.get("last_increase_lst_hour", -1) < 0:
+        if cur_lst_hour < 18:
+            return False, f"lst_{cur_lst_hour}_no_metar_state_pre_18"
+        stability_hours = 0  # conservative
+    else:
+        stability_hours = max(0, cur_lst_hour - state["last_increase_lst_hour"])
+
+    if not is_post_peak_safe(station.series, cur_lst_hour, stability_hours):
+        return False, (
+            f"lst_{cur_lst_hour}_K{stability_hours}_unsafe_per_{station.series}_rule"
+        )
+    return True, f"lst_{cur_lst_hour}_K{stability_hours}_safe"
+
+
+def _target_lst_date_from_settlement_key(settlement_key: str) -> Optional[str]:
+    """Parse e.g. ``KXHIGHNY-26MAY04`` into ``2026-05-04``."""
+    parts = settlement_key.split("-")
+    if len(parts) < 2:
+        return None
+    raw = parts[1]
+    if len(raw) != 7:
+        return None
+    months = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    }
+    try:
+        yr = 2000 + int(raw[:2])
+        mon = months[raw[2:5].upper()]
+        day = int(raw[5:7])
+        return f"{yr:04d}-{mon:02d}-{day:02d}"
+    except (ValueError, KeyError):
+        return None
+
+
 def _best_ask_for_buy(
     ticker: str, side: str,
 ) -> tuple[Optional[int], Optional[int]]:
@@ -547,10 +631,12 @@ def _process_decisions(
 
     # TTE check fires once per portfolio (all legs share a settlement).
     in_tte_window, hours_to_settle = _is_live_eligible_window(settlement_key)
+    # LST gate (per-city, post-peak only) — also portfolio-level.
+    in_lst_window, lst_reason = _is_in_lst_gate(settlement_key)
 
     # Cap legs per portfolio (live-mode only — shadow logs everything).
     non_skip = [d for d in decisions if d.action != "skip"]
-    if family_live and in_tte_window and \
+    if family_live and in_tte_window and in_lst_window and \
             len(non_skip) > CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO:
         # Sort by edge desc and take top N. We compute a single edge
         # number per leg = max(edge_yes, edge_no) (whichever side fired).
@@ -601,6 +687,10 @@ def _process_decisions(
             leg_can_go_live = False
             live_skip_reason = f"tte_{hours_to_settle:.1f}h_outside_band"
             stats["live_skipped_tte"] += 1
+        elif not in_lst_window:
+            leg_can_go_live = False
+            live_skip_reason = lst_reason
+            stats["live_skipped_lst"] = stats.get("live_skipped_lst", 0) + 1
         elif leg_edge < CROSS_BRACKET_LIVE_MIN_EDGE:
             leg_can_go_live = False
             live_skip_reason = (

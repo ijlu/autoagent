@@ -68,7 +68,18 @@ CANONICAL_WEATHER_SOURCES: frozenset[str] = frozenset({
 #     learned residual-σ which is strictly more skillful. Same back-compat
 #     story.
 GAUSSIAN_COMBINE_SOURCES: frozenset[str] = frozenset({
-    HRRR, NWS_POINT, WEATHER, METAR,
+    HRRR, NWS_POINT, METAR,
+    # 2026-05-05: WEATHER dropped from combine. Per-city scorecard analysis
+    # (reports/PER_SOURCE_INVESTIGATION_2026-05-05.md + POSTFIX_REASSESSMENT_
+    # 2026-05-05.md) showed corr(hrrr, weather) = 0.994 (NY) / 1.000 (LAX)
+    # at peak window — both pull from Open-Meteo (gfs_hrrr vs default
+    # blend; default blend IS gfs at US lat/lons). Duplicated the HRRR
+    # signal in the combine, halving effective weight of every other
+    # source. Constant kept in CANONICAL_WEATHER_SOURCES so historical
+    # kv_cache rows + back-fill snapshot rows referencing `weather` are
+    # still recognized by readers; getter no longer wired into
+    # weather_ensemble_v2._collect_gaussians.
+    # WEATHER,
     ICON, UKMO,  # Added 2026-04-29 (Phase B.2). PROBATIONARY
                  # state via pre-seed; promoted to ACTIVE by
                  # the daily evaluator after 50+ settled rows.

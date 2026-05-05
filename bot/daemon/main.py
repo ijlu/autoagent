@@ -324,6 +324,32 @@ def _run_cross_bracket_rearm(conn) -> None:
     )
 
 
+def _run_cross_bracket_lst_refresh(conn) -> None:
+    """Recompute per-city cross-bracket LST gates from current METAR
+    backfill and persist to kv_cache. See
+    bot/learning/cross_bracket_lst_gate.py.
+
+    Falls back to defaults per-series when data is insufficient — does
+    NOT make the gate looser than the hardcoded defaults. Safe to run
+    even with no data (the kv_cache writes are skipped, defaults stay
+    in effect).
+    """
+    from bot.learning.cross_bracket_lst_gate import refresh_all_from_metar
+    try:
+        results = refresh_all_from_metar(conn=conn)
+    except Exception as exc:
+        logger.warning("[cross_bracket_lst_refresh] failed: %s", exc)
+        return
+    empirical = sum(1 for r in results.values() if r.get("source") == "empirical")
+    fallback = len(results) - empirical
+    logger.info(
+        "[cross_bracket_lst_refresh] %d empirical, %d fallback-to-default",
+        empirical, fallback,
+    )
+    for series, info in sorted(results.items()):
+        logger.info("  %s → %s", series, info)
+
+
 def _run_fills_validator(conn) -> None:
     """Daily ledger-vs-legacy divergence report. Silent on empty /
     informational, warns on meaningful divergence.
@@ -1398,6 +1424,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_cross_bracket_validation(conn),
         interval_s=86400.0,
         initial_delay_s=_seconds_until_utc_hour(8),
+    )
+    # 2026-05-05: per-city LST gate refresh from METAR backfill. Runs
+    # once per day at 09:00 UTC, after the daily scoreboard + dashboard
+    # tasks have finished. See bot/learning/cross_bracket_lst_gate.py.
+    scheduler.register(
+        "cross_bracket_lst_refresh",
+        lambda: _run_cross_bracket_lst_refresh(conn),
+        interval_s=86400.0,
+        initial_delay_s=_seconds_until_utc_hour(9),
     )
 
     # Start pollers on scheduler start, stop them on scheduler stop.

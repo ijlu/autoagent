@@ -59,6 +59,11 @@ class StationState:
     last_temp_f: float | None = None
     running_high_f: float = -999.0
     running_high_date: str = ""  # YYYY-MM-DD in LST
+    # 2026-05-05 (Phase 3e stability detector): LST hour at which
+    # running_high_f last increased. Used by the cross-bracket fast-path
+    # to compute "stability" (current LST hour - last_increase_lst_hour).
+    # See bot/learning/cross_bracket_lst_gate.is_post_peak_safe().
+    last_increase_lst_hour: int = -1
     readings: list[StationReading] = field(default_factory=list)  # recent history
     MAX_READINGS: int = 90  # 45 minutes of history at 30s intervals
     # Trajectory requires enough spread + sample count to avoid noise amplification.
@@ -385,25 +390,39 @@ class METARPoller(Poller):
         except RuntimeError:
             return  # DB not yet initialised
 
-        snapshot: list[tuple[str, float, str]] = []
+        snapshot: list[tuple[str, float, str, int]] = []
         with self._lock:
             for station_id, state in self._states.items():
                 if state.running_high_f > -999.0:
-                    snapshot.append(
-                        (station_id, state.running_high_f, state.running_high_date)
-                    )
+                    snapshot.append((
+                        station_id,
+                        state.running_high_f,
+                        state.running_high_date,
+                        state.last_increase_lst_hour,
+                    ))
 
-        for station_id, high_f, date_lst in snapshot:
+        for station_id, high_f, date_lst, last_inc_hour in snapshot:
             kv_key = f"metar_daily_high_{station_id}_{date_lst}"
             try:
                 existing = kv_get(conn, kv_key)
                 if existing is None:
-                    record: dict = {"high_f": high_f, "obs_count": 0}
+                    record: dict = {
+                        "high_f": high_f,
+                        "obs_count": 0,
+                        "last_increase_lst_hour": last_inc_hour,
+                    }
                 else:
-                    if high_f <= existing.get("high_f", -999.0):
-                        continue  # kv already has equal or higher value — nothing to do
                     record = dict(existing)
-                    record["high_f"] = high_f
+                    if high_f > existing.get("high_f", -999.0):
+                        record["high_f"] = high_f
+                        # Only bump last_increase when the high actually increased
+                        record["last_increase_lst_hour"] = last_inc_hour
+                    elif "last_increase_lst_hour" not in record:
+                        # Backfill on legacy records that pre-date this field
+                        record["last_increase_lst_hour"] = last_inc_hour
+                    else:
+                        # No high change AND last_increase already populated → skip
+                        continue
                 kv_set(conn, kv_key, record, _DAILY_HIGH_TTL)
             except Exception as exc:
                 logger.warning(
@@ -479,10 +498,24 @@ class METARPoller(Poller):
         if state.running_high_date != today_lst:
             state.running_high_f = -999.0
             state.running_high_date = today_lst
+            state.last_increase_lst_hour = -1
             state.readings.clear()
 
         # -- Update running daily high --
-        if reading.temp_f > state.running_high_f:
+        # Track last_increase_lst_hour for the cross-bracket stability detector
+        # (Phase 3e). The current LST hour is computed from the reading's UTC
+        # timestamp + the station's fixed LST offset.
+        if reading.temp_f > state.running_high_f + 0.1:
+            state.running_high_f = reading.temp_f
+            from tools.lst_align import lst_hour as _lst_hour_fn
+            from bot.daemon.stations import lst_offset_for_station
+            offset = lst_offset_for_station(station)
+            state.last_increase_lst_hour = _lst_hour_fn(
+                reading.poll_time, lst_offset=offset,
+            )
+        elif reading.temp_f > state.running_high_f:
+            # Tiny increase (≤0.1°F) — track new max but don't reset stability
+            # clock (sample noise, not a real new high).
             state.running_high_f = reading.temp_f
 
         # -- Update last temp --

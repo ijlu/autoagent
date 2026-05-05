@@ -283,11 +283,14 @@ def test_materialize_due_dedups_iem_per_city_date(conn, fake_iem):
 
 def test_materialize_due_idempotent_under_repeat_runs(conn, fake_iem):
     # 2026-04-29: was hrrr+nbm; nbm dropped from GAUSSIAN_COMBINE_SOURCES
-    # (Open-Meteo proxy duplicate). Swap to hrrr+weather (also in combine).
+    # (Open-Meteo proxy duplicate). Was hrrr+weather then.
+    # 2026-05-05: weather also dropped (corr 0.99-1.00 with hrrr — same
+    # Open-Meteo proxy issue as nbm). Swap to hrrr+ecmwf — both in
+    # combine, low cross-correlation, valid materialization targets.
     ticker = "KXHIGHMIA-26APR18-B84.5"
     _populate_full_ticker(
         conn, ticker, recorded_at="2026-04-18T08:00:00Z",
-        source_means={"hrrr": 85.0, "weather": 84.5},
+        source_means={"hrrr": 85.0, "ecmwf": 84.5},
     )
     fake_iem.responses[("KMIA", "2026-04-18")] = 86.0
 
@@ -304,11 +307,12 @@ def test_materialize_due_idempotent_under_repeat_runs(conn, fake_iem):
 
 
 def test_materialize_due_iem_miss_soft_skips_and_retries(conn, fake_iem):
-    # 2026-04-29: was hrrr+nbm; same swap as above.
+    # 2026-04-29: was hrrr+nbm; 2026-05-05: weather also dropped; swap
+    # to hrrr+ecmwf (both in combine).
     ticker = "KXHIGHCHI-26APR20-T55"
     _populate_full_ticker(
         conn, ticker, recorded_at="2026-04-20T08:00:00Z",
-        source_means={"hrrr": 56.0, "weather": 55.5},
+        source_means={"hrrr": 56.0, "ecmwf": 55.5},
     )
     # Pass 1: IEM has no response → soft skip
     s1 = materialize_due(conn, today_iso="2026-04-25")
@@ -443,10 +447,13 @@ def test_fit_and_persist_skill_curves_writes_kv(tmp_path):
     _seed_backfill_for_skill(conn, n_days=20)
 
     stats = fit_and_persist_skill_curves(conn)
-    # 3 sources × (1 pooled + 1 per-city for "nyc") = 6 fits
-    assert stats["buckets_fitted"] == 6
-    assert stats["keys_written"] == 6
-    assert stats["city_keys_written"] == 3
+    # 2026-05-05: weather dropped from GAUSSIAN_COMBINE_SOURCES (corr 0.99-1.00
+    # with hrrr — Open-Meteo proxy). Of the 4 seeded sources, only hrrr +
+    # nws_point survive the live-source filter (nbm dropped 2026-04-29,
+    # weather dropped 2026-05-05). 2 sources × (pooled + per-city "nyc") = 4 fits.
+    assert stats["buckets_fitted"] == 4
+    assert stats["keys_written"] == 4
+    assert stats["city_keys_written"] == 2
     assert stats["buckets_thin"] == 0
 
     pooled = kv_get(conn, "weather_skill_hrrr_6_24")

@@ -79,6 +79,22 @@ def project_gaussian_above(mu: float, sigma: float, threshold: float) -> float:
     return max(0.005, min(0.995, p))
 
 
+# 2026-05-05 (Phase 3d): conviction gate — require model probability of
+# the side we'd buy to exceed this threshold before firing. Without this,
+# a bracket boundary case (e.g., NY high lands at 72.0°F = boundary of
+# B72.5 [72, 74)) gives p_yes ≈ 0.45 which the strategy would interpret
+# as "edge_no = 0.55 - market_no_price" and fire NO at high price. The
+# market knows the high landed at 72 (it's seen METAR) and has priced
+# YES at 86%. We have no edge — we have a coin flip with the market
+# disagreeing about magnitude. Skip.
+#
+# 0.65 chosen so that NO leg fires only when model thinks NO has at
+# least 65% probability — i.e., model has a clear directional view.
+# Cross-bracket's value comes from confident disagreements with the
+# market, not magnitude disputes on coin-flips.
+_CONVICTION_THRESHOLD: float = 0.65
+
+
 def _decide_leg(
     p_yes: float,
     yes_bid: Optional[int], yes_ask: Optional[int],
@@ -90,13 +106,16 @@ def _decide_leg(
     """Return (action, side, price_cents, skip_reason) for one bracket.
 
     YES side: buy YES at yes_ask if (our_p_yes - yes_ask/100) >= min_edge
+              AND p_yes >= _CONVICTION_THRESHOLD (strong YES conviction)
     NO side: buy NO at no_ask = 100 - yes_bid
-             if ((1 - our_p_yes) - no_ask/100) >= min_edge
+              if ((1 - our_p_yes) - no_ask/100) >= min_edge
+              AND (1 - p_yes) >= _CONVICTION_THRESHOLD (strong NO conviction)
 
-    The strength of cross-bracket is exactly the case where we're
-    confident YES (or NO) will happen and the market disagrees — i.e.,
-    extreme p_yes values. So no prediction-tail filter; price-band
-    guards (min/max_price_cents on the trade side) handle penny risk.
+    Cross-bracket is designed for confident disagreements with the
+    market. The conviction gate prevents firing on bracket-boundary
+    coin-flips where p_yes ≈ 0.5 — the market may know more than we
+    do via real-time METAR, and we shouldn't bet against it without
+    a clear directional view.
     """
     edge_yes = None
     edge_no = None
@@ -113,7 +132,13 @@ def _decide_leg(
     best_edge = 0.0
     skip_reason = None
 
-    if edge_yes is not None and edge_yes > best_edge and edge_yes >= min_edge:
+    p_no = 1.0 - p_yes
+
+    yes_passes_conviction = p_yes >= _CONVICTION_THRESHOLD
+    no_passes_conviction = p_no >= _CONVICTION_THRESHOLD
+
+    if (edge_yes is not None and edge_yes > best_edge
+            and edge_yes >= min_edge and yes_passes_conviction):
         if min_price_cents <= yes_ask <= max_price_cents:
             best_action = "buy_yes"
             best_side = "yes"
@@ -121,7 +146,8 @@ def _decide_leg(
             best_edge = edge_yes
         else:
             skip_reason = f"yes_ask_{yes_ask}c_outside_band"
-    if edge_no is not None and edge_no > best_edge and edge_no >= min_edge:
+    if (edge_no is not None and edge_no > best_edge
+            and edge_no >= min_edge and no_passes_conviction):
         no_ask_cents = 100 - yes_bid
         if min_price_cents <= no_ask_cents <= max_price_cents:
             best_action = "buy_no"
@@ -132,15 +158,23 @@ def _decide_leg(
             skip_reason = f"no_ask_{no_ask_cents}c_outside_band"
 
     if best_action == "skip" and skip_reason is None:
-        # Both sides had insufficient edge. Either edge can be None when the
-        # corresponding quote leg is missing (one-sided market) — format only
-        # the legs we have.
+        # Both sides had insufficient edge or conviction. Annotate which.
         if edge_yes is None and edge_no is None:
             skip_reason = "no_market_quote"
         else:
             ey = f"{edge_yes:+.3f}" if edge_yes is not None else "n/a"
             en = f"{edge_no:+.3f}" if edge_no is not None else "n/a"
-            skip_reason = f"edge_yes={ey} edge_no={en} min={min_edge:.3f}"
+            # Add conviction context — distinguishes "edge too small" from
+            # "no directional view" so post-mortems can tell them apart.
+            conv_tag = ""
+            if not yes_passes_conviction and not no_passes_conviction:
+                conv_tag = (
+                    f" conviction_fail(p_yes={p_yes:.2f}<{_CONVICTION_THRESHOLD}"
+                    f" p_no={p_no:.2f}<{_CONVICTION_THRESHOLD})"
+                )
+            skip_reason = (
+                f"edge_yes={ey} edge_no={en} min={min_edge:.3f}{conv_tag}"
+            )
 
     return (best_action, best_side, best_price, skip_reason)
 

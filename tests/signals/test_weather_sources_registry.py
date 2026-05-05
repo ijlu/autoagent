@@ -57,19 +57,20 @@ def test_registry_contents_pinned():
     # observations free, no auth, no rate limit.
     # 2026-05-02: nws_5min_diurnal + nws_5min_analog added — both
     # forecasters built on top of the same 5-min observation feed.
+    # 2026-05-05: `weather` removed from live combine — corr(hrrr, weather)
+    # = 0.994 (NY) / 1.000 (LAX); both Open-Meteo (gfs_hrrr vs default
+    # blend = GFS in US). See reports/POSTFIX_REASSESSMENT_2026-05-05.md.
     assert GAUSSIAN_COMBINE_SOURCES == frozenset({
-        "hrrr", "nws_point", "weather", "metar",
+        "hrrr", "nws_point", "metar",
         "icon", "ukmo",
         "gem", "metno", "ecmwf",
         "nws_5min", "nws_5min_diurnal",
-        # 2026-05-02: nws_5min_analog demoted to SHADOW (registered
-        # in CANONICAL but not in the live combine) — feature-vintage
-        # bug + insufficient regime coverage. See weather_sources.py
-        # for the full rationale.
     })
     assert "nws_5min_analog" in CANONICAL_WEATHER_SOURCES
     assert "nws_5min_analog" not in GAUSSIAN_COMBINE_SOURCES
     assert "iem_1min" not in GAUSSIAN_COMBINE_SOURCES
+    assert "weather" in CANONICAL_WEATHER_SOURCES
+    assert "weather" not in GAUSSIAN_COMBINE_SOURCES
     assert NBM not in GAUSSIAN_COMBINE_SOURCES
     assert MADIS not in GAUSSIAN_COMBINE_SOURCES
 

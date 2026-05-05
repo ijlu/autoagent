@@ -47,19 +47,21 @@ def _market():
 
 
 class TestCollectGaussiansSourceList:
-    def test_eleven_sources_called(self):
+    def test_ten_sources_called(self):
         """Patching every getter to return None should result in exactly
-        11 sources being attempted.
+        10 sources being attempted.
 
         2026-05-02: nws_5min_diurnal added — METAR's diurnal fit
         applied to the 5-min observation feed.
 
         2026-05-02 (later): nws_5min_analog removed from live combine.
-        Post-deploy probe revealed the AVG-across-ticker-lifetime
-        feature collapsed to long-range outlooks rather than the
-        morning-of consensus, AND only 35 historical days were
-        available, peaks 78-88°F vs today's 93-95°F regime. Module
-        retained for re-enable after vintage refactor + more history.
+
+        2026-05-05: `weather` removed from live combine. Per-city scorecard
+        analysis showed corr(hrrr, weather) = 0.994 (NY) / 1.000 (LAX) at
+        peak window — both are Open-Meteo (gfs_hrrr vs default blend; the
+        default blend IS GFS for US lat/lons). Was duplicating the HRRR
+        signal and halving the effective weight of every other source.
+        See reports/POSTFIX_REASSESSMENT_2026-05-05.md.
 
         IEM 1-min is intentionally absent — IEM's asos1min.py endpoint
         has ~24h publication latency."""
@@ -77,7 +79,6 @@ class TestCollectGaussiansSourceList:
         with patch("bot.signals.sources.hrrr.get_hrrr_gaussian", make_getter("hrrr")), \
              patch("bot.signals.sources.metar_observations.get_metar_gaussian", make_getter("metar")), \
              patch("bot.signals.sources.nws_point.get_nws_point_gaussian", make_getter("nws_point")), \
-             patch("bot.signals.sources.weather.get_weather_gaussian", make_getter("weather")), \
              patch("bot.signals.sources.icon.get_icon_gaussian", make_getter("icon")), \
              patch("bot.signals.sources.ukmo.get_ukmo_gaussian", make_getter("ukmo")), \
              patch("bot.signals.sources.gem.get_gem_gaussian", make_getter("gem")), \
@@ -92,9 +93,24 @@ class TestCollectGaussiansSourceList:
         assert sorted(called) == [
             "ecmwf", "gem", "hrrr", "icon", "metar", "metno",
             "nws_5min", "nws_5min_diurnal",
-            "nws_point", "ukmo", "weather",
+            "nws_point", "ukmo",
         ], (
-            f"Expected 11 sources, got {sorted(called)}"
+            f"Expected 10 sources, got {sorted(called)}"
+        )
+
+    def test_weather_not_in_getters_tuple(self):
+        """`weather` (Open-Meteo default blend) must NOT be a live combine
+        source — it duplicates HRRR (Open-Meteo gfs_hrrr) at corr 0.99-1.00.
+        See reports/POSTFIX_REASSESSMENT_2026-05-05.md. Re-add only as a
+        snapshot-only monitor, never to the combine."""
+        import re, inspect
+        src = inspect.getsource(v2._collect_gaussians)
+        live = "\n".join(
+            ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert not re.search(r'\(\s*"weather"\s*,', live), (
+            "`weather` re-added to live combine. It duplicates HRRR — "
+            "both are Open-Meteo with the default model = GFS for US."
         )
 
     def test_analog_not_in_live_combine(self):
