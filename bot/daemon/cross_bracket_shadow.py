@@ -11,10 +11,14 @@ Live mode is OFF by default and gated by TWO independent switches:
 Both must pass; either being false keeps the family in shadow.
 
 Additional safety rails (all configurable, see ``bot/config.py``):
-  - TTE window: live trading only fires for portfolios where the
-    decision time is within (``CROSS_BRACKET_MIN_TTE_HOURS``,
-    ``CROSS_BRACKET_MAX_TTE_HOURS``) — defaults 3-7h pre-settle,
-    matching the 96-100% WR backtest band.
+  - LST + stability gate (PRIMARY entry filter): per-city
+    ``is_post_peak_safe(lst_hour, stability_hours)`` from
+    ``bot.learning.cross_bracket_lst_gate``. See Phase 3e in
+    reports/POSTFIX_REASSESSMENT_2026-05-05.md.
+  - TTE backstop: ``CROSS_BRACKET_MIN_TTE_HOURS`` (0.5h) prevents posting
+    minutes before settle; ``CROSS_BRACKET_MAX_TTE_HOURS`` (24h)
+    sanity ceiling. The LST gate is doing the actual entry-window
+    work; TTE is now belt-and-suspenders.
   - Per-leg contract cap: ``CROSS_BRACKET_MAX_CONTRACTS_PER_LEG`` (default 1).
   - Per-portfolio leg cap: ``CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO`` (default 4).
   - Edge floor (live-only, separate from the shadow scorer's 0.07):
@@ -372,6 +376,12 @@ def _is_live_eligible_window(settlement_key: str) -> tuple[bool, float]:
     Hours-to-settle is computed from settlement_key. Returns (False, -1)
     on parse failure (fail-closed — won't trade live for unparseable
     keys).
+
+    2026-05-06 (Phase 3e cleanup): this is now a belt-and-suspenders
+    check, NOT the primary entry gate. The real entry gate is the
+    per-city LST+stability check ``_is_in_lst_gate``. TTE thresholds
+    are 0.5h (min — don't post at-settle) and 24h (max — skip
+    next-day-or-later tickers, redundant with LST gate's date check).
     """
     settle_unix = _settlement_unix_from_key(settlement_key)
     if settle_unix is None:
@@ -692,14 +702,18 @@ def _process_decisions(
             leg_can_go_live = False
             live_skip_reason = "family_not_live"
             stats["live_skipped_family_off"] += 1
-        elif not in_tte_window:
-            leg_can_go_live = False
-            live_skip_reason = f"tte_{hours_to_settle:.1f}h_outside_band"
-            stats["live_skipped_tte"] += 1
         elif not in_lst_window:
+            # Primary entry gate (Phase 3e): per-city LST + stability.
+            # See _is_in_lst_gate / is_post_peak_safe.
             leg_can_go_live = False
             live_skip_reason = lst_reason
             stats["live_skipped_lst"] = stats.get("live_skipped_lst", 0) + 1
+        elif not in_tte_window:
+            # Belt-and-suspenders: 0.5h floor avoids posting at-settle;
+            # 24h ceiling is redundant with LST gate's date check.
+            leg_can_go_live = False
+            live_skip_reason = f"tte_{hours_to_settle:.1f}h_outside_backstop"
+            stats["live_skipped_tte"] += 1
         elif leg_edge < CROSS_BRACKET_LIVE_MIN_EDGE:
             leg_can_go_live = False
             live_skip_reason = (

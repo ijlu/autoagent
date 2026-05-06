@@ -74,14 +74,22 @@ CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO = int(
 CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS = int(
     os.environ.get("CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS", "500")
 )
-# TTE window (hours pre-settle) where cross-bracket has demonstrated
-# alpha. Outside this window the strategy is shadow-only regardless
-# of live flags. The 4-6h band is where the 96-100% WR was measured.
+# TTE backstop bounds. As of 2026-05-06 (Phase 3e cleanup) the primary
+# entry filter is the per-city LST+stability gate
+# (bot.learning.cross_bracket_lst_gate.is_post_peak_safe), NOT TTE.
+# These values are belt-and-suspenders only:
+#   - MIN 0.5h: don't post orders that arrive within 30min of settle
+#     (Kalshi may stop accepting + settlement timing edge cases).
+#   - MAX 24h: skip next-day-or-later tickers — but the LST gate
+#     ``cur_lst_date == target_lst_date`` check already enforces this
+#     more precisely. Wide ceiling avoids suppressing legitimate
+#     marine-layer-city opportunities (e.g., LAX always_arm@LST 14 =
+#     TTE ~9h, below the old 7h cap).
 CROSS_BRACKET_MIN_TTE_HOURS = float(
-    os.environ.get("CROSS_BRACKET_MIN_TTE_HOURS", "3.0")
+    os.environ.get("CROSS_BRACKET_MIN_TTE_HOURS", "0.5")
 )
 CROSS_BRACKET_MAX_TTE_HOURS = float(
-    os.environ.get("CROSS_BRACKET_MAX_TTE_HOURS", "7.0")
+    os.environ.get("CROSS_BRACKET_MAX_TTE_HOURS", "24.0")
 )
 # Edge floor (we already gate at 0.07 in score_market_portfolio, but
 # the live path can be tightened further). Higher than shadow's gate
