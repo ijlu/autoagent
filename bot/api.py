@@ -10,8 +10,10 @@ import time
 from urllib.parse import urlparse
 
 import requests
+from cachetools import TTLCache
 
 from bot.config import KEY_ID, KEY_PATH, HOST, RATE_LIMITS
+from bot.daemon.locks import API_LOCK
 
 # Lazy import cryptography — only needed for Kalshi API auth, not for data source HTTP
 _hashes = _serialization = _padding = None
@@ -41,21 +43,31 @@ def _get_private_key():
 
 
 def _sign(method: str, path: str) -> dict:
+    """Produce RSA-PSS-signed Kalshi API headers.
+
+    Thread-safety: signing is CPU-bound but must be paired atomically with the
+    timestamp (Kalshi's clock-skew window is tight — a stale ts + fresh sig is
+    rejected). Take API_LOCK so concurrent callers don't interleave timestamps
+    and signatures. Under the GIL this is almost unobservable in CPython, but
+    the lock makes correctness explicit and is required when we move to
+    free-threaded CPython later.
+    """
     _ensure_crypto()
-    ts_ms = str(int(time.time() * 1000))
-    msg = (ts_ms + method.upper() + path).encode()
-    pk = _get_private_key()
-    sig = pk.sign(
-        msg,
-        _padding.PSS(mgf=_padding.MGF1(_hashes.SHA256()), salt_length=_padding.PSS.MAX_LENGTH),
-        _hashes.SHA256(),
-    )
-    return {
-        "KALSHI-ACCESS-KEY": KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
-        "Content-Type": "application/json",
-    }
+    with API_LOCK:
+        ts_ms = str(int(time.time() * 1000))
+        msg = (ts_ms + method.upper() + path).encode()
+        pk = _get_private_key()
+        sig = pk.sign(
+            msg,
+            _padding.PSS(mgf=_padding.MGF1(_hashes.SHA256()), salt_length=_padding.PSS.MAX_LENGTH),
+            _hashes.SHA256(),
+        )
+        return {
+            "KALSHI-ACCESS-KEY": KEY_ID,
+            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+            "Content-Type": "application/json",
+        }
 
 
 def api_get(path: str) -> dict:
@@ -104,7 +116,15 @@ _RATE_HISTORY: dict[str, list[float]] = {}
 
 
 def rate_limit_wait(url: str) -> None:
-    """Enforce per-domain rate limiting. Blocks until safe to request."""
+    """Enforce per-domain rate limiting. Blocks until safe to request.
+
+    Thread-safety: mutates shared _RATE_HISTORY dict. Take API_LOCK for the
+    read-decide-append phase so two threads can't both see "burst headroom
+    available" at the same instant and blast through the limit. The time.sleep
+    happens INSIDE the lock — that's intentional; concurrent senders should
+    queue at the rate limit rather than all charge through as soon as the
+    limit allows one.
+    """
     domain = urlparse(url).hostname or ""
 
     matched_key = None
@@ -117,34 +137,41 @@ def rate_limit_wait(url: str) -> None:
         return
 
     min_interval, max_burst = RATE_LIMITS[matched_key]
-    now = time.time()
 
-    if matched_key not in _RATE_HISTORY:
-        _RATE_HISTORY[matched_key] = []
+    with API_LOCK:
+        now = time.time()
 
-    history = _RATE_HISTORY[matched_key]
-    window = max_burst * min_interval
-    history[:] = [t for t in history if now - t < window]
+        if matched_key not in _RATE_HISTORY:
+            _RATE_HISTORY[matched_key] = []
 
-    if len(history) >= max_burst:
-        wait_until = history[0] + window
-        sleep_time = wait_until - now
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-    elif history:
-        time_since_last = now - history[-1]
-        if time_since_last < min_interval:
-            time.sleep(min_interval - time_since_last)
+        history = _RATE_HISTORY[matched_key]
+        window = max_burst * min_interval
+        history[:] = [t for t in history if now - t < window]
 
-    _RATE_HISTORY[matched_key].append(time.time())
+        if len(history) >= max_burst:
+            wait_until = history[0] + window
+            sleep_time = wait_until - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        elif history:
+            time_since_last = now - history[-1]
+            if time_since_last < min_interval:
+                time.sleep(min_interval - time_since_last)
+
+        _RATE_HISTORY[matched_key].append(time.time())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HTTP helpers for external data sources
 # ══════════════════════════════════════════════════════════════════════════════
 
-_CACHE: dict[str, tuple] = {}
-CACHE_TTL = 60  # seconds
+CACHE_TTL = 60  # seconds — matches prior behavior
+_CACHE_MAXSIZE = 500  # bounded so a 30-day daemon can't OOM
+
+# Thread-safe bounded TTL cache. Reads and writes must both be inside API_LOCK
+# because TTLCache's internal expire() pass and __setitem__ are not safe to
+# interleave with concurrent reads on the same instance.
+_CACHE: TTLCache = TTLCache(maxsize=_CACHE_MAXSIZE, ttl=CACHE_TTL)
 
 _DEFAULT_HEADERS = {
     "User-Agent": "KalshiTradingBot/1.0 (contact: bot@example.com)",
@@ -153,10 +180,18 @@ _DEFAULT_HEADERS = {
 
 
 def cached_get(key: str, url: str, timeout: int = 5, headers: dict = None):
-    """GET with in-memory cache, per-domain rate limiting, and retry on transient errors."""
-    now = time.time()
-    if key in _CACHE and now - _CACHE[key][1] < CACHE_TTL:
-        return _CACHE[key][0]
+    """GET with in-memory cache, per-domain rate limiting, and retry on transient errors.
+
+    Cache is a thread-safe, size-bounded, TTL-expiring TTLCache. Two reasons
+    for the bound: (1) a long-running daemon must not accumulate unbounded
+    entries, (2) TTLCache's LRU eviction keeps hot keys warm even under churn.
+    """
+    # Fast path: check cache under lock.
+    with API_LOCK:
+        try:
+            return _CACHE[key]
+        except KeyError:
+            pass
     if not url:
         return None
     max_retries = 2
@@ -172,7 +207,8 @@ def cached_get(key: str, url: str, timeout: int = 5, headers: dict = None):
                 print(f"[http] {key} → HTTP {r.status_code} from {url.split('?')[0]}")
                 return None
             data = r.json()
-            _CACHE[key] = (data, now)
+            with API_LOCK:
+                _CACHE[key] = data
             return data
         except Exception as e:
             if attempt < max_retries:

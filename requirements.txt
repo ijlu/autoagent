@@ -1,0 +1,9 @@
+# Kalshi trading bot — runtime dependencies.
+# Pinned loosely; any recent patch version is fine.
+# Install on VPS: python3 -m pip install --break-system-packages -r requirements.txt
+
+requests>=2.31
+cryptography>=41
+cachetools>=5.3      # bounded TTL cache for data-source HTTP responses (Phase 1)
+openai>=1.0          # GPT-4o-mini fallback source
+python-dotenv>=1.0

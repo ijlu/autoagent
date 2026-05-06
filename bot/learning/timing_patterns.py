@@ -9,7 +9,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from bot.learning.adaptive_weights import _parse_sources_from_strategy
-from bot.market_maker.selection import categorize_market
+from bot.core.categorization import categorize_market
+from bot.db import db_write_ctx
 
 
 def record_timing_data(conn):
@@ -43,27 +44,26 @@ def record_timing_data(conn):
         return 0
 
     recorded = 0
-    for oid, ticker, won, profit, trade_ts, strategy, edge in all_rows:
-        try:
-            dt = datetime.fromisoformat(trade_ts.replace("Z", "+00:00"))
-        except Exception:
-            continue
+    with db_write_ctx(conn):
+        for oid, ticker, won, profit, trade_ts, strategy, edge in all_rows:
+            try:
+                dt = datetime.fromisoformat(trade_ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
 
-        hour_utc = dt.hour
-        dow = dt.weekday()  # 0=Monday
-        cat = categorize_market(ticker, "")
+            hour_utc = dt.hour
+            dow = dt.weekday()  # 0=Monday
+            cat = categorize_market(ticker, "")
 
-        # Extract primary source from strategy string
-        sources = _parse_sources_from_strategy(strategy)
-        primary_source = sources[0] if sources else "unknown"
+            # Extract primary source from strategy string
+            sources = _parse_sources_from_strategy(strategy)
+            primary_source = sources[0] if sources else "unknown"
 
-        conn.execute("""INSERT INTO timing_patterns
-            (recorded_at, order_id, hour_utc, day_of_week, category, source, edge, won, profit_cents)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (now_str, oid, hour_utc, dow, cat, primary_source, edge, won, profit))
-        recorded += 1
-
-    conn.commit()
+            conn.execute("""INSERT INTO timing_patterns
+                (recorded_at, order_id, hour_utc, day_of_week, category, source, edge, won, profit_cents)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (now_str, oid, hour_utc, dow, cat, primary_source, edge, won, profit))
+            recorded += 1
 
     # Analyze timing patterns if we have enough data
     if recorded > 0:

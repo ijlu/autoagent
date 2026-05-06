@@ -29,9 +29,13 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 # New modular sources — import from bot package if available
 try:
-    from bot.signals.sources.metar_observations import get_metar_observation_estimate
+    from bot.signals.sources.metar_observations import (
+        get_metar_observation_estimate,
+        is_metar_fresh_for_ticker as _is_metar_fresh_for_ticker,
+    )
 except ImportError:
     get_metar_observation_estimate = None
+    _is_metar_fresh_for_ticker = None
 try:
     from bot.signals.sources.fedwatch import get_fedwatch_estimate
 except ImportError:
@@ -75,10 +79,49 @@ SINGLE_SOURCE_EDGE = float(os.environ.get("SINGLE_SOURCE_EDGE", "0.12"))  # 12% 
 MAX_PER_CATEGORY   = int(os.environ.get("MAX_PER_CATEGORY", "2"))        # max concurrent positions per risk category
 MAX_PORTFOLIO_PCT  = float(os.environ.get("MAX_PORTFOLIO_PCT", "0.15"))   # max 15% of balance in open positions
 
+# ── Immutable initial-config snapshot ─────────────────────────────────────────
+# Captured once at module import. apply_phase_limits() and the active-feedback
+# block MUST derive effective values from these, not from the current mutated
+# globals, otherwise each daemon cycle compounds the multiplication and drives
+# KELLY→0 / MIN_EDGE→∞ as process lifetime grows. See tests/test_config_no_drift.py.
+_INITIAL_DRY_RUN          = DRY_RUN
+_INITIAL_MAX_POSITION_PCT = MAX_POSITION_PCT
+_INITIAL_MAX_PORTFOLIO_PCT = MAX_PORTFOLIO_PCT
+_INITIAL_MAX_CONTRACTS    = MAX_CONTRACTS
+_INITIAL_KELLY_FRACTION   = KELLY_FRACTION
+_INITIAL_MIN_EDGE         = MIN_EDGE
+_INITIAL_SINGLE_SOURCE_EDGE = SINGLE_SOURCE_EDGE
+
 # Fee accounting: use exact Kalshi formulas from bot/core/money.py
 # Old flat estimate ESTIMATED_FEE_PER_CONTRACT=0.03 was ~3-7x too high for maker orders.
 # Now we compute price-dependent fees: maker entry + taker exit per contract.
 from bot.core.money import fee_per_contract_cents as _fee_per_contract_cents
+from bot.learning.alpha_log import (
+    DecisionOutcome as _AlphaOutcome,
+    DecisionType as _AlphaType,
+    EnsembleSnapshot as _AlphaEnsemble,
+    fill_settlement_for_ticker as _alpha_fill_settlement,
+    log_decision as _alpha_log_decision,
+    market_snapshot_from_dict as _alpha_market_snapshot,
+    to_canonical_p_yes as _to_canonical_p_yes,
+)
+from bot.learning.populate_from_alpha import populate_all as _alpha_populate_all
+from bot.learning.directional_shadow import (
+    ShadowOutcome as _ShadowOutcome,
+    evaluate as _eval_directional_shadow,
+    get_kelly_multiplier as _get_kelly_multiplier,
+    get_live_state as _get_live_state,
+    LiveState as _LiveState,
+)
+from bot.learning.alpha_log import family_from_ticker as _family_from_ticker
+from bot.learning.calibration import (
+    apply_calibration as _apply_calibration,
+    apply_calibration_correction,
+    compute_calibration_correction,
+    fit_and_persist as _cal_fit_and_persist,
+    load_curve as _cal_load_curve,
+    reset_cache as _cal_reset_cache,
+)
 ESTIMATED_EXIT_SPREAD = float(os.environ.get("ESTIMATED_EXIT_SPREAD", "0.03"))  # 3¢ expected exit slippage
 
 def _round_trip_fee_dollars(price_dollars: float) -> float:
@@ -111,21 +154,12 @@ def log_opportunity(conn, ticker, strategy, action, side=None, ensemble_prob=Non
     except Exception:
         pass  # Never let logging break the trading loop
 
-# Market making config (separate from directional DRY_RUN so MM can go live in Phase 1)
-MM_ENABLED       = os.environ.get("MM_ENABLED", "true").lower() in ("true", "1", "yes")
-MM_DRY_RUN       = os.environ.get("MM_DRY_RUN", "true").lower() in ("true", "1", "yes")
-MM_MIN_SPREAD    = int(os.environ.get("MM_MIN_SPREAD_CENTS", "4"))
-MM_HALF_SPREAD   = int(os.environ.get("MM_HALF_SPREAD_CENTS", "2"))
-MM_MAX_INVENTORY = int(os.environ.get("MM_MAX_INVENTORY", "50"))
-MM_MAX_MARKETS   = int(os.environ.get("MM_MAX_MARKETS", "10"))
-MM_CAPITAL_PCT   = float(os.environ.get("MM_CAPITAL_PCT", "0.10"))
-MM_ORDER_SIZE    = int(os.environ.get("MM_ORDER_SIZE", "10"))
-MM_SKEW_PER_10   = int(os.environ.get("MM_SKEW_PER_10", "2"))
-MM_MIN_VOLUME    = int(os.environ.get("MM_MIN_VOLUME", "25"))
-MM_ORDER_TAG     = "mm_v1"
-MM_PREFERRED_CATS = {"weather", "climate", "economics"}  # crypto, sports, company removed — crypto/index too fast for 2min cron
+# Market making config was deleted in Phase 0 of the MM-deletion pivot (2026-04-16).
+# Negative P&L after 813 fills + 69 losing settlements forced the decision to remove
+# the entire market-maker package. See /Users/jlu/.claude/plans/elegant-petting-dawn.md
+# for the roadmap. If we ever want MM back it will be a new, from-scratch project.
 
-# Safe Compounder config (separate from MM and directional)
+# Safe Compounder config (separate from directional)
 SC_ENABLED       = os.environ.get("SC_ENABLED", "true").lower() in ("true", "1", "yes")
 SC_DRY_RUN       = os.environ.get("SC_DRY_RUN", "true").lower() in ("true", "1", "yes")
 
@@ -207,26 +241,32 @@ def compute_current_phase(conn):
     return current_phase, PHASE_CONFIG[current_phase], stats
 
 def apply_phase_limits(phase_num, phase_cfg):
-    """Apply phase-specific limits to global config variables.
-    Returns a dict of the effective limits for logging."""
+    """Derive phase-adjusted trading limits from the immutable INITIAL snapshot.
+
+    This function is idempotent: calling it N times in a long-lived daemon with
+    the same inputs always produces the same output. It never reads the current
+    mutated globals, so per-cycle multiplications cannot compound over the
+    process lifetime. Globals are still *written* (for read-compat with the
+    rest of trade.py) but always from _INITIAL_* values.
+
+    Returns a dict of the effective limits for logging and downstream threading.
+    """
     global DRY_RUN, MAX_POSITION_PCT, MAX_PORTFOLIO_PCT, MAX_CONTRACTS
     global KELLY_FRACTION, MIN_EDGE, SINGLE_SOURCE_EDGE
 
     _, _, max_pos_pct, max_port_pct, max_contracts, kelly_mult, edge_mult, desc = phase_cfg
 
     # DIRECTIONAL TRADING DISABLED (V4): losing -$93.93 at 16% win rate.
-    # Force DRY_RUN=True for all phases so directional orders never go live.
-    # MM is unaffected (uses MM_DRY_RUN separately).
     DRY_RUN = True
 
-    # Apply limits — never exceed what the phase allows, but respect
-    # user-configured values if they're MORE conservative
-    MAX_POSITION_PCT = min(MAX_POSITION_PCT, max_pos_pct)
-    MAX_PORTFOLIO_PCT = min(MAX_PORTFOLIO_PCT, max_port_pct)
-    MAX_CONTRACTS = min(MAX_CONTRACTS, max_contracts)
-    KELLY_FRACTION = KELLY_FRACTION * kelly_mult
-    MIN_EDGE = MIN_EDGE * edge_mult
-    SINGLE_SOURCE_EDGE = SINGLE_SOURCE_EDGE * edge_mult
+    # Take the more conservative of (user-configured initial, phase cap).
+    MAX_POSITION_PCT = min(_INITIAL_MAX_POSITION_PCT, max_pos_pct)
+    MAX_PORTFOLIO_PCT = min(_INITIAL_MAX_PORTFOLIO_PCT, max_port_pct)
+    MAX_CONTRACTS = min(_INITIAL_MAX_CONTRACTS, max_contracts)
+    # Multiplicative params derive from INITIAL, not current globals.
+    KELLY_FRACTION = _INITIAL_KELLY_FRACTION * kelly_mult
+    MIN_EDGE = _INITIAL_MIN_EDGE * edge_mult
+    SINGLE_SOURCE_EDGE = _INITIAL_SINGLE_SOURCE_EDGE * edge_mult
 
     effective = {
         "phase": phase_num, "description": desc,
@@ -241,7 +281,7 @@ def apply_phase_limits(phase_num, phase_cfg):
 from bot.config import compute_dynamic_sizing  # noqa: E402
 
 
-print(f"[trade.py] HOST={HOST}  DRY_RUN={DRY_RUN}  MM_DRY_RUN={MM_DRY_RUN}  "
+print(f"[trade.py] HOST={HOST}  DRY_RUN={DRY_RUN}  "
       f"KELLY={KELLY_FRACTION}x  MIN_EDGE={MIN_EDGE}  SINGLE_SRC_EDGE={SINGLE_SOURCE_EDGE}")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -358,35 +398,58 @@ def prune_stale_orders():
 
 def _init_position_health_table(conn):
     """Create position_health_log table for bandit learning on exit decisions."""
-    conn.execute("""CREATE TABLE IF NOT EXISTS position_health_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        ticker TEXT NOT NULL,
-        side TEXT NOT NULL,
-        quantity INTEGER,
-        health_score REAL,
-        remaining_edge REAL,
-        edge_trend REAL,
-        action TEXT,          -- hold, graduated_trim, graduated_half, etc.
-        exit_qty INTEGER,
-        settlement_result TEXT DEFAULT NULL,  -- filled post-settlement for learning
-        settlement_pnl_cents INTEGER DEFAULT NULL
-    )""")
-    conn.commit()
+    with db_write_ctx(conn):
+        conn.execute("""CREATE TABLE IF NOT EXISTS position_health_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER,
+            health_score REAL,
+            remaining_edge REAL,
+            edge_trend REAL,
+            action TEXT,          -- hold, graduated_trim, graduated_half, etc.
+            exit_qty INTEGER,
+            settlement_result TEXT DEFAULT NULL,  -- filled post-settlement for learning
+            settlement_pnl_cents INTEGER DEFAULT NULL
+        )""")
+        # Idempotent column adds — exit-model + calibration analysis need fresh_prob
+        # and source-count trajectories, not just the composite edge snapshot.
+        for col, coltype in (
+            ("fresh_prob", "REAL"),
+            ("fresh_source_count", "INTEGER"),
+            ("entry_edge", "REAL"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE position_health_log ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass  # column exists
 
 
 def _log_position_health(conn, ticker, side, quantity, health,
-                          remaining_edge, trend, action, exit_qty):
-    """Log a position health evaluation for future bandit learning."""
+                          remaining_edge, trend, action, exit_qty,
+                          fresh_prob=None, fresh_source_count=None,
+                          entry_edge=None):
+    """Log a position health evaluation for future bandit learning.
+
+    fresh_prob / fresh_source_count capture the ensemble's current FV so the
+    trajectory can be reconstructed per position. entry_edge is the edge at
+    the time we opened the position — needed by the edge-decay exit model
+    (task 4) to compute remaining_edge / entry_edge ratios.
+    """
     try:
-        conn.execute("""INSERT INTO position_health_log
-            (timestamp, ticker, side, quantity, health_score, remaining_edge,
-             edge_trend, action, exit_qty)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (datetime.now(timezone.utc).isoformat(), ticker, side, quantity,
-             round(health, 4), round(remaining_edge, 4),
-             round(trend, 4), action, exit_qty))
-        conn.commit()
+        with db_write_ctx(conn):
+            conn.execute("""INSERT INTO position_health_log
+                (timestamp, ticker, side, quantity, health_score, remaining_edge,
+                 edge_trend, action, exit_qty,
+                 fresh_prob, fresh_source_count, entry_edge)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.now(timezone.utc).isoformat(), ticker, side, quantity,
+                 round(health, 4), round(remaining_edge, 4),
+                 round(trend, 4), action, exit_qty,
+                 round(fresh_prob, 4) if fresh_prob is not None else None,
+                 fresh_source_count,
+                 round(entry_edge, 4) if entry_edge is not None else None))
     except Exception as e:
         print(f"[health] log_position_health failed: {e}")
 
@@ -402,15 +465,10 @@ def manage_positions(conn, dynamic_sizing=None):
     if not positions:
         print("[positions] No open positions"); return 0
 
-    # Build set of tickers managed by MM — manage_positions() must NOT touch these
-    # because its exit orders aren't tracked in mm_orders and would desync mm_inventory.
-    mm_tickers = set()
-    try:
-        mm_rows = conn.execute(
-            "SELECT ticker FROM mm_inventory WHERE net_position != 0").fetchall()
-        mm_tickers = {r[0] for r in mm_rows}
-    except Exception as e:
-        print(f"[positions] mm_inventory query failed: {e}")
+    # Legacy MM positions: MM code has been deleted but mm_inventory rows may still
+    # hold contracts from the pre-deletion era. Those positions now fall through to
+    # manage_positions() like any other directional holding — they settle naturally.
+    # The mm_inventory table is retained for historical analytics only.
 
     now = datetime.now(timezone.utc)
     exits = 0
@@ -422,10 +480,6 @@ def manage_positions(conn, dynamic_sizing=None):
         side     = "yes" if pos_val > 0 else "no"
         quantity = abs(pos_val)
         if quantity == 0: continue
-
-        # Skip tickers managed by MM — their exits go through mm_liquidate_expiring()
-        if ticker in mm_tickers:
-            continue
 
         # Get current market price for this position
         try:
@@ -448,15 +502,20 @@ def manage_positions(conn, dynamic_sizing=None):
         exit_price = yes_bid if side == "yes" else no_bid
         if exit_price <= 0: continue
 
-        # Look up entry price from our trades DB
+        # Look up entry price + entry edge from our trades DB. entry_edge
+        # feeds the edge-decay exit model (task 4) and lets the bandit
+        # learn remaining_edge / entry_edge ratios at settlement.
         trade = conn.execute(
-            "SELECT price_cents, timestamp FROM trades WHERE ticker=? AND side=? AND action='buy' ORDER BY id DESC LIMIT 1",
+            "SELECT price_cents, timestamp, edge FROM trades "
+            "WHERE ticker=? AND side=? AND action='buy' ORDER BY id DESC LIMIT 1",
             (ticker, side)
         ).fetchone()
 
+        entry_edge = None
         if trade:
             entry_price = trade[0] / 100  # cents to fraction
             entry_time  = trade[1]
+            entry_edge = trade[2]  # float or None
         else:
             # Fallback: use position's average cost if available
             entry_price = float(pos.get("average_price_paid") or pos.get("market_exposure") or 0)
@@ -582,7 +641,10 @@ def manage_positions(conn, dynamic_sizing=None):
                           f"— SETTLEMENT CERTAINTY HOLD")
                     _log_position_health(conn, ticker, side, quantity,
                                          our_prob, remaining_edge, 0.0,
-                                         "settlement_hold", 0)
+                                         "settlement_hold", 0,
+                                         fresh_prob=fresh_prob,
+                                         fresh_source_count=fresh_n,
+                                         entry_edge=entry_edge)
                     continue  # skip to next position
 
             # Time decay multiplier: require more edge as expiry approaches
@@ -614,6 +676,37 @@ def manage_positions(conn, dynamic_sizing=None):
                 if avg_earlier != 0:
                     trend_score = max(-1, min(1, (avg_recent - avg_earlier) / max(abs(avg_earlier), 0.01)))
 
+            # ── Edge-decay hard trigger ─────────────────────────────────
+            # Runs before the composite health score when entry_edge is
+            # available. Inverted-thesis and decayed-below-floor exits are
+            # the semantic anchor; time + stale backstops cover frozen-
+            # ensemble failure modes. Composite health-score still applies
+            # when entry_edge is missing (older positions, shadow-only).
+            if entry_edge is not None and fresh_prob is not None and fresh_n > 0:
+                from bot.core.exit_model import evaluate_edge_decay_exit
+                from bot.config import (
+                    EXIT_EDGE_DECAY_RATIO, EXIT_TIME_BACKSTOP_HOURS,
+                    EXIT_TIME_BACKSTOP_EDGE_ABS, EXIT_STALE_HOLD_HOURS,
+                )
+                _decay_dec = evaluate_edge_decay_exit(
+                    entry_edge=entry_edge,
+                    remaining_edge=remaining_edge,
+                    hours_to_expiry=hours_to_expiry,
+                    hours_held=days_held * 24.0,
+                    trend_score=trend_score,
+                    decay_ratio=EXIT_EDGE_DECAY_RATIO,
+                    time_backstop_hours=EXIT_TIME_BACKSTOP_HOURS,
+                    time_backstop_edge_abs=EXIT_TIME_BACKSTOP_EDGE_ABS,
+                    stale_hold_hours=EXIT_STALE_HOLD_HOURS,
+                )
+                if _decay_dec.trigger is not None:
+                    exit_reason = f"edge_decay_{_decay_dec.trigger}: {_decay_dec.detail}"
+                    # Urgency: flipped edge is most urgent (thesis inverted),
+                    # decayed is moderate, backstops patient.
+                    exit_urgency = (2 if _decay_dec.trigger == "edge_flipped"
+                                    else 1 if _decay_dec.trigger == "edge_decayed"
+                                    else 0)
+
             # Source confidence factor: more sources = more trust in the estimate
             confidence = min(1.0, fresh_n / 3.0) if fresh_n > 0 else 0.3
 
@@ -637,7 +730,13 @@ def manage_positions(conn, dynamic_sizing=None):
                       0.10 * confidence)
 
             # ── Map health to action ──
-            if health >= 0.65:
+            # Edge-decay trigger (above) may have already set exit_reason.
+            # When it has, skip the health-score branching so we exit at
+            # the semantically-anchored reason rather than re-deriving from
+            # the composite — and exit_qty stays at the default (full exit).
+            if exit_reason:
+                pass  # fall through to exit-execution below
+            elif health >= 0.65:
                 # Healthy — hold
                 print(f"[positions] {ticker} {side} x{quantity}: "
                       f"entry={entry_price:.2f} now={exit_price:.2f} pnl={pnl_pct:+.0%} "
@@ -646,7 +745,10 @@ def manage_positions(conn, dynamic_sizing=None):
                       f"held={days_held:.1f}d — HOLD")
                 # Log health for learning
                 _log_position_health(conn, ticker, side, quantity, health,
-                                     remaining_edge, trend_score, "hold", 0)
+                                     remaining_edge, trend_score, "hold", 0,
+                                     fresh_prob=fresh_prob,
+                                     fresh_source_count=fresh_n,
+                                     entry_edge=entry_edge)
                 continue
             elif health >= 0.45 and quantity > _trim_thresh:
                 # Moderate — trim 25-33% (only if position is large enough)
@@ -718,7 +820,9 @@ def manage_positions(conn, dynamic_sizing=None):
         if side == "yes":
             # Exiting YES → buy NO.  NO price = 100 - yes_bid.
             # Urgency adjusts how much above ask we're willing to pay.
-            base_no_price = max(1, 100 - int(yes_bid * 100))
+            # round(), not int(): avoids 1¢ misprice from float underflow
+            # (CLAUDE.md §5 — fixed-point parsing).
+            base_no_price = max(1, 100 - round(yes_bid * 100))
             if exit_urgency >= 2:
                 opp_price_cents = min(99, base_no_price + 3)
             elif exit_urgency == 1:
@@ -727,7 +831,7 @@ def manage_positions(conn, dynamic_sizing=None):
                 opp_price_cents = min(99, base_no_price)
         else:
             # Exiting NO → buy YES.  YES price = 100 - no_bid.
-            base_yes_price = max(1, 100 - int(no_bid * 100))
+            base_yes_price = max(1, 100 - round(no_bid * 100))
             if exit_urgency >= 2:
                 opp_price_cents = min(99, base_yes_price + 3)
             elif exit_urgency == 1:
@@ -739,6 +843,10 @@ def manage_positions(conn, dynamic_sizing=None):
         error = None
         if not DRY_RUN:
             try:
+                # mm_exit_ prefix: fills writer's source_tagger routes this to
+                # `exit`. Periods stripped per Kalshi constraint (CLAUDE.md
+                # §Known Bug Pattern #1).
+                client_id = f"mm_exit_{ticker.replace('.', '_')}_{int(time.time())}"
                 order_body = {
                     "ticker": ticker,
                     "side": opp_side,
@@ -747,6 +855,7 @@ def manage_positions(conn, dynamic_sizing=None):
                     ("yes_price" if opp_side == "yes" else "no_price"): opp_price_cents,
                     "action": "buy",
                     "expiration_ts": int(time.time() + ORDER_MAX_AGE_HOURS * 3600),
+                    "client_order_id": client_id,
                 }
                 # Urgency 0: patient exit — post_only to get maker fee, rests at ask
                 # Urgency 1+: must cross the spread to fill — no post_only
@@ -767,15 +876,18 @@ def manage_positions(conn, dynamic_sizing=None):
         # Log for bandit learning
         _log_position_health(conn, ticker, side, exit_qty,
                              health, remaining_edge, trend_score,
-                             exit_reason.split(":")[0], exit_qty)
+                             exit_reason.split(":")[0], exit_qty,
+                             fresh_prob=fresh_prob,
+                             fresh_source_count=fresh_n,
+                             entry_edge=entry_edge)
 
-        conn.execute("""INSERT INTO position_exits
-            (timestamp, ticker, side, entry_price_cents, exit_price_cents,
-             contracts, exit_reason, order_id, error)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (now.isoformat(), ticker, side, int(entry_price * 100),
-             opp_price_cents, quantity, exit_reason, order_id, error))
-        conn.commit()
+        with db_write_ctx(conn):
+            conn.execute("""INSERT INTO position_exits
+                (timestamp, ticker, side, entry_price_cents, exit_price_cents,
+                 contracts, exit_reason, order_id, error)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (now.isoformat(), ticker, side, round(entry_price * 100),
+                 opp_price_cents, quantity, exit_reason, order_id, error))
         exits += 1
 
     print(f"[positions] {exits} exit orders placed")
@@ -785,15 +897,20 @@ def manage_positions(conn, dynamic_sizing=None):
 # INFORMATION LAYER — independent probability estimates from external sources
 # ══════════════════════════════════════════════════════════════════════════════
 import re, math
+from cachetools import TTLCache
 
-# Shared cache: {key: (value, timestamp)}
-_CACHE = {}
-CACHE_TTL = 60  # seconds
+# Shared cache: {key: (value, timestamp)} — bounded TTLCache so the long-running
+# daemon can't OOM via unbounded growth (CLAUDE.md Known Bug Pattern #12).
+# maxsize is generous; ttl here matches the longest manual-TTL check below
+# (60-min vol cache) so the cachetools layer is a backstop, not the primary
+# eviction mechanism (call sites still do their own time-since-write check).
+CACHE_TTL = 60  # seconds — primary TTL used by manual checks at call sites
+_CACHE = TTLCache(maxsize=4096, ttl=3600)
 
 # ── Persistent cache (SQLite) — canonical implementation in bot/db ──────
 import json as _json_mod  # kept for other uses in trade.py
 
-from bot.db import kv_get as _db_cache_get, kv_set as _db_cache_set, kv_cleanup as _db_cache_cleanup  # noqa: E402
+from bot.db import kv_get as _db_cache_get, kv_set as _db_cache_set, kv_cleanup as _db_cache_cleanup, db_write_ctx  # noqa: E402
 
 # ── Rate limiter: per-domain minimum interval between requests ───────────
 _RATE_LIMITS = {
@@ -3095,7 +3212,59 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
     If adaptive_weights is provided (dict of source→weight), uses learned weights
     instead of static SOURCE_WEIGHTS. If calibration_corrections is provided,
     applies bias correction to the final ensemble output.
+
+    Weather short-circuit: when ``WEATHER_ENSEMBLE_V2`` is enabled and this is
+    a weather ticker, bypass the per-source probability collection and Platt
+    calibration entirely — call ``predict_v2`` directly. Reasoning:
+      * ``predict_v2`` produces a properly-combined Gaussian estimate with
+        per-city skill σ, MOS bias, group correlation discount, staleness
+        inflation, running-high truncation, and clamp.
+      * The probability-space combine in this function is lossier than v2's
+        Bayesian Gaussian combine.
+      * The Platt calibration was fit on historical v1 outputs and would
+        re-introduce a known bias if applied to v2. Skipping it is correct.
     """
+    from bot.config import WEATHER_ENSEMBLE_V2
+
+    ticker_upper = (ticker or "").upper()
+    is_weather_ticker = (
+        ticker_upper.startswith("KXHIGH")
+        or ticker_upper.startswith("KXHMONTHRANGE")
+        or ticker_upper.startswith("KXHURR")
+    )
+    if WEATHER_ENSEMBLE_V2 and is_weather_ticker and market_data is not None:
+        try:
+            from bot.signals.weather_ensemble_v2 import (
+                predict_v2,
+                _collect_gaussians,
+            )
+            v2_prob, v2_tag = predict_v2(ticker, market_data)
+            if v2_prob is not None:
+                # Source count: how many Gaussians actually fired. Used
+                # downstream by edge-threshold logic (more sources → smaller
+                # required edge). predict_v2's tag has the form
+                # "weather_ensemble_v2:hrrr+nbm+nws_point+weather+metar+madis+afd"
+                # so the contributor count is plus-separated tokens after the
+                # colon. Cap at the count of independent groups.
+                n_contributors = 1
+                if v2_tag and ":" in v2_tag:
+                    contributor_tokens = v2_tag.split(":", 1)[1].split("+")
+                    n_contributors = max(1, len(contributor_tokens))
+                # Treat HRRR/NBM/Open-Meteo as one effective group (group ρ
+                # is 1.0 in the model-correlation kv). So the number of
+                # *independent* opinions feeding v2 is at most:
+                #   model_group(1) + nws_point + metar + madis + afd → up to 5.
+                # Cap to that so a downstream "n_sources >= 3" gate doesn't
+                # treat the three correlated models as three separate votes.
+                n_independent = min(n_contributors, 5)
+                print(f"[weather_v2] {ticker} → p={v2_prob:.3f} via {v2_tag}")
+                return v2_prob, v2_tag, n_independent
+        except Exception as exc:
+            # Fall through to v1 path on any failure — never leave the caller
+            # without an estimate.
+            print(f"[weather_v2] {ticker} predict_v2 raised "
+                  f"{type(exc).__name__}: {exc}; falling back to v1")
+
     weights = adaptive_weights if adaptive_weights else SOURCE_WEIGHTS
     estimates = []  # list of (prob, weight, source_name)
 
@@ -3280,28 +3449,37 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
         base = s.split(":")[0] if ":" in s else s.split("_")[0]
         source_names.add(base.lower())
 
-    # Count effective sources: each correlated group counts as 1 effective source
-    claimed_by_group = set()
-    n_effective = 0.0
-    for group_name, group_members in _CORRELATED_GROUPS.items():
-        overlap = source_names & group_members
-        if len(overlap) >= 2:
-            # Multiple correlated sources → count as 1.0 (no bonus for correlated data)
-            n_effective += 1.0
-            claimed_by_group |= overlap
-        elif len(overlap) == 1:
-            n_effective += 1.0
-            claimed_by_group |= overlap
-    # Add ungrouped sources at full weight
-    ungrouped = source_names - claimed_by_group
-    n_effective += len(ungrouped)
+    # Count effective sources: each correlated group counts as 1 effective source.
+    # Use canonical "claim by first matching group" semantics from
+    # bot.signals.ensemble._compute_n_effective — a source that appears in
+    # multiple groups (e.g. `fred` ∈ cpi ∩ fed) must be counted ONCE, not N
+    # times. Old in-line loop here had the same double-count bug fixed in
+    # commit adf884d for bot/signals/ensemble.py but never propagated to this
+    # local copy. CLAUDE.md Known Bug Pattern #9.
+    try:
+        from bot.signals.ensemble import _compute_n_effective
+        n_effective = _compute_n_effective(source_names, _CORRELATED_GROUPS)
+    except Exception:
+        # Fallback: inline the same algorithm so a future import-time failure
+        # never reverts to the buggy double-count behavior.
+        claimed = set()
+        n_effective = 0.0
+        for _, group_members in _CORRELATED_GROUPS.items():
+            overlap = (source_names & group_members) - claimed
+            if overlap:
+                n_effective += 1.0
+                claimed |= overlap
+        ungrouped = source_names - claimed
+        n_effective += len(ungrouped)
 
     n_sources = max(1, round(n_effective))  # integer for backward compat
 
     # Apply calibration correction if we have learned biases
     raw_prob = ensemble_prob
     if calibration_corrections:
-        ensemble_prob = apply_calibration_correction(ensemble_prob, calibration_corrections)
+        corrected = _apply_calibration(ensemble_prob, calibration_corrections, ticker=ticker)
+        if corrected is not None:
+            ensemble_prob = corrected
         if abs(ensemble_prob - raw_prob) > 0.001:
             print(f"[calibration] Corrected {raw_prob:.3f} → {ensemble_prob:.3f} "
                   f"(correction={ensemble_prob - raw_prob:+.3f})")
@@ -3351,138 +3529,197 @@ def record_settlements(conn):
     skipped_personal = 0
     skipped_dup = 0
     skipped_notours = 0
+    shadow_rows_annotated = 0  # Phase 1 weather-MM shadow annotation counter
+    shadow_tickers_annotated = 0
     _settlement_alerts = []  # large losses to alert on
     now_str = datetime.now(timezone.utc).isoformat()
 
-    for s in settlements:
-        ticker = s.get("ticker", "")
-        if not ticker:
-            continue
+    with db_write_ctx(conn):
+        for s in settlements:
+            ticker = s.get("ticker", "")
+            if not ticker:
+                continue
 
-        # Skip personal/manual trades
-        ticker_upper = ticker.upper()
-        if any(ticker_upper.startswith(pfx) for pfx in _PERSONAL_PREFIXES):
-            skipped_personal += 1
-            continue
+            # Skip personal/manual trades
+            ticker_upper = ticker.upper()
+            if any(ticker_upper.startswith(pfx) for pfx in _PERSONAL_PREFIXES):
+                skipped_personal += 1
+                continue
 
-        # Use ticker as unique key (one settlement per ticker per account)
-        if conn.execute("SELECT 1 FROM settlements WHERE ticker=? AND order_id LIKE 'settlement_%'",
-                        (ticker,)).fetchone():
-            skipped_dup += 1
-            continue
+            # ─── Phase 1: annotate weather_mm_shadow for EVERY settled ticker ───
+            # Must run BEFORE the dup-skip and bot-position gate below: shadow-only
+            # tickers (WEATHER_MM_LIVE=false) never enter `settlements` nor `mm_orders`,
+            # so if we gate on those we never annotate any shadow rows and the
+            # promotion gate's `ts_settle_unix IS NOT NULL` filter never matches.
+            # annotate_shadow_pnl is idempotent (WHERE ts_settle_unix IS NULL) and
+            # no-ops for non-weather tickers, so running it unconditionally is safe.
+            result_early = s.get("market_result", "")
+            if result_early in ("yes", "no"):
+                try:
+                    from bot.learning.mm_promotion import annotate_shadow_pnl
+                    _n_annot = annotate_shadow_pnl(
+                        conn, ticker,
+                        won_yes=(result_early == "yes"),
+                        ts_settle_unix=time.time(),
+                    )
+                    if _n_annot:
+                        shadow_rows_annotated += int(_n_annot)
+                        shadow_tickers_annotated += 1
+                except Exception as e:
+                    print(f"[mm_promotion] annotate failed for {ticker}: {e}")
 
-        # Check if this ticker was traded by the bot (mm_orders or trades table)
-        # For MM trades, use AVG(price_cents) as actual entry cost, not fair_value_cents
-        mm_row = conn.execute(
-            "SELECT AVG(price_cents), tag FROM mm_orders WHERE ticker=? AND fill_qty > 0",
-            (ticker,)).fetchone()
-        dir_row = conn.execute(
-            "SELECT price_cents, strategy, independent_prob FROM trades WHERE ticker=? LIMIT 1",
-            (ticker,)).fetchone()
+            # Use ticker as unique key (one settlement per ticker per account)
+            if conn.execute("SELECT 1 FROM settlements WHERE ticker=? AND order_id LIKE 'settlement_%'",
+                            (ticker,)).fetchone():
+                skipped_dup += 1
+                continue
 
-        # Also check safe_compounder_orders
-        sc_row = None
-        try:
-            sc_row = conn.execute(
-                "SELECT no_price_cents FROM safe_compounder_orders WHERE ticker=? AND settled=0 LIMIT 1",
+            # Check if this ticker was traded by the bot (mm_orders or trades table)
+            # For MM trades, use AVG(price_cents) as actual entry cost, not fair_value_cents
+            mm_row = conn.execute(
+                "SELECT AVG(price_cents), tag FROM mm_orders WHERE ticker=? AND fill_qty > 0",
                 (ticker,)).fetchone()
-        except Exception:
-            pass  # table might not exist yet
-
-        if mm_row and mm_row[0] is not None:
-            strat = "mm:" + (mm_row[1] or "mm_v1")
-            est_prob = None
-            pc = int(mm_row[0])  # AVG actual fill price, not fair value
-        elif sc_row:
-            strat = "safe_compounder"
-            est_prob = None
-            pc = sc_row[0]
-        elif dir_row:
-            pc = dir_row[0]
-            strat = dir_row[1]
-            est_prob = dir_row[2]
-        else:
-            # Not in our DB — might be a personal trade or from before bot started
-            skipped_notours += 1
-            continue
-
-        # Parse settlement data from Kalshi API
-        revenue = int(s.get("revenue", 0))
-        result = s.get("market_result", "")  # "yes" or "no"
-        yes_count = float(s.get("yes_count_fp", 0))
-        no_count = float(s.get("no_count_fp", 0))
-        yes_cost = float(s.get("yes_total_cost_dollars", 0)) * 100  # to cents
-        no_cost = float(s.get("no_total_cost_dollars", 0)) * 100
-        # Fee from Kalshi API (dollars → cents)
-        fee_raw = s.get("fee_cost") or s.get("fee_cost_dollars") or 0
-        fee_cents = float(fee_raw) * 100 if fee_raw and float(fee_raw) < 100 else float(fee_raw or 0)
-        contracts = int(round(yes_count + no_count))
-        total_cost = int(yes_cost + no_cost)
-
-        # Profit = revenue - cost - fees (V5: was missing fee subtraction)
-        profit = revenue - total_cost - int(fee_cents)
-        # Won = profit > 0 (V5: was revenue > 0, which ignores fees and can mislabel)
-        won = 1 if profit > 0 else 0
-
-        # Determine side from position
-        side = "yes" if yes_count > no_count else "no"
-
-        # Use "settlement_<ticker>" as settlement key
-        settlement_id = f"settlement_{ticker}"
-
-        conn.execute("""INSERT OR IGNORE INTO settlements
-            (recorded_at, order_id, ticker, side, price_cents, contracts,
-             revenue_cents, profit_cents, won, volume, spread_cents, strategy)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_str, settlement_id, ticker, side,
-             pc, contracts, revenue, profit, won, None, None, strat))
-
-        # Record calibration data for directional trades with estimates
-        if est_prob is not None:
-            bucket = _prob_bucket(est_prob)
-            conn.execute("""INSERT INTO calibration
-                (recorded_at, ticker, estimated_prob, actual_outcome, source_desc, n_sources, bucket)
-                VALUES (?,?,?,?,?,?,?)""",
-                (now_str, ticker, est_prob, won, strat, None, bucket))
-        elif mm_row and mm_row[0] is not None:
-            # MM trades: use AVG(fair_value_cents)/100 as estimated probability
-            mm_fv = conn.execute(
-                "SELECT AVG(fair_value_cents) FROM mm_orders WHERE ticker=? AND fill_qty > 0",
+            dir_row = conn.execute(
+                "SELECT price_cents, strategy, independent_prob FROM trades WHERE ticker=? LIMIT 1",
                 (ticker,)).fetchone()
-            if mm_fv and mm_fv[0] is not None:
-                mm_est_prob = mm_fv[0] / 100.0
-                mm_bucket = _prob_bucket(mm_est_prob)
+
+            # Also check safe_compounder_orders
+            sc_row = None
+            try:
+                sc_row = conn.execute(
+                    "SELECT no_price_cents FROM safe_compounder_orders WHERE ticker=? AND settled=0 LIMIT 1",
+                    (ticker,)).fetchone()
+            except Exception:
+                pass  # table might not exist yet
+
+            if mm_row and mm_row[0] is not None:
+                strat = "mm:" + (mm_row[1] or "mm_v1")
+                est_prob = None
+                pc = int(mm_row[0])  # AVG actual fill price, not fair value
+            elif sc_row:
+                strat = "safe_compounder"
+                est_prob = None
+                pc = sc_row[0]
+            elif dir_row:
+                pc = dir_row[0]
+                strat = dir_row[1]
+                est_prob = dir_row[2]
+            else:
+                # Not in our DB — might be a personal trade or from before bot started
+                skipped_notours += 1
+                continue
+
+            # Parse settlement data from Kalshi API
+            revenue = int(s.get("revenue", 0))
+            result = s.get("market_result", "")  # "yes" or "no"
+            yes_count = float(s.get("yes_count_fp", 0))
+            no_count = float(s.get("no_count_fp", 0))
+            yes_cost = float(s.get("yes_total_cost_dollars", 0)) * 100  # to cents
+            no_cost = float(s.get("no_total_cost_dollars", 0)) * 100
+            # Fee from Kalshi API (dollars → cents)
+            fee_raw = s.get("fee_cost") or s.get("fee_cost_dollars") or 0
+            fee_cents = float(fee_raw) * 100 if fee_raw and float(fee_raw) < 100 else float(fee_raw or 0)
+            contracts = int(round(yes_count + no_count))
+            # Use round(), not int(): dollars→cents float conversion can produce
+            # 28.9999... from "0.29" which int() truncates to 28. Matches the
+            # "Fixed-point parsing" known-bug pattern (CLAUDE.md §5).
+            total_cost = round(yes_cost + no_cost)
+
+            # Profit = revenue - cost - fees (V5: was missing fee subtraction)
+            profit = revenue - total_cost - round(fee_cents)
+            # Won = profit > 0 (V5: was revenue > 0, which ignores fees and can mislabel)
+            won = 1 if profit > 0 else 0
+
+            # Determine side from position
+            side = "yes" if yes_count > no_count else "no"
+
+            # Use "settlement_<ticker>" as settlement key
+            settlement_id = f"settlement_{ticker}"
+
+            conn.execute("""INSERT OR IGNORE INTO settlements
+                (recorded_at, order_id, ticker, side, price_cents, contracts,
+                 revenue_cents, profit_cents, won, volume, spread_cents, strategy)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (now_str, settlement_id, ticker, side,
+                 pc, contracts, revenue, profit, won, None, None, strat))
+
+            # Back-fill position_health_log so the bandit can train on which
+            # health-band decisions held winning vs losing positions. Stamp every
+            # prior health log for this ticker with the final settlement outcome.
+            if result in ("yes", "no"):
+                try:
+                    conn.execute(
+                        "UPDATE position_health_log "
+                        "SET settlement_result=?, settlement_pnl_cents=? "
+                        "WHERE ticker=? AND settlement_result IS NULL",
+                        (result, profit, ticker),
+                    )
+                except Exception as e:
+                    print(f"[health] position_health_log backfill failed for {ticker}: {e}")
+
+            # Mark matching alpha_backtest shadow rows settled (both sides). Uses
+            # counterfactual P&L per row — this is the Phase 1 gate input.
+            if result in ("yes", "no"):
+                try:
+                    _alpha_fill_settlement(conn, ticker=ticker, settlement_result=result)
+                except Exception as e:
+                    print(f"[alpha_log] fill failed for {ticker}: {e}")
+
+            # (Phase 1 shadow annotation moved above the bot-position gate so
+            # it runs for shadow-only tickers too — see comment on result_early.)
+
+            # Record calibration data for directional trades with estimates
+            if est_prob is not None:
+                bucket = _prob_bucket(est_prob)
                 conn.execute("""INSERT INTO calibration
                     (recorded_at, ticker, estimated_prob, actual_outcome, source_desc, n_sources, bucket)
                     VALUES (?,?,?,?,?,?,?)""",
-                    (now_str, ticker, mm_est_prob, won, strat, None, mm_bucket))
+                    (now_str, ticker, est_prob, won, strat, None, bucket))
+            elif mm_row and mm_row[0] is not None:
+                # MM trades: use AVG(fair_value_cents)/100 as estimated probability
+                # fv-mixed-side-ok: storage convention is P(YES) on both YES and NO
+                # rows, so AVG of identical values returns P(YES) — exactly what
+                # the calibration table needs (CLAUDE.md Known Bug Pattern #13).
+                mm_fv = conn.execute(
+                    "SELECT AVG(fair_value_cents) FROM mm_orders WHERE ticker=? AND fill_qty > 0",
+                    (ticker,)).fetchone()
+                if mm_fv and mm_fv[0] is not None:
+                    mm_est_prob = mm_fv[0] / 100.0
+                    mm_bucket = _prob_bucket(mm_est_prob)
+                    conn.execute("""INSERT INTO calibration
+                        (recorded_at, ticker, estimated_prob, actual_outcome, source_desc, n_sources, bucket)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (now_str, ticker, mm_est_prob, won, strat, None, mm_bucket))
 
-        # Zero mm_inventory for settled tickers (canonical settlement path)
-        # This is the ONLY place inventory should be zeroed for settlements
-        try:
-            conn.execute(
-                "UPDATE mm_inventory SET net_position=0, realized_pnl_cents = realized_pnl_cents + ? WHERE ticker=?",
-                (profit, ticker))
-        except Exception as e:
-            print(f"[settlement] mm_inventory zero failed for {ticker}: {e}")
+            # Zero mm_inventory for settled tickers (canonical settlement path)
+            # This is the ONLY place inventory should be zeroed for settlements
+            try:
+                conn.execute(
+                    "UPDATE mm_inventory SET net_position=0, realized_pnl_cents = realized_pnl_cents + ? WHERE ticker=?",
+                    (profit, ticker))
+            except Exception as e:
+                print(f"[settlement] mm_inventory zero failed for {ticker}: {e}")
 
-        # Mark Safe Compounder orders as settled
-        try:
-            conn.execute(
-                "UPDATE safe_compounder_orders SET settled=1, settlement_pnl_cents=? WHERE ticker=? AND settled=0",
-                (profit, ticker))
-        except Exception as e:
-            print(f"[settlement] SC settle failed for {ticker}: {e}")
+            # Mark Safe Compounder orders as settled
+            try:
+                conn.execute(
+                    "UPDATE safe_compounder_orders SET settled=1, settlement_pnl_cents=? WHERE ticker=? AND settled=0",
+                    (profit, ticker))
+            except Exception as e:
+                print(f"[settlement] SC settle failed for {ticker}: {e}")
 
-        recorded += 1
-        # Track large losses for Telegram alert
-        if profit < -50:  # loss > 50¢
-            _settlement_alerts.append({"ticker": ticker, "profit_cents": profit})
+            recorded += 1
+            # Track large losses for Telegram alert
+            if profit < -50:  # loss > 50¢
+                _settlement_alerts.append({"ticker": ticker, "profit_cents": profit})
 
-    if recorded > 0:
-        conn.commit()
     print(f"[learn] Settlements: {recorded} recorded, {skipped_personal} personal (skipped), "
           f"{skipped_notours} not ours, {skipped_dup} already recorded")
+    # Phase 1: surface shadow annotation activity so a silent-zero regression
+    # (like the one diagnosed 2026-04-22) shows up in cron.log instead of only
+    # in the DB. Logged unconditionally — zero IS the signal we want visible.
+    print(f"[mm_promotion] shadow annotate: {shadow_rows_annotated} rows across "
+          f"{shadow_tickers_annotated} tickers")
 
     # Stash alerts for main() to pick up
     if _settlement_alerts:
@@ -3496,8 +3733,21 @@ def record_settlements(conn):
     return recorded
 
 def compute_avoid_filters(conn):
-    filters = {"low_volume_threshold": None, "wide_spread_threshold": None,
-               "avoided_strategies": set(), "avoided_prefixes": set(), "summary": []}
+    """Kept in-sync with ``bot/scoring/filters.py:compute_avoid_filters``.
+
+    **2026-04-22 audit fix:** prefix avoidance is now partitioned by
+    strategy (``avoided_by_strategy``) so MM losses on a prefix stop
+    vetoing that prefix for every other strategy. See the sibling
+    docstring in ``bot/scoring/filters.py`` for full rationale.
+    """
+    filters = {
+        "low_volume_threshold": None,
+        "wide_spread_threshold": None,
+        "avoided_strategies": set(),
+        "avoided_by_strategy": {},
+        "avoided_prefixes": set(),
+        "summary": [],
+    }
     rows = conn.execute(
         "SELECT volume, spread_cents, strategy, ticker, won FROM settlements WHERE recorded_at > datetime('now', '-30 days')"
     ).fetchall()
@@ -3521,22 +3771,29 @@ def compute_avoid_filters(conn):
             msg += f" → AVOID"
         filters["summary"].append(msg); print(msg)
 
-    strat_map, prefix_map = {}, {}
+    strat_map, strat_prefix_map = {}, {}
     for vol, sp, strat, tick, won in rows:
         if strat: strat_map.setdefault(strat, []).append(won)
-        if tick: prefix_map.setdefault(tick[:6], []).append(won)
+        if strat and tick:
+            strat_prefix_map.setdefault((strat, tick[:6]), []).append(won)
     for strat, outcomes in strat_map.items():
         if len(outcomes) < MIN_SAMPLE_SIZE: continue
         wr = sum(outcomes)/len(outcomes)
         msg = f"  strat[{strat[:20]}] wr={wr:.0%} n={len(outcomes)}"
         if wr < MIN_WIN_RATE: filters["avoided_strategies"].add(strat); msg += " → AVOID"
         filters["summary"].append(msg); print(msg)
-    for pfx, outcomes in prefix_map.items():
+    for (strat, pfx), outcomes in strat_prefix_map.items():
         if len(outcomes) < MIN_SAMPLE_SIZE: continue
         wr = sum(outcomes)/len(outcomes)
-        msg = f"  prefix[{pfx}] wr={wr:.0%} n={len(outcomes)}"
-        if wr < MIN_WIN_RATE: filters["avoided_prefixes"].add(pfx); msg += " → AVOID"
+        msg = f"  strat[{strat[:20]}] prefix[{pfx}] wr={wr:.0%} n={len(outcomes)}"
+        if wr < MIN_WIN_RATE:
+            filters["avoided_by_strategy"].setdefault(strat, set()).add(pfx)
+            msg += " → AVOID"
         filters["summary"].append(msg); print(msg)
+    # Derived legacy union for any un-migrated callers.
+    filters["avoided_prefixes"] = {
+        pfx for pfxs in filters["avoided_by_strategy"].values() for pfx in pfxs
+    }
 
     # ── Calibration analysis: are our probability estimates accurate? ──────
     # Group settled trades by estimated probability bucket and check if
@@ -3575,7 +3832,8 @@ def compute_avoid_filters(conn):
 # what actually worked vs. what didn't.
 
 _LEARNED_WEIGHTS = None   # cached per run
-_CALIBRATION_CURVE = None # cached per run
+# _CALIBRATION_CURVE moved to bot.learning.calibration._CURVE_CACHE;
+# reset_cache() is called at the top of each cycle.
 _CATEGORY_EDGES = None    # cached per run
 
 def _parse_sources_from_strategy(strategy_str):
@@ -3663,59 +3921,8 @@ def compute_adaptive_weights(conn):
     _LEARNED_WEIGHTS = adjusted
     return adjusted
 
-def compute_calibration_correction(conn):
-    """Build a calibration curve that corrects systematic bias in our estimates.
-    If we estimate 70% but actual outcomes are 55%, we should adjust down.
-    Returns a dict of {bucket: correction_offset} to apply to ensemble output."""
-    global _CALIBRATION_CURVE
-    if _CALIBRATION_CURVE is not None:
-        return _CALIBRATION_CURVE
-
-    MIN_CAL_SAMPLES = 5  # per bucket
-
-    rows = conn.execute(
-        "SELECT bucket, estimated_prob, actual_outcome FROM calibration WHERE bucket IS NOT NULL"
-    ).fetchall()
-
-    if len(rows) < 20:
-        _CALIBRATION_CURVE = {}
-        return _CALIBRATION_CURVE
-
-    buckets = {}
-    for bucket, est, actual in rows:
-        buckets.setdefault(bucket, []).append((est, actual))
-
-    corrections = {}
-    for bucket, entries in sorted(buckets.items()):
-        if len(entries) < MIN_CAL_SAMPLES:
-            continue
-        avg_est = sum(e for e, _ in entries) / len(entries)
-        actual_rate = sum(a for _, a in entries) / len(entries)
-        bias = avg_est - actual_rate
-
-        # Only correct if bias is significant (>5%) and we have enough data
-        if abs(bias) > 0.05 and len(entries) >= MIN_CAL_SAMPLES:
-            # Apply partial correction (50% of observed bias) to be conservative
-            # Full correction would overfit to small samples
-            corrections[bucket] = -bias * 0.5
-            direction = "overconfident" if bias > 0 else "underconfident"
-            print(f"[calibration] {bucket}: {direction} by {abs(bias):.1%} "
-                  f"(est={avg_est:.2f} vs actual={actual_rate:.2f}, n={len(entries)}) "
-                  f"→ correction={corrections[bucket]:+.3f}")
-
-    _CALIBRATION_CURVE = corrections
-    return corrections
-
-def apply_calibration_correction(ensemble_prob, calibration_corrections):
-    """Apply learned calibration correction to an ensemble probability estimate."""
-    if not calibration_corrections or ensemble_prob is None:
-        return ensemble_prob
-    bucket = _prob_bucket(ensemble_prob)
-    correction = calibration_corrections.get(bucket, 0)
-    if correction == 0:
-        return ensemble_prob
-    corrected = max(0.02, min(0.98, ensemble_prob + correction))
-    return corrected
+# compute_calibration_correction + apply_calibration_correction moved to
+# bot.learning.calibration (unified Platt implementation). Imported at top.
 
 def compute_category_edge_thresholds(conn):
     """Learn per-category minimum edge thresholds from settlement data.
@@ -3955,56 +4162,55 @@ def run_loss_postmortems(conn):
         return 0
 
     classified = 0
-    for (oid, ticker, revenue, profit, settle_price, contracts,
-         est_prob, mkt_prob, edge, strategy, entry_price) in losses:
+    with db_write_ctx(conn):
+        for (oid, ticker, revenue, profit, settle_price, contracts,
+             est_prob, mkt_prob, edge, strategy, entry_price) in losses:
 
-        loss_type = "unknown"
-        detail = ""
-        title = ""
-        cat = categorize_market(ticker, title)
-
-        if est_prob is not None and mkt_prob is not None and edge is not None:
-            # How wrong were we?
-            # Compare our estimate to what the market was pricing at entry.
-            # A large gap (est >> market) that still lost = bad source signal.
-            estimation_error = est_prob - mkt_prob  # our estimate vs market consensus
-
-            if abs(estimation_error) > 0.30:
-                loss_type = "bad_source"
-                detail = (f"Estimated {est_prob:.0%} probability but lost. "
-                         f"Sources: {strategy}. Major estimation failure.")
-            elif edge is not None and abs(edge) < 0.07:
-                # Fee calculation: exit slippage + price-dependent round-trip fees
-                fee_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(mkt_prob)
-                if edge > 0 and edge < fee_cost:
-                    loss_type = "fee_erosion"
-                    detail = (f"Edge of {edge:.1%} was below fee cost ~{fee_cost:.1%}. "
-                             f"Would need >{fee_cost:.1%} edge to be profitable after fees.")
-                else:
-                    loss_type = "efficient_market"
-                    detail = (f"Edge was only {edge:.1%}. Market was approximately correct. "
-                             f"Our estimate {est_prob:.2f} vs market {mkt_prob:.2f}.")
-            elif est_prob is not None and est_prob > 0.55:
-                # We were fairly confident but still lost — could be adverse selection
-                loss_type = "adverse_selection"
-                detail = (f"Confident estimate ({est_prob:.0%}) but lost. "
-                         f"Possible informed traders on other side or stale data.")
-            else:
-                loss_type = "bad_source"
-                detail = f"Estimate {est_prob:.2f}, edge {edge:.1%}. Sources: {strategy}"
-        else:
             loss_type = "unknown"
-            detail = "Missing estimation data for analysis"
+            detail = ""
+            title = ""
+            cat = categorize_market(ticker, title)
 
-        conn.execute("""INSERT INTO loss_postmortems
-            (recorded_at, order_id, ticker, category, loss_type, source_combo,
-             estimated_prob, market_prob, edge_at_entry, price_at_settlement, detail)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (now_str, oid, ticker, cat, loss_type, strategy,
-             est_prob, mkt_prob, edge, settle_price, detail))
-        classified += 1
+            if est_prob is not None and mkt_prob is not None and edge is not None:
+                # How wrong were we?
+                # Compare our estimate to what the market was pricing at entry.
+                # A large gap (est >> market) that still lost = bad source signal.
+                estimation_error = est_prob - mkt_prob  # our estimate vs market consensus
 
-    conn.commit()
+                if abs(estimation_error) > 0.30:
+                    loss_type = "bad_source"
+                    detail = (f"Estimated {est_prob:.0%} probability but lost. "
+                             f"Sources: {strategy}. Major estimation failure.")
+                elif edge is not None and abs(edge) < 0.07:
+                    # Fee calculation: exit slippage + price-dependent round-trip fees
+                    fee_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(mkt_prob)
+                    if edge > 0 and edge < fee_cost:
+                        loss_type = "fee_erosion"
+                        detail = (f"Edge of {edge:.1%} was below fee cost ~{fee_cost:.1%}. "
+                                 f"Would need >{fee_cost:.1%} edge to be profitable after fees.")
+                    else:
+                        loss_type = "efficient_market"
+                        detail = (f"Edge was only {edge:.1%}. Market was approximately correct. "
+                                 f"Our estimate {est_prob:.2f} vs market {mkt_prob:.2f}.")
+                elif est_prob is not None and est_prob > 0.55:
+                    # We were fairly confident but still lost — could be adverse selection
+                    loss_type = "adverse_selection"
+                    detail = (f"Confident estimate ({est_prob:.0%}) but lost. "
+                             f"Possible informed traders on other side or stale data.")
+                else:
+                    loss_type = "bad_source"
+                    detail = f"Estimate {est_prob:.2f}, edge {edge:.1%}. Sources: {strategy}"
+            else:
+                loss_type = "unknown"
+                detail = "Missing estimation data for analysis"
+
+            conn.execute("""INSERT INTO loss_postmortems
+                (recorded_at, order_id, ticker, category, loss_type, source_combo,
+                 estimated_prob, market_prob, edge_at_entry, price_at_settlement, detail)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (now_str, oid, ticker, cat, loss_type, strategy,
+                 est_prob, mkt_prob, edge, settle_price, detail))
+            classified += 1
 
     # Print summary
     if classified > 0:
@@ -4242,46 +4448,45 @@ def record_pipeline_health(conn):
     """Record this run's pipeline health stats and detect degradations."""
     now_str = datetime.now(timezone.utc).isoformat()
 
-    for source, stats in _PIPELINE_STATS.items():
-        attempted = stats["attempted"]
-        returned = stats["returned"]
-        errors = stats["errors"]
-        latencies = stats["latencies"]
-        avg_latency = sum(latencies) / len(latencies) if latencies else 0
-        error_rate = errors / attempted if attempted > 0 else 0
+    with db_write_ctx(conn):
+        for source, stats in _PIPELINE_STATS.items():
+            attempted = stats["attempted"]
+            returned = stats["returned"]
+            errors = stats["errors"]
+            latencies = stats["latencies"]
+            avg_latency = sum(latencies) / len(latencies) if latencies else 0
+            error_rate = errors / attempted if attempted > 0 else 0
 
-        # Determine status
-        if attempted == 0:
-            status = "idle"
-        elif error_rate > 0.5:
-            status = "degraded"
-        elif returned == 0 and attempted > 0:
-            status = "broken"
-        else:
-            status = "healthy"
+            # Determine status
+            if attempted == 0:
+                status = "idle"
+            elif error_rate > 0.5:
+                status = "degraded"
+            elif returned == 0 and attempted > 0:
+                status = "broken"
+            else:
+                status = "healthy"
 
-        detail = ""
-        # Compare to historical health for this source
-        prev = conn.execute("""
-            SELECT markets_attempted, markets_returned, status
-            FROM pipeline_health
-            WHERE source = ? ORDER BY id DESC LIMIT 1
-        """, (source,)).fetchone()
+            detail = ""
+            # Compare to historical health for this source
+            prev = conn.execute("""
+                SELECT markets_attempted, markets_returned, status
+                FROM pipeline_health
+                WHERE source = ? ORDER BY id DESC LIMIT 1
+            """, (source,)).fetchone()
 
-        if prev and prev[2] == "healthy" and status in ("degraded", "broken"):
-            detail = f"ALERT: {source} degraded from healthy → {status}"
-            print(f"[pipeline] ⚠️  {detail}")
-        elif prev and prev[1] and prev[1] > 5 and returned == 0:
-            detail = f"ALERT: {source} returned 0 results (was {prev[1]} last run)"
-            print(f"[pipeline] ⚠️  {detail}")
+            if prev and prev[2] == "healthy" and status in ("degraded", "broken"):
+                detail = f"ALERT: {source} degraded from healthy → {status}"
+                print(f"[pipeline] ⚠️  {detail}")
+            elif prev and prev[1] and prev[1] > 5 and returned == 0:
+                detail = f"ALERT: {source} returned 0 results (was {prev[1]} last run)"
+                print(f"[pipeline] ⚠️  {detail}")
 
-        conn.execute("""INSERT INTO pipeline_health
-            (recorded_at, source, status, markets_attempted, markets_returned,
-             avg_latency_ms, error_rate, detail)
-            VALUES (?,?,?,?,?,?,?,?)""",
-            (now_str, source, status, attempted, returned, avg_latency, error_rate, detail))
-
-    conn.commit()
+            conn.execute("""INSERT INTO pipeline_health
+                (recorded_at, source, status, markets_attempted, markets_returned,
+                 avg_latency_ms, error_rate, detail)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (now_str, source, status, attempted, returned, avg_latency, error_rate, detail))
     _PIPELINE_STATS.clear()
 
     # Print summary
@@ -4329,40 +4534,39 @@ def check_edge_convergence(conn):
 
     checked = 0
     convergences = []
-    for oid, ticker, side, est_prob, mkt_prob, trade_ts, entry_price in trades:
-        # Fetch current market price for this ticker
-        try:
-            mkt = api_get(f"/markets/{ticker}")
-            current_yes = float(mkt.get("yes_ask") or mkt.get("yes_ask_dollars") or mkt.get("last_price") or mkt.get("last_price_dollars") or 0)
-            if current_yes > 1:
-                current_yes /= 100
-        except Exception:
-            continue
+    with db_write_ctx(conn):
+        for oid, ticker, side, est_prob, mkt_prob, trade_ts, entry_price in trades:
+            # Fetch current market price for this ticker
+            try:
+                mkt = api_get(f"/markets/{ticker}")
+                current_yes = float(mkt.get("yes_ask") or mkt.get("yes_ask_dollars") or mkt.get("last_price") or mkt.get("last_price_dollars") or 0)
+                if current_yes > 1:
+                    current_yes /= 100
+            except Exception:
+                continue
 
-        if current_yes <= 0 or mkt_prob is None or est_prob is None:
-            continue
+            if current_yes <= 0 or mkt_prob is None or est_prob is None:
+                continue
 
-        entry_price_frac = (entry_price / 100) if entry_price and entry_price > 1 else (entry_price or 0)
+            entry_price_frac = (entry_price / 100) if entry_price and entry_price > 1 else (entry_price or 0)
 
-        # Did the market move toward our estimate?
-        original_gap = abs(est_prob - mkt_prob)
-        current_gap = abs(est_prob - current_yes)
+            # Did the market move toward our estimate?
+            original_gap = abs(est_prob - mkt_prob)
+            current_gap = abs(est_prob - current_yes)
 
-        if original_gap > 0.01:  # only check if we had meaningful edge
-            convergence_pct = (original_gap - current_gap) / original_gap
-            converged = 1 if convergence_pct > 0.1 else 0  # >10% closer = convergence
+            if original_gap > 0.01:  # only check if we had meaningful edge
+                convergence_pct = (original_gap - current_gap) / original_gap
+                converged = 1 if convergence_pct > 0.1 else 0  # >10% closer = convergence
 
-            conn.execute("""INSERT INTO edge_convergence
-                (recorded_at, ticker, side, our_estimate, market_price_at_entry,
-                 market_price_after_24h, converged, convergence_pct)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (now_str, ticker, side, est_prob, mkt_prob, current_yes,
-                 converged, convergence_pct))
+                conn.execute("""INSERT INTO edge_convergence
+                    (recorded_at, ticker, side, our_estimate, market_price_at_entry,
+                     market_price_after_24h, converged, convergence_pct)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (now_str, ticker, side, est_prob, mkt_prob, current_yes,
+                     converged, convergence_pct))
 
-            convergences.append(convergence_pct)
-            checked += 1
-
-    conn.commit()
+                convergences.append(convergence_pct)
+                checked += 1
 
     if convergences:
         avg_conv = sum(convergences) / len(convergences)
@@ -4416,27 +4620,26 @@ def record_timing_data(conn):
         return 0
 
     recorded = 0
-    for oid, ticker, won, profit, trade_ts, strategy, edge in rows:
-        try:
-            dt = datetime.fromisoformat(trade_ts.replace("Z", "+00:00"))
-        except Exception:
-            continue
+    with db_write_ctx(conn):
+        for oid, ticker, won, profit, trade_ts, strategy, edge in rows:
+            try:
+                dt = datetime.fromisoformat(trade_ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
 
-        hour_utc = dt.hour
-        dow = dt.weekday()  # 0=Monday
-        cat = categorize_market(ticker, "")
+            hour_utc = dt.hour
+            dow = dt.weekday()  # 0=Monday
+            cat = categorize_market(ticker, "")
 
-        # Extract primary source from strategy string
-        sources = _parse_sources_from_strategy(strategy)
-        primary_source = sources[0] if sources else "unknown"
+            # Extract primary source from strategy string
+            sources = _parse_sources_from_strategy(strategy)
+            primary_source = sources[0] if sources else "unknown"
 
-        conn.execute("""INSERT INTO timing_patterns
-            (recorded_at, order_id, hour_utc, day_of_week, category, source, edge, won, profit_cents)
-            VALUES (?,?,?,?,?,?,?,?,?)""",
-            (now_str, oid, hour_utc, dow, cat, primary_source, edge, won, profit))
-        recorded += 1
-
-    conn.commit()
+            conn.execute("""INSERT INTO timing_patterns
+                (recorded_at, order_id, hour_utc, day_of_week, category, source, edge, won, profit_cents)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (now_str, oid, hour_utc, dow, cat, primary_source, edge, won, profit))
+            recorded += 1
 
     # Analyze timing patterns if we have enough data
     if recorded > 0:
@@ -4519,44 +4722,43 @@ def record_shadow_evaluations(conn, result):
     if not opps:
         return
 
-    for opp in opps:
-        ticker = opp.get("ticker", "")
-        contracts = opp.get("contracts", 0)
-        price_cents = opp.get("price_cents", 50)
-        indep_prob = opp.get("independent_prob")
-        edge = opp.get("edge")
+    with db_write_ctx(conn):
+        for opp in opps:
+            ticker = opp.get("ticker", "")
+            contracts = opp.get("contracts", 0)
+            price_cents = opp.get("price_cents", 50)
+            indep_prob = opp.get("independent_prob")
+            edge = opp.get("edge")
 
-        if not indep_prob or not price_cents:
-            continue
-
-        # Shadow Kelly fractions
-        for shadow_kelly in SHADOW_PARAMS.get("kelly_fraction", []):
-            # Recompute Kelly with shadow value
-            market_prob = price_cents / 100
-            edge_val = indep_prob - market_prob
-            if edge_val <= 0:
+            if not indep_prob or not price_cents:
                 continue
-            b = (100 - price_cents) / price_cents
-            q = 1 - indep_prob
-            kelly_raw = (b * indep_prob - q) / b
-            if kelly_raw <= 0:
-                continue
-            # Use the first session balance as reference
-            bal_row = conn.execute(
-                "SELECT balance_cents FROM sessions ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            balance = bal_row[0] if bal_row else 10000
-            shadow_stake = kelly_raw * shadow_kelly * (balance / 100)
-            shadow_contracts = max(1, int(shadow_stake / (price_cents / 100)))
 
-            conn.execute("""INSERT INTO hyperparam_shadow
-                (recorded_at, param_name, current_value, shadow_value,
-                 ticker, actual_contracts, shadow_contracts, actual_profit, shadow_profit)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (now_str, "kelly_fraction", KELLY_FRACTION, shadow_kelly,
-                 ticker, contracts, shadow_contracts, None, None))
+            # Shadow Kelly fractions
+            for shadow_kelly in SHADOW_PARAMS.get("kelly_fraction", []):
+                # Recompute Kelly with shadow value
+                market_prob = price_cents / 100
+                edge_val = indep_prob - market_prob
+                if edge_val <= 0:
+                    continue
+                b = (100 - price_cents) / price_cents
+                q = 1 - indep_prob
+                kelly_raw = (b * indep_prob - q) / b
+                if kelly_raw <= 0:
+                    continue
+                # Use the first session balance as reference
+                bal_row = conn.execute(
+                    "SELECT balance_cents FROM sessions ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                balance = bal_row[0] if bal_row else 10000
+                shadow_stake = kelly_raw * shadow_kelly * (balance / 100)
+                shadow_contracts = max(1, int(shadow_stake / (price_cents / 100)))
 
-    conn.commit()
+                conn.execute("""INSERT INTO hyperparam_shadow
+                    (recorded_at, param_name, current_value, shadow_value,
+                     ticker, actual_contracts, shadow_contracts, actual_profit, shadow_profit)
+                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (now_str, "kelly_fraction", KELLY_FRACTION, shadow_kelly,
+                     ticker, contracts, shadow_contracts, None, None))
 
 def analyze_shadow_performance(conn):
     """After settlements, compare actual vs shadow performance.
@@ -4591,30 +4793,29 @@ def analyze_shadow_performance(conn):
         groups[key]["shadow_profit"] += per_contract_profit * shadow_c
         groups[key]["n"] += 1
 
-    for (pname, shadow_val), stats in groups.items():
-        if stats["n"] < 10:
-            continue
-        actual = stats["actual_profit"]
-        shadow = stats["shadow_profit"]
-        improvement = (shadow - actual) / abs(actual) if actual != 0 else 0
+    with db_write_ctx(conn):
+        for (pname, shadow_val), stats in groups.items():
+            if stats["n"] < 10:
+                continue
+            actual = stats["actual_profit"]
+            shadow = stats["shadow_profit"]
+            improvement = (shadow - actual) / abs(actual) if actual != 0 else 0
 
-        if abs(improvement) > 0.10:  # >10% difference
-            direction = "better" if improvement > 0 else "worse"
-            print(f"[shadow] {pname}={shadow_val} would be {abs(improvement):.0%} {direction} "
-                  f"than current {stats['current_val']} (n={stats['n']})")
+            if abs(improvement) > 0.10:  # >10% difference
+                direction = "better" if improvement > 0 else "worse"
+                print(f"[shadow] {pname}={shadow_val} would be {abs(improvement):.0%} {direction} "
+                      f"than current {stats['current_val']} (n={stats['n']})")
 
-            if improvement > 0.15 and stats["n"] >= 20:
-                # Strong evidence for change — log recommendation
-                conn.execute("""INSERT INTO strategy_journal
-                    (timestamp, entry_type, category, title, detail, metric_value, metric_name)
-                    VALUES (?,?,?,?,?,?,?)""",
-                    (now_str, "hyperparam_recommendation", pname,
-                     f"Consider changing {pname} from {stats['current_val']} to {shadow_val}",
-                     f"Shadow testing over {stats['n']} trades shows {improvement:.0%} improvement. "
-                     f"Actual profit: {actual:.0f}¢, shadow profit: {shadow:.0f}¢.",
-                     improvement, f"shadow_{pname}"))
-
-    conn.commit()
+                if improvement > 0.15 and stats["n"] >= 20:
+                    # Strong evidence for change — log recommendation
+                    conn.execute("""INSERT INTO strategy_journal
+                        (timestamp, entry_type, category, title, detail, metric_value, metric_name)
+                        VALUES (?,?,?,?,?,?,?)""",
+                        (now_str, "hyperparam_recommendation", pname,
+                         f"Consider changing {pname} from {stats['current_val']} to {shadow_val}",
+                         f"Shadow testing over {stats['n']} trades shows {improvement:.0%} improvement. "
+                         f"Actual profit: {actual:.0f}¢, shadow profit: {shadow:.0f}¢.",
+                         improvement, f"shadow_{pname}"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5270,10 +5471,22 @@ STRATEGY_REGISTRY = [
 def score_market(m, adaptive_weights=None, calibration_corrections=None, category_edges=None,
                  disabled_sources=None, disabled_strategies=None, strategy_bandit=None):
     """
-    Returns (score, side, strategy, detail, volume, spread_cents,
-             independent_prob, market_prob, edge)
-    score=0 → no trade.
+    Returns a 10-tuple:
+    (score, side, strategy, detail, volume, spread_cents,
+     independent_prob, market_prob, edge, skip_reason)
+
+    ``score == 0`` → no trade. Trailing ``skip_reason`` is one of the
+    ``SKIP_*`` constants in ``bot.scoring.market_scorer`` when score == 0,
+    and ``""`` on success. Kept in sync with the canonical module copy.
+    2026-04-22 audit observability #2.
+
+    10-tuple is a known smell; migrate to a dataclass in a focused
+    refactor PR if the shape churn gets painful.
     """
+    from bot.scoring.market_scorer import (
+        SKIP_PRICE_BOUNDS, SKIP_VOLUME, SKIP_SPREAD_ZERO,
+        SKIP_NO_ENSEMBLE, SKIP_EDGE_BELOW_THRESHOLD, SKIP_NO_STRATEGY_FIRED,
+    )
     def _n(v, d=99):
         v = float(v or d); return v/100 if v > 1.0 else v
 
@@ -5286,15 +5499,16 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
     sc      = round(spread * 100, 1)
     ticker  = m.get("ticker", "")
 
-    EMPTY = (0.0, "", "", "", 0, 0, None, None, 0)
+    def _empty(reason):
+        return (0.0, "", "", "", 0, 0, None, None, 0, reason)
 
     # Skip very illiquid or very cheap markets
     if yes_ask <= 0.08 or yes_ask >= 0.92:
-        return EMPTY
+        return _empty(SKIP_PRICE_BOUNDS)
     if volume < 50:
-        return EMPTY
+        return _empty(SKIP_VOLUME)
     if spread <= 0:
-        return EMPTY
+        return _empty(SKIP_SPREAD_ZERO)
 
     # ── Get ensemble probability estimate (with adaptive weights + calibration) ─
     indep_prob, info_source, n_sources = get_independent_estimate(
@@ -5308,7 +5522,7 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
     # Market making and liquidity harvest removed — they had no real information edge.
     # Only trade when we have independent data that diverges from market price.
     if indep_prob is None or n_sources == 0:
-        return EMPTY
+        return _empty(SKIP_NO_ENSEMBLE)
 
     # Adaptive edge threshold: more sources → more confidence → lower threshold
     if n_sources >= 3:
@@ -5406,7 +5620,13 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
             print(f"[strategy] near_resolution error: {e}")
 
     if not candidates:
-        return EMPTY
+        # Split edge-below-threshold (tunable via MIN_EDGE / category
+        # multipliers) from "info_edge had enough edge but spread >= 0.08
+        # killed it and every other strategy stayed silent" — different
+        # fix surfaces entirely.
+        if fee_adjusted_edge_yes <= required_edge and fee_adjusted_edge_no <= required_edge:
+            return _empty(SKIP_EDGE_BELOW_THRESHOLD)
+        return _empty(SKIP_NO_STRATEGY_FIRED)
 
     # Weight each candidate's score by its Thompson Sampling posterior draw.
     # This means proven strategies get full credit while unproven ones are
@@ -5429,13 +5649,23 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
         strat_names = [c[2] for c in candidates]
         best_detail += f" [also: {', '.join(s for s in strat_names if s != best_strat)}]"
 
-    return best_score, best_side, best_strat, best_detail, volume, sc, best_ip, best_mp, best_edge
+    return (best_score, best_side, best_strat, best_detail, volume, sc,
+            best_ip, best_mp, best_edge, "")
 
 def passes_filters(ticker, strategy, volume, spread_cents, af):
+    """Kept in-sync with ``bot/scoring/market_scorer.py:passes_filters``.
+
+    2026-04-22 audit fix: prefix rejection is partitioned by strategy.
+    """
     vt = af.get("low_volume_threshold")
     if vt and volume < vt: return False, f"learned: vol {volume:.0f}<{vt}"
     if strategy in af.get("avoided_strategies", set()): return False, f"learned: strat '{strategy}'"
-    if ticker[:6] in af.get("avoided_prefixes", set()): return False, f"learned: prefix '{ticker[:6]}'"
+    by_strat = af.get("avoided_by_strategy")
+    if by_strat is not None:
+        if ticker[:6] in by_strat.get(strategy, set()):
+            return False, f"learned: strat '{strategy}' prefix '{ticker[:6]}'"
+    elif ticker[:6] in af.get("avoided_prefixes", set()):
+        return False, f"learned: prefix '{ticker[:6]}'"
     return True, ""
 
 def get_open_tickers():
@@ -5574,27 +5804,26 @@ def track_fills(conn):
         print(f"[fills] Could not fetch orders: {e}"); return
 
     filled = partial = unfilled = 0
-    for o in orders:
-        oid = o.get("order_id", "")
-        status = o.get("status", "")
-        if not oid:
-            continue
-        if status in ("executed", "filled"):
-            filled += 1
-        elif status == "partial":
-            partial += 1
-        elif status in ("canceled", "cancelled", "expired"):
-            unfilled += 1
-        else:
-            continue
+    with db_write_ctx(conn):
+        for o in orders:
+            oid = o.get("order_id", "")
+            status = o.get("status", "")
+            if not oid:
+                continue
+            if status in ("executed", "filled"):
+                filled += 1
+            elif status == "partial":
+                partial += 1
+            elif status in ("canceled", "cancelled", "expired"):
+                unfilled += 1
+            else:
+                continue
 
-        # Update our trades table with fill status
-        # Allow promotion: partial → filled/executed (no IS NULL restriction)
-        conn.execute(
-            "UPDATE trades SET fill_status=? WHERE order_id=?",
-            (status, oid))
-
-    conn.commit()
+            # Update our trades table with fill status
+            # Allow promotion: partial → filled/executed (no IS NULL restriction)
+            conn.execute(
+                "UPDATE trades SET fill_status=? WHERE order_id=?",
+                (status, oid))
     total = filled + partial + unfilled
     if total > 0:
         fill_rate = (filled + partial) / total
@@ -6029,7 +6258,8 @@ def generate_performance_report(conn, result):
     except Exception as e:
         print(f"[report] Failed to write report: {e}")
 
-    conn.commit()
+    with db_write_ctx(conn):
+        pass  # no-op commit preserved from prior semantics
     return report_text
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6059,19 +6289,19 @@ _SC_MAX_HOURS_TO_EXPIRY = 168  # don't lock up capital > 7 days
 
 def _init_sc_table(conn):
     """Create safe_compounder_orders table for tracking."""
-    conn.execute("""CREATE TABLE IF NOT EXISTS safe_compounder_orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT,
-        ticker TEXT,
-        no_price_cents INTEGER,
-        contracts INTEGER,
-        equity_cents INTEGER,
-        order_id TEXT,
-        status TEXT DEFAULT 'posted',
-        settled INTEGER DEFAULT 0,
-        settlement_pnl_cents INTEGER DEFAULT 0,
-        error TEXT)""")
-    conn.commit()
+    with db_write_ctx(conn):
+        conn.execute("""CREATE TABLE IF NOT EXISTS safe_compounder_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            ticker TEXT,
+            no_price_cents INTEGER,
+            contracts INTEGER,
+            equity_cents INTEGER,
+            order_id TEXT,
+            status TEXT DEFAULT 'posted',
+            settled INTEGER DEFAULT 0,
+            settlement_pnl_cents INTEGER DEFAULT 0,
+            error TEXT)""")
 
 
 def safe_compounder_scan(conn, markets, balance_cents, portfolio_value):
@@ -6200,13 +6430,14 @@ def safe_compounder_scan(conn, markets, balance_cents, portfolio_value):
 
         # Edge calculation: our "edge" is (1 - yes_price) - no_ask
         # If YES is at 10¢, fair NO is ~90¢. If NO ask is 85¢, edge = 5¢.
+        # round(), not int(): float*100 can underflow by 1¢ (CLAUDE.md §5).
         implied_no_fair = 1.0 - yes_indicator
         no_ask_price = no_ask
-        edge_cents = int((implied_no_fair - no_ask_price) * 100)
+        edge_cents = round((implied_no_fair - no_ask_price) * 100)
 
         # Require at least 3¢ edge after estimated fees (use canonical formula)
         from bot.core.money import kalshi_maker_fee
-        est_fee = kalshi_maker_fee(1, int(no_ask * 100))  # per-contract fee at this price
+        est_fee = kalshi_maker_fee(1, round(no_ask * 100))  # per-contract fee at this price
         net_edge = edge_cents - est_fee
         if net_edge < 3:
             log_opportunity(conn, ticker, "safe_compounder", "skip_edge", side="no",
@@ -6242,60 +6473,62 @@ def safe_compounder_scan(conn, markets, balance_cents, portfolio_value):
           f"{slots_available} slots available")
 
     orders_placed = 0
-    for c in candidates[:slots_available]:
-        ticker = c["ticker"]
-        no_ask_cents = int(c["no_ask"] * 100)
+    with db_write_ctx(conn):
+        for c in candidates[:slots_available]:
+            ticker = c["ticker"]
+            # round(), not int(): float*100 underflows 28.999... → 28 vs 29
+            # (known bug pattern #5, also causes mispriced orders that won't fill).
+            no_ask_cents = round(c["no_ask"] * 100)
 
-        # Size: max_per_position / no_ask_cents, min 1 contract
-        contracts = max(1, min(50, max_per_position // no_ask_cents))
+            # Size: max_per_position / no_ask_cents, min 1 contract
+            contracts = max(1, min(50, max_per_position // no_ask_cents))
 
-        # Sanity cap: don't exceed 50% of orderbook depth
-        try:
-            book = api_get(f"/markets/{ticker}/orderbook")
-            no_bids = book.get("orderbook", {}).get("no", [])
-            depth = sum(int(level[1]) for level in no_bids) if no_bids else 999
-            contracts = min(contracts, max(1, depth // 2))
-        except Exception:
-            pass  # if we can't check depth, use calculated size
-
-        print(f"  {ticker}: YES={c['yes_price']:.0%}  NO_ask={no_ask_cents}¢  "
-              f"edge={c['net_edge']}¢  vol={c['volume']:.0f}  "
-              f"expiry={c['hours_to_expiry']:.0f}h  [{c['category']}] → "
-              f"BUY NO x{contracts}")
-
-        order_id = None
-        error = None
-        if not SC_DRY_RUN:  # SC has its own dry-run flag (separate from MM and directional)
+            # Sanity cap: don't exceed 50% of orderbook depth
             try:
-                client_id = f"mm_sc_{ticker.replace('.', '_')}_{int(time.time())}"
-                resp = api_post("/portfolio/orders", {
-                    "ticker": ticker,
-                    "side": "no",
-                    "type": "limit",
-                    "count": contracts,
-                    "no_price": no_ask_cents,
-                    "action": "buy",
-                    "expiration_ts": int(time.time() + 3600),  # 1h to fill
-                    "client_order_id": client_id,
-                })
-                order_id = resp.get("order", {}).get("order_id", "")
-                print(f"    ✓ order {order_id[:12]}")
-                orders_placed += 1
-            except Exception as e:
-                error = str(e)
-                print(f"    ✗ {error}")
-        else:
-            print(f"    [DRY] would buy NO x{contracts} @ {no_ask_cents}¢")
-            orders_placed += 1
+                book = api_get(f"/markets/{ticker}/orderbook")
+                no_bids = book.get("orderbook", {}).get("no", [])
+                depth = sum(int(level[1]) for level in no_bids) if no_bids else 999
+                contracts = min(contracts, max(1, depth // 2))
+            except Exception:
+                pass  # if we can't check depth, use calculated size
 
-        # Record
-        conn.execute("""INSERT INTO safe_compounder_orders
-            (timestamp, ticker, no_price_cents, contracts, equity_cents,
-             order_id, status, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (now.isoformat(), ticker, no_ask_cents, contracts,
-             total_equity_cents, order_id, "posted" if order_id else "dry_run", error))
-        conn.commit()
+            print(f"  {ticker}: YES={c['yes_price']:.0%}  NO_ask={no_ask_cents}¢  "
+                  f"edge={c['net_edge']}¢  vol={c['volume']:.0f}  "
+                  f"expiry={c['hours_to_expiry']:.0f}h  [{c['category']}] → "
+                  f"BUY NO x{contracts}")
+
+            order_id = None
+            error = None
+            if not SC_DRY_RUN:  # SC has its own dry-run flag (separate from MM and directional)
+                try:
+                    client_id = f"mm_sc_{ticker.replace('.', '_')}_{int(time.time())}"
+                    resp = api_post("/portfolio/orders", {
+                        "ticker": ticker,
+                        "side": "no",
+                        "type": "limit",
+                        "count": contracts,
+                        "no_price": no_ask_cents,
+                        "action": "buy",
+                        "expiration_ts": int(time.time() + 3600),  # 1h to fill
+                        "client_order_id": client_id,
+                    })
+                    order_id = resp.get("order", {}).get("order_id", "")
+                    print(f"    ✓ order {order_id[:12]}")
+                    orders_placed += 1
+                except Exception as e:
+                    error = str(e)
+                    print(f"    ✗ {error}")
+            else:
+                print(f"    [DRY] would buy NO x{contracts} @ {no_ask_cents}¢")
+                orders_placed += 1
+
+            # Record
+            conn.execute("""INSERT INTO safe_compounder_orders
+                (timestamp, ticker, no_price_cents, contracts, equity_cents,
+                 order_id, status, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (now.isoformat(), ticker, no_ask_cents, contracts,
+                 total_equity_cents, order_id, "posted" if order_id else "dry_run", error))
 
     stats["orders_placed"] = orders_placed
     print(f"[sc] Safe Compounder: {orders_placed} orders placed "
@@ -6304,1825 +6537,23 @@ def safe_compounder_scan(conn, markets, balance_cents, portfolio_value):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET MAKING — provide liquidity in thin markets for spread income (v3.11)
-# ══════════════════════════════════════════════════════════════════════════════
-# Instead of predicting outcomes (directional), market making earns the bid-ask
-# spread by posting two-sided limit orders. Profitable when:
-#   1. The spread is wide enough to cover fees + adverse selection
-#   2. Our fair value estimate is roughly correct (don't need to be perfect)
-#   3. We manage inventory so we don't accumulate large directional risk
-#
-# Targets: thin markets that professional MMs ignore (weather, niche sports,
-# entertainment) where spreads are 8-20¢ and volume is too low for HFT.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _init_mm_tables(conn):
-    """Create market-making tables if they don't exist."""
-    conn.execute("""CREATE TABLE IF NOT EXISTS mm_orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
-        ticker TEXT, side TEXT, price_cents INTEGER, contracts INTEGER,
-        order_id TEXT, status TEXT DEFAULT 'posted', fill_qty INTEGER DEFAULT 0,
-        fair_value_cents INTEGER, inventory_at_post INTEGER,
-        tag TEXT DEFAULT 'mm_v1')""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS mm_inventory (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, updated_at TEXT,
-        ticker TEXT UNIQUE, net_position INTEGER DEFAULT 0,
-        total_bought INTEGER DEFAULT 0, total_sold INTEGER DEFAULT 0,
-        realized_pnl_cents INTEGER DEFAULT 0,
-        avg_entry_cents REAL DEFAULT 0,
-        first_fill_at TEXT)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS mm_sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT,
-        markets_quoted INTEGER, orders_posted INTEGER, orders_cancelled INTEGER,
-        fills_detected INTEGER, inventory_value_cents INTEGER,
-        realized_pnl_cents INTEGER, unrealized_pnl_cents INTEGER)""")
-    conn.commit()
-
-def mm_get_inventory(conn, ticker):
-    """Get current net position for a market. Positive = long YES, negative = short YES (long NO)."""
-    row = conn.execute(
-        "SELECT net_position, avg_entry_cents FROM mm_inventory WHERE ticker=?", (ticker,)
-    ).fetchone()
-    return (row[0], row[1]) if row else (0, 0.0)
-
-def _apply_trade(net, avg_entry, side, qty, price_cents):
-    """Pure math: compute new (net_position, avg_entry, realized_pnl) after a trade.
-
-    Convention: avg_entry is always YES-equivalent cost basis.
-      Long YES (net > 0):  avg_entry = what we paid per YES contract
-      Short YES (net < 0): avg_entry = 100 - what_we_paid_per_NO (YES-equivalent)
-
-    price_cents: the SIDE-APPROPRIATE price:
-      YES fill → yes_price in cents
-      NO fill  → no_price in cents (NOT yes_price!)
-
-    Handles 4 cases per side:
-      1. Adding to existing same-direction position  → weighted avg
-      2. Reducing opposite position without flipping → keep old avg, realize P&L
-      3. Flipping from opposite to same direction    → realize P&L, new avg for excess
-      4. Opening fresh position                      → avg = trade price
-    """
-    realized_pnl = 0.0
-
-    if side == "yes":
-        new_net = net + qty
-        if net >= 0:
-            # Case 1/4: adding to long or opening fresh long
-            total_cost = avg_entry * abs(net) + price_cents * qty
-            new_avg = total_cost / max(1, abs(new_net))
-        elif qty <= abs(net):
-            # Case 2: reducing short without flipping — keep old avg for remainder
-            closed = qty
-            # Short had YES-equiv avg_entry (e.g. 60 means we effectively sold YES at 60¢).
-            # Buying YES at price_cents to close. P&L = avg_entry - price_cents per contract.
-            # Example: short at avg_entry=60, close by buying YES at 45 → profit = 60-45 = +15¢
-            realized_pnl = closed * (avg_entry - price_cents)
-            new_avg = avg_entry  # remaining short keeps its avg
-        else:
-            # Case 3: flipping from short to long
-            closed = abs(net)
-            realized_pnl = closed * (avg_entry - price_cents)
-            new_avg = price_cents  # new long position at trade price
-    else:
-        # NO side: convert to YES-equivalent for storage
-        yes_equiv = 100.0 - price_cents
-        new_net = net - qty
-        if net <= 0:
-            # Case 1/4: adding to short or opening fresh short
-            total_cost = avg_entry * abs(net) + yes_equiv * qty
-            new_avg = total_cost / max(1, abs(new_net)) if new_net != 0 else 0.0
-        elif qty <= net:
-            # Case 2: reducing long without flipping — keep old avg for remainder
-            closed = qty
-            exit_price = 100.0 - price_cents  # what we get for exiting YES via NO sale
-            realized_pnl = closed * (exit_price - avg_entry)
-            new_avg = avg_entry  # remaining long keeps its avg
-        else:
-            # Case 3: flipping from long to short
-            closed = net
-            exit_price = 100.0 - price_cents
-            realized_pnl = closed * (exit_price - avg_entry)
-            new_avg = yes_equiv  # new short at YES-equivalent
-
-    return new_net, new_avg, realized_pnl
-
-
-def mm_update_inventory(conn, ticker, side, qty, price_cents):
-    """Update inventory after a fill is detected.
-    price_cents must be the SIDE-APPROPRIATE price:
-      YES fill → yes_price in cents
-      NO fill  → no_price in cents
-    NOTE: Does NOT commit — caller must commit the transaction."""
-    now = datetime.now(timezone.utc).isoformat()
-    net, avg_entry = mm_get_inventory(conn, ticker)
-
-    new_net, new_avg, realized_pnl = _apply_trade(net, avg_entry, side, qty, price_cents)
-
-    if round(realized_pnl) != 0:
-        conn.execute("""UPDATE mm_inventory SET realized_pnl_cents = realized_pnl_cents + ?
-                       WHERE ticker = ?""", (round(realized_pnl), ticker))
-
-    if side == "yes":
-        conn.execute("""INSERT INTO mm_inventory (updated_at, ticker, net_position, total_bought, avg_entry_cents, first_fill_at)
-                       VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(ticker) DO UPDATE SET
-                       updated_at=?, net_position=?, total_bought=total_bought+?, avg_entry_cents=?""",
-                     (now, ticker, new_net, qty, new_avg, now,
-                      now, new_net, qty, new_avg))
-    else:
-        conn.execute("""INSERT INTO mm_inventory (updated_at, ticker, net_position, total_sold, avg_entry_cents, first_fill_at)
-                       VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(ticker) DO UPDATE SET
-                       updated_at=?, net_position=?, total_sold=total_sold+?, avg_entry_cents=?""",
-                     (now, ticker, new_net, qty, new_avg, now,
-                      now, new_net, qty, new_avg))
-    # NOTE: no conn.commit() here — caller handles transaction boundaries
-
-def mm_calculate_quotes(fair_value_cents, inventory, half_spread):
-    """Calculate bid/ask prices, skewed by inventory to encourage rebalancing.
-    If we're long (inventory > 0), lower BID (reluctant to buy more) and lower ASK (eager to sell).
-    If we're short (inventory < 0), raise ASK (reluctant to sell more) and raise BID (eager to buy).
-    The skew moves the MIDPOINT, so both sides shift together — the direction incentivizes
-    the counterparty to take the other side of our position."""
-    # Continuous skew instead of integer truncation — even 1 contract matters
-    skew = int(round(inventory * MM_SKEW_PER_10 / 10.0))
-    bid = fair_value_cents - half_spread - skew
-    ask = fair_value_cents + half_spread - skew
-    # Clamp to valid Kalshi range [1, 99]
-    bid = max(1, min(98, bid))
-    ask = max(bid + 1, min(99, ask))  # ask must be > bid
-    return bid, ask
-
-def mm_cancel_all_orders(conn):
-    """Cancel all resting MM orders. We re-post fresh ones each cycle.
-    Returns count of orders cancelled."""
-    cancelled = 0
-    try:
-        orders = api_get("/portfolio/orders?status=resting&limit=200").get("orders", [])
-        # Identify MM orders by checking our DB
-        mm_order_ids = set()
-        rows = conn.execute(
-            "SELECT order_id FROM mm_orders WHERE status='posted'"
-        ).fetchall()
-        for row in rows:
-            mm_order_ids.add(row[0])
-
-        for o in orders:
-            oid = o.get("order_id", "")
-            if oid in mm_order_ids:
-                try:
-                    r = api_delete(f"/portfolio/orders/{oid}")
-                    if r.status_code in (200, 204):
-                        conn.execute("UPDATE mm_orders SET status='cancelled' WHERE order_id=?", (oid,))
-                        cancelled += 1
-                    else:
-                        # Cancel failed — do NOT mark as cancelled, order may still be live
-                        print(f"[mm] Cancel {oid} got HTTP {r.status_code} — order may still be live")
-                        conn.execute("UPDATE mm_orders SET status='cancel_failed' WHERE order_id=?", (oid,))
-                except Exception as e:
-                    print(f"[mm] Failed to cancel {oid}: {e}")
-                    # Network error — do NOT mark as cancelled, order may still be live
-                    conn.execute("UPDATE mm_orders SET status='cancel_failed' WHERE order_id=?", (oid,))
-
-        # Also mark any old 'posted' orders not found in API as expired/stale
-        for oid in mm_order_ids:
-            api_oids = {o.get("order_id", "") for o in orders}
-            if oid not in api_oids:
-                conn.execute("UPDATE mm_orders SET status='expired' WHERE order_id=? AND status='posted'", (oid,))
-        conn.commit()
-    except Exception as e:
-        print(f"[mm] Error cancelling orders: {e}")
-    return cancelled
-
-def _parse_fill_price_cents(fill, side):
-    """Extract the correct side-appropriate price from a fill response.
-    For YES fills → yes_price. For NO fills → no_price.
-    Returns price in cents (integer)."""
-    if side == "no":
-        # Use no_price_dollars first, then derive from yes_price if missing
-        no_raw = fill.get("no_price_dollars") or fill.get("no_price")
-        if no_raw:
-            v = float(no_raw)
-            return int(round(v * 100)) if 0 < v <= 1.0 else int(v)
-        # Fallback: derive from yes_price (no_price = 100 - yes_price)
-        yes_raw = fill.get("yes_price_dollars") or fill.get("yes_price")
-        if yes_raw:
-            v = float(yes_raw)
-            yes_cents = int(round(v * 100)) if 0 < v <= 1.0 else int(v)
-            return 100 - yes_cents
-        return 0
-    else:
-        yes_raw = fill.get("yes_price_dollars") or fill.get("yes_price")
-        if yes_raw:
-            v = float(yes_raw)
-            return int(round(v * 100)) if 0 < v <= 1.0 else int(v)
-        return 0
-
-
-def mm_check_fills(conn):
-    """Check for new fills using Kalshi's /portfolio/fills endpoint (ground truth).
-    Falls back to order-status inference if fills endpoint unavailable.
-    Returns number of new fills detected.
-
-    ATOMICITY: inventory update, fill-id insert, and order-state update are
-    wrapped in a single transaction per fill batch. mm_update_inventory() does
-    NOT commit internally."""
-    fills = 0
-
-    # Ensure tables exist
-    conn.execute("""CREATE TABLE IF NOT EXISTS mm_processed_fills (
-        fill_id TEXT PRIMARY KEY, processed_at TEXT, fee_cents REAL DEFAULT 0,
-        order_id TEXT DEFAULT '', ticker TEXT DEFAULT '')""")
-    # Add columns if upgrading from old schema
-    for col, coldef in [("fee_cents", "REAL DEFAULT 0"), ("order_id", "TEXT DEFAULT ''"), ("ticker", "TEXT DEFAULT ''")]:
-        try:
-            conn.execute(f"SELECT {col} FROM mm_processed_fills LIMIT 1")
-        except Exception:
-            try:
-                conn.execute(f"ALTER TABLE mm_processed_fills ADD COLUMN {col} {coldef}")
-            except Exception:
-                pass
-
-    try:
-        # --- Paginated fill retrieval with high-water mark ---
-        # Get last-seen fill timestamp for incremental sync
-        last_ts_row = conn.execute(
-            "SELECT MAX(processed_at) FROM mm_processed_fills").fetchone()
-        min_ts_param = ""
-        if last_ts_row and last_ts_row[0]:
-            # Subtract 5 minutes for safety overlap (dedupe handles repeats)
-            try:
-                last_dt = datetime.fromisoformat(last_ts_row[0].replace("Z", "+00:00"))
-                safe_dt = last_dt - timedelta(minutes=5)
-                min_ts_param = f"&min_ts={int(safe_dt.timestamp())}"
-            except Exception:
-                pass
-
-        # Get ALL known MM order IDs (not just 'posted' — catches late fills on canceled orders)
-        mm_oids = set(r[0] for r in conn.execute(
-            "SELECT order_id FROM mm_orders").fetchall())
-        processed = set(r[0] for r in conn.execute(
-            "SELECT fill_id FROM mm_processed_fills").fetchall())
-
-        # Paginate through fills using cursor
-        cursor = ""
-        total_api_fills = 0
-        while True:
-            url = f"/portfolio/fills?limit=1000{min_ts_param}"
-            if cursor:
-                url += f"&cursor={cursor}"
-            resp = api_get(url)
-            api_fills = resp.get("fills", [])
-            total_api_fills += len(api_fills)
-
-            for f in api_fills:
-                fill_id = f.get("fill_id") or f.get("trade_id") or ""
-                if not fill_id or fill_id in processed:
-                    continue
-                order_id = f.get("order_id", "")
-                if order_id not in mm_oids:
-                    continue
-
-                # Parse fill details
-                ticker = f.get("ticker") or f.get("market_ticker", "")
-                side = f.get("side", "")
-                count_raw = f.get("count_fp") or f.get("count", 0)
-                fill_qty = max(1, round(float(count_raw))) if count_raw else 0
-                # CRITICAL: use side-appropriate price (audit fix #1)
-                price_cents = _parse_fill_price_cents(f, side)
-                # Actual fee from Kalshi (in dollars → cents)
-                fee_raw = f.get("fee_cost") or f.get("fee_cost_dollars") or 0
-                fee_cents = float(fee_raw) * 100 if fee_raw and float(fee_raw) < 100 else float(fee_raw or 0)
-
-                if fill_qty <= 0:
-                    continue
-
-                # ATOMIC: inventory + fill record + order state in one transaction
-                mm_update_inventory(conn, ticker, side, fill_qty, price_cents)
-                conn.execute("INSERT OR IGNORE INTO mm_processed_fills (fill_id, processed_at, fee_cents, order_id, ticker) VALUES (?, ?, ?, ?, ?)",
-                            (fill_id, datetime.now(timezone.utc).isoformat(), fee_cents, order_id, ticker))
-                conn.execute(
-                    "UPDATE mm_orders SET fill_qty = fill_qty + ?, "
-                    "status = CASE WHEN fill_qty + ? >= contracts THEN 'filled' ELSE status END "
-                    "WHERE order_id = ?",
-                    (fill_qty, fill_qty, order_id))
-                fills += 1
-                processed.add(fill_id)  # avoid re-processing within same batch
-                is_taker = f.get("is_taker", False)
-                print(f"[mm] Fill: {ticker} {side} x{fill_qty} @ {price_cents}¢ "
-                      f"({'taker' if is_taker else 'maker'}) fee={fee_cents:.1f}¢ [fill_id={fill_id[:12]}]")
-
-            # Commit after each page (atomic per page)
-            conn.commit()
-
-            # Check for next page
-            next_cursor = resp.get("cursor", "")
-            if not next_cursor or not api_fills:
-                break
-            cursor = next_cursor
-
-        if fills > 0 or total_api_fills > 0:
-            return fills  # fills endpoint worked — trust it
-
-    except Exception as e:
-        print(f"[mm] Fills endpoint error ({e}), falling back to order-status inference")
-
-    # Fallback: infer fills from order status (less reliable but works pre-migration)
-    try:
-        orders = api_get("/portfolio/orders?status=executed&limit=200").get("orders", [])
-        executed_ids = {o.get("order_id"): o for o in orders if o.get("order_id")}
-
-        rows = conn.execute(
-            "SELECT id, order_id, ticker, side, price_cents, contracts, fill_qty FROM mm_orders WHERE status='posted'"
-        ).fetchall()
-
-        for row_id, oid, ticker, side, price_cents, contracts, prev_fill in rows:
-            if oid in executed_ids:
-                exec_order = executed_ids[oid]
-                fill_count_raw = exec_order.get("fill_count_fp") or exec_order.get("count_fp") or exec_order.get("count", contracts)
-                total_filled = round(float(fill_count_raw))
-                new_fills = total_filled - (prev_fill or 0)
-                if new_fills > 0:
-                    mm_update_inventory(conn, ticker, side, new_fills, price_cents)
-                    # Record fee in mm_processed_fills (fallback path was missing this)
-                    from bot.core.money import kalshi_maker_fee
-                    est_fee = kalshi_maker_fee(new_fills, price_cents)
-                    fallback_fill_id = f"fallback_{oid}_{int(time.time())}"
-                    conn.execute(
-                        "INSERT OR IGNORE INTO mm_processed_fills (fill_id, processed_at, fee_cents, order_id, ticker) VALUES (?, ?, ?, ?, ?)",
-                        (fallback_fill_id, datetime.now(timezone.utc).isoformat(), est_fee, oid, ticker))
-                    conn.execute(
-                        "UPDATE mm_orders SET status='filled', fill_qty=? WHERE id=?",
-                        (total_filled, row_id))
-                    fills += 1
-                    print(f"[mm] Fill (fallback): {ticker} {side} x{new_fills} @ {price_cents}¢ (est_fee={est_fee}¢)")
-
-        # Check partially filled resting orders
-        resting = api_get("/portfolio/orders?status=resting&limit=200").get("orders", [])
-        resting_ids = {o.get("order_id"): o for o in resting if o.get("order_id")}
-        rows2 = conn.execute(
-            "SELECT id, order_id, ticker, side, price_cents, contracts, fill_qty FROM mm_orders WHERE status='posted'"
-        ).fetchall()
-        for row_id, oid, ticker, side, price_cents, contracts, prev_fill in rows2:
-            if oid in resting_ids:
-                o = resting_ids[oid]
-                remaining_raw = o.get("remaining_count_fp") or o.get("remaining_count", contracts)
-                remaining = round(float(remaining_raw))
-                new_fills = contracts - remaining - (prev_fill or 0)
-                if new_fills > 0:
-                    mm_update_inventory(conn, ticker, side, new_fills, price_cents)
-                    # Record fee in mm_processed_fills (fallback path was missing this)
-                    from bot.core.money import kalshi_maker_fee
-                    est_fee = kalshi_maker_fee(new_fills, price_cents)
-                    fallback_fill_id = f"fallback_partial_{oid}_{int(time.time())}"
-                    conn.execute(
-                        "INSERT OR IGNORE INTO mm_processed_fills (fill_id, processed_at, fee_cents, order_id, ticker) VALUES (?, ?, ?, ?, ?)",
-                        (fallback_fill_id, datetime.now(timezone.utc).isoformat(), est_fee, oid, ticker))
-                    conn.execute(
-                        "UPDATE mm_orders SET fill_qty=? WHERE id=?",
-                        ((prev_fill or 0) + new_fills, row_id))
-                    fills += 1
-                    print(f"[mm] Partial fill (fallback): {ticker} {side} x{new_fills} @ {price_cents}¢ (est_fee={est_fee}¢)")
-
-        conn.commit()
-    except Exception as e:
-        print(f"[mm] Error in fallback fill check: {e}")
-    return fills
-
-def mm_select_markets(markets, conn, balance_cents, category_edges=None):
-    """Select markets suitable for market making.
-    Criteria: wide spread, adequate volume, low adverse-selection category,
-    not already at inventory limit. Uses category_edges to skip categories
-    that need unsustainably wide spreads."""
-    # Portfolio-level series concentration: count total inventory per series prefix.
-    # Prevents accumulating 30+ positions in one correlated cluster (e.g., all KXFED).
-    MM_MAX_SERIES_INVENTORY = 50  # max total |net_position| across all tickers in one series
-    series_inventory = {}
-    try:
-        inv_rows = conn.execute(
-            "SELECT ticker, net_position FROM mm_inventory WHERE net_position != 0"
-        ).fetchall()
-        for t, net in inv_rows:
-            series_pfx = t.split("-")[0] if "-" in t else t
-            series_inventory[series_pfx] = series_inventory.get(series_pfx, 0) + abs(int(net))
-    except Exception:
-        pass
-
-    candidates = []
-    filter_stats = {"total": 0, "cat_skip": 0, "no_ask": 0, "no_bid_narrow": 0,
-                    "tight_spread": 0, "low_vol": 0, "extreme_price": 0,
-                    "inv_full": 0, "expiring": 0, "series_full": 0, "passed": 0}
-    for m in markets:
-        filter_stats["total"] += 1
-        ticker = m.get("ticker", "")
-        title = (m.get("title", "") or m.get("subtitle", "") or "").lower()
-
-        # Skip multi-leg parlay/combo markets (MVE) — synthetic, not real tradeable markets
-        if "KXMVE" in ticker or "MULTIGAME" in ticker or m.get("mve_collection_ticker"):
-            filter_stats["cat_skip"] += 1
-            continue
-
-        # Category filter: prefer low-adverse-selection markets
-        cat = categorize_market(ticker, title)
-        if cat not in MM_PREFERRED_CATS:
-            filter_stats["cat_skip"] += 1
-            continue
-
-        # Skip categories where learned edge multiplier is too high (unprofitable to MM)
-        if category_edges:
-            cat_mult = category_edges.get(cat, 1.0)
-            if cat_mult > 2.5:
-                filter_stats["cat_skip"] += 1
-                continue  # category needs >2.5x edge — not worth quoting
-
-        # Parse prices
-        def _pc(v):
-            """Convert price to cents. Handles both cent ints (65) and dollar strings ('0.65')."""
-            v = float(v or 0)
-            return int(round(v * 100)) if v <= 1.0 else int(v)
-        yes_ask = _pc(m.get("yes_ask") or m.get("yes_ask_dollars"))
-        yes_bid = _pc(m.get("yes_bid") or m.get("yes_bid_dollars"))
-
-        # Use last_price as fair value hint when orderbook is thin
-        last_price = _pc(m.get("last_price") or m.get("last_price_dollars"))
-
-        # Calculate spread from available prices
-        # Empty orderbook handling — NEVER quote off stale last_price alone.
-        # Markets with no live book are too dangerous: we have no idea where
-        # real liquidity sits, and quoting off a stale print invites adverse selection.
-        if yes_ask <= 0 and yes_bid <= 0:
-            # No live book at all — skip entirely. Do NOT use last_price as anchor.
-            filter_stats["no_ask"] += 1
-            continue
-        elif yes_ask <= 0:
-            spread = 99 - yes_bid  # no sellers = wide spread
-            mid = yes_bid + 10  # anchor to live bid, NOT stale last_price
-        elif yes_bid <= 0:
-            spread = yes_ask  # no buyers = wide spread
-            mid = max(yes_ask - 5, 1)  # anchor to live ask, NOT stale last_price
-        else:
-            spread = yes_ask - yes_bid
-            mid = (yes_ask + yes_bid) // 2
-
-        if spread < MM_MIN_SPREAD:
-            filter_stats["tight_spread"] += 1
-            continue  # spread too tight — a better MM is already here
-
-        volume = float(m.get("volume") or m.get("volume_24h_fp") or m.get("volume_fp") or 0)
-        open_interest = float(m.get("open_interest") or m.get("open_interest_fp") or 0)
-        activity = max(volume, open_interest)  # OI shows someone holds positions even if no recent trades
-        if activity < MM_MIN_VOLUME:
-            filter_stats["low_vol"] += 1
-            continue
-
-        # Skip markets too close to 0 or 100 (high adverse selection near resolution)
-        if mid < 10 or mid > 90:
-            filter_stats["extreme_price"] += 1
-            continue
-
-        # Check current inventory — skip if already at limit
-        inv, _ = mm_get_inventory(conn, ticker)
-        if abs(inv) >= MM_MAX_INVENTORY:
-            filter_stats["inv_full"] += 1
-            continue
-
-        # Portfolio-level series concentration check
-        series_pfx = ticker.split("-")[0] if "-" in ticker else ticker
-        if series_inventory.get(series_pfx, 0) >= MM_MAX_SERIES_INVENTORY:
-            filter_stats["series_full"] += 1
-            continue
-
-        # Check time to expiration — prefer markets with > 6h left
-        close_time = m.get("close_time") or m.get("expiration_time")
-        hours_left = 999
-        if close_time:
-            try:
-                ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-                hours_left = (ct - datetime.now(timezone.utc)).total_seconds() / 3600
-            except Exception:
-                pass
-        if hours_left < 2:
-            filter_stats["expiring"] += 1
-            continue  # too close to resolution — high adverse selection
-
-        filter_stats["passed"] += 1
-        # Score: balance spread profit vs fill probability (volume)
-        # Cap spread contribution at 30¢ — beyond that, extra spread doesn't help much
-        # because the market is just illiquid, not more profitable per fill
-        spread_score = min(spread, 30)
-        vol_score = math.log1p(volume + open_interest * 0.3)  # OI counts but less than volume
-        time_mult = 1.0 if hours_left > 12 else 0.7
-        # Prefer markets that resolve sooner (faster capital recycling)
-        days_to_resolution = hours_left / 24
-        recycling_bonus = max(0, 5 - days_to_resolution) * 0.5  # up to 2.5 bonus for <5 day markets
-        score = spread_score * vol_score * time_mult + recycling_bonus
-        candidates.append((score, m, ticker, spread, mid, inv, cat))
-        # Log accepted MM candidate
-        log_opportunity(conn, ticker, "mm", "candidate", side="both",
-                        market_prob=mid / 100.0 if mid else None,
-                        edge=spread / 100.0 if spread else None)
-
-    # Log filter funnel
-    print(f"[mm] Filter funnel: {filter_stats['total']} total → "
-          f"{filter_stats['cat_skip']} wrong category, "
-          f"{filter_stats['no_ask']} no ask, "
-          f"{filter_stats['tight_spread']} tight spread, "
-          f"{filter_stats['low_vol']} low volume, "
-          f"{filter_stats['extreme_price']} extreme price, "
-          f"{filter_stats['expiring']} expiring, "
-          f"{filter_stats['inv_full']} inv full, "
-          f"{filter_stats.get('series_full', 0)} series full → "
-          f"{filter_stats['passed']} passed")
-
-    # Sort by score descending, then diversify: max 3 markets per series
-    # This prevents concentration (e.g., all 16 KXFED strikes filling to max)
-    MAX_PER_SERIES = 3
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    selected = []
-    series_count = {}
-    for c in candidates:
-        ticker = c[2]  # ticker is 3rd element
-        # Extract series prefix (e.g., "KXFED" from "KXFED-27APR-T2.50")
-        series = ticker.split("-")[0] if "-" in ticker else ticker
-        series_count[series] = series_count.get(series, 0) + 1
-        if series_count[series] > MAX_PER_SERIES:
-            continue  # skip — already have enough from this series
-        selected.append(c)
-        if len(selected) >= MM_MAX_MARKETS:
-            break
-    return selected
-
-# ── Economic Calendar: scheduled release awareness ──────────────────────────
-# When a major data release is imminent, widen spreads or pause quoting to
-# avoid adverse selection from informed traders who reprice instantly.
-_ECON_CALENDAR_2026 = {
-    # FOMC decisions (Wed 2pm ET) — pause quoting ±15 min, widen 2x for ±2h
-    "fomc": [
-        "2026-01-28", "2026-03-18", "2026-05-06", "2026-06-17",
-        "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-16",
-    ],
-    # CPI releases (typically 8:30am ET, 2nd week of month)
-    "cpi": [
-        "2026-01-14", "2026-02-12", "2026-03-11", "2026-04-14",
-        "2026-05-13", "2026-06-10", "2026-07-14", "2026-08-12",
-        "2026-09-10", "2026-10-13", "2026-11-12", "2026-12-10",
-    ],
-    # Jobs report (typically 8:30am ET, 1st Friday)
-    "jobs": [
-        "2026-01-09", "2026-02-06", "2026-03-06", "2026-04-03",
-        "2026-05-08", "2026-06-05", "2026-07-02", "2026-08-07",
-        "2026-09-04", "2026-10-02", "2026-11-06", "2026-12-04",
-    ],
-}
-
-def _econ_release_proximity():
-    """Check if a major economic release is happening soon.
-    Returns (event_type, hours_until_release) or (None, None).
-    Release times: FOMC=18:00 UTC (2pm ET), CPI/Jobs=12:30 UTC (8:30am ET)."""
-    now = datetime.now(timezone.utc)
-    today_str = now.strftime("%Y-%m-%d")
-
-    for event_type, dates in _ECON_CALENDAR_2026.items():
-        for date_str in dates:
-            if abs((datetime.fromisoformat(date_str + "T00:00:00+00:00") - now).days) > 1:
-                continue  # not today or tomorrow
-            # Set release time
-            release_hour = 18 if event_type == "fomc" else 12  # UTC
-            release_min = 0 if event_type == "fomc" else 30
-            release_dt = datetime.fromisoformat(
-                f"{date_str}T{release_hour:02d}:{release_min:02d}:00+00:00")
-            hours_until = (release_dt - now).total_seconds() / 3600
-            if -0.5 <= hours_until <= 3.0:  # within 3h before to 30min after
-                return event_type, hours_until
-    return None, None
-
-# ── Category-specific spread overrides ──────────────────────────────────────
-# Markets with high informed-trader participation need wider spreads.
-_CATEGORY_SPREAD_OVERRIDES = {
-    "economics": 7,   # KXFED, KXCPI, KXJOB — high informed flow → 7¢ half-spread
-    "crypto":    6,    # KXBTC, KXETH — fast-moving, high adverse selection
-    "weather":   8,    # Weather — wider spread (was blocked, now METAR-gated)
-    "company":   5,    # Company KPIs — moderate, keep at default
-    "sports":    5,    # Sports — moderate
-}
-
-def mm_get_effective_spread(conn, ticker, category):
-    """Get effective half-spread considering: base → category override →
-    adaptive (adverse selection learning) → economic calendar multiplier."""
-    # Start with category override or default
-    base_hs = _CATEGORY_SPREAD_OVERRIDES.get(category, MM_HALF_SPREAD)
-    if base_hs is None:
-        return -1  # Blocked category — signal caller to skip
-
-    # Apply adaptive spread (learned adverse selection)
-    adaptive_hs = mm_adaptive_spread(conn, ticker, base_hs)
-    if adaptive_hs < 0:
-        return -1  # Adverse selection auto-block
-
-    # Widen for economic releases
-    event_type, hours_until = _econ_release_proximity()
-    if event_type is not None:
-        if hours_until is not None and -0.25 <= hours_until <= 0.25:
-            # Within ±15 min of release — return -1 to signal "pause quoting"
-            print(f"    [econ] {event_type} release in {hours_until*60:.0f} min — PAUSING quotes")
-            return -1  # sentinel: skip this market
-        elif hours_until is not None and hours_until <= 2.0:
-            # Within 2 hours — double the spread
-            adaptive_hs = min(15, adaptive_hs * 2)
-            print(f"    [econ] {event_type} in {hours_until:.1f}h — spread doubled to {adaptive_hs}¢")
-
-    return adaptive_hs
-
-
-def _get_series_prefix(ticker):
-    """Extract the series prefix from a bracket/threshold ticker.
-    KXHIGHDEN-26APR09-B69.5 → KXHIGHDEN-26APR09
-    KXFED-27APR-T2.50 → KXFED-27APR
-    Returns (prefix, is_bracket). Bracket markets (-B) have mutually exclusive outcomes."""
-    parts = ticker.rsplit("-", 1)
-    if len(parts) == 2 and parts[1] and parts[1][0] in ("B", "T"):
-        is_bracket = parts[1][0] == "B"
-        return parts[0], is_bracket
-    # Not a bracket/threshold ticker
-    return ticker, False
-
-
-def mm_check_series_profitability(conn, ticker, proposed_side, proposed_qty, proposed_price):
-    """Check if adding a proposed position to a bracket series would make the
-    portfolio structurally unprofitable.
-
-    For bracket markets (only ONE bracket can be true):
-    - Simulates every possible outcome (each bracket winning, plus none winning)
-    - For each outcome, computes total portfolio P&L across ALL brackets in the series
-    - Rejects if: no profitable outcome, or worst-case loss exceeds budget, or EV < 0
-
-    Uses mm_inventory as primary source (tracks actual fills).
-    Merges directional trades from trades table (fail-closed on error).
-    Uses _apply_trade() for proposed position math (shared with mm_update_inventory).
-
-    Returns (ok, reason) — ok=True if the new position is safe to add."""
-    series_prefix, is_bracket = _get_series_prefix(ticker)
-
-    if not is_bracket:
-        return True, "not a bracket market"  # threshold markets (-T) aren't mutually exclusive
-
-    # --- Get ALL positions in this series from mm_inventory (ground truth for MM) ---
-    positions = {}
-    rows = conn.execute(
-        "SELECT ticker, net_position, avg_entry_cents FROM mm_inventory WHERE ticker LIKE ? AND abs(net_position) > 0",
-        (series_prefix + "%",)
-    ).fetchall()
-    for t, net, avg_e in rows:
-        _, pos_is_bracket = _get_series_prefix(t)
-        if not pos_is_bracket:
-            continue
-        positions[t] = (net, float(avg_e))
-
-    # Also merge directional trades — FAIL CLOSED on error (audit fix: no silent pass)
-    try:
-        dir_rows = conn.execute(
-            """SELECT ticker, side, SUM(contracts), AVG(price_cents) FROM trades
-               WHERE ticker LIKE ? AND action='buy' AND fill_status IN ('executed','filled')
-               GROUP BY ticker, side""",
-            (series_prefix + "%",)
-        ).fetchall()
-        for t, side, qty, avg_p in dir_rows:
-            _, dir_is_bracket = _get_series_prefix(t)
-            if not dir_is_bracket:
-                continue
-            dir_net = int(qty) if side == "yes" else -int(qty)
-            dir_avg = float(avg_p)
-            if t in positions:
-                # Combine with existing MM position using _apply_trade()
-                existing_net, existing_avg = positions[t]
-                combined_net, combined_avg, _ = _apply_trade(
-                    existing_net, existing_avg, side, int(qty), dir_avg)
-                positions[t] = (combined_net, combined_avg)
-            else:
-                positions[t] = (dir_net, dir_avg)
-    except Exception as e:
-        # FAIL CLOSED: if we can't see directional trades, block the order
-        print(f"    [series-check] BLOCKED: cannot read directional trades: {e}")
-        return False, f"cannot read directional trades for risk check: {e}"
-
-    # Apply proposed trade using shared _apply_trade() math
-    existing_net, existing_avg = positions.get(ticker, (0, 0.0))
-    new_net, new_avg, _ = _apply_trade(existing_net, existing_avg, proposed_side, proposed_qty, proposed_price)
-    positions[ticker] = (new_net, new_avg)
-
-    # Get all bracket tickers in this series (even those without inventory)
-    all_tickers = set(positions.keys())
-    all_tickers.add(ticker)
-
-    # Simulate each possible outcome: one bracket wins, all others lose
-    # CONVENTION: avg_e is always YES-side cost basis
-    #   - For long YES (net > 0): avg_e = what we paid for YES
-    #   - For short YES / long NO (net < 0): avg_e = 100 - what_we_paid_for_NO (YES-equivalent)
-    scenario_pnls = []
-
-    for winning_ticker in all_tickers:
-        total_pnl = 0.0
-        for t, (net, avg_e) in positions.items():
-            if net == 0:
-                continue
-            if net > 0:
-                if t == winning_ticker:
-                    pnl = net * (100.0 - avg_e)
-                else:
-                    pnl = net * (0.0 - avg_e)
-            else:
-                no_cost = 100.0 - avg_e
-                if t == winning_ticker:
-                    pnl = -abs(net) * no_cost
-                else:
-                    pnl = abs(net) * (100.0 - no_cost)
-            total_pnl += pnl
-        scenario_pnls.append(total_pnl)
-
-    # Also check: outcome where NONE of our held brackets win (uncovered bracket)
-    uncovered_pnl = 0.0
-    for t, (net, avg_e) in positions.items():
-        if net == 0:
-            continue
-        if net > 0:
-            uncovered_pnl += net * (0.0 - avg_e)
-        else:
-            no_cost = 100.0 - avg_e
-            uncovered_pnl += abs(net) * (100.0 - no_cost)
-    scenario_pnls.append(uncovered_pnl)
-
-    worst_pnl = min(scenario_pnls) if scenario_pnls else 0.0
-    best_pnl = max(scenario_pnls) if scenario_pnls else 0.0
-    n_scenarios = len(scenario_pnls)
-
-    # --- EV estimate using model probabilities (not uniform prior) ---
-    # Look up most recent fair_value_cents for each bracket ticker from mm_orders.
-    # scenario_pnls[i] corresponds to all_tickers[i] winning (last entry = none winning).
-    ticker_list = list(all_tickers)  # matches scenario_pnls order from for loop above
-    scenario_weights = []
-    total_model_prob = 0.0
-    for t in ticker_list:
-        fv = None
-        try:
-            row = conn.execute(
-                "SELECT fair_value_cents FROM mm_orders WHERE ticker=? AND fair_value_cents > 0 "
-                "ORDER BY timestamp DESC LIMIT 1", (t,)
-            ).fetchone()
-            if row and row[0]:
-                fv = float(row[0]) / 100.0  # convert cents to probability
-        except Exception:
-            pass
-        if fv is not None and 0.01 <= fv <= 0.99:
-            scenario_weights.append(fv)
-            total_model_prob += fv
-        else:
-            scenario_weights.append(None)  # unknown — will fall back
-
-    # Weight for "none wins" scenario = 1 - sum(all bracket probs), clamped to [0.01, 0.99]
-    none_wins_prob = max(0.01, min(0.99, 1.0 - total_model_prob))
-    # Fill in missing weights with uniform share of remaining probability
-    n_missing = sum(1 for w in scenario_weights if w is None)
-    if n_missing > 0 and n_missing < len(scenario_weights):
-        # Distribute remaining probability uniformly among unknown brackets
-        leftover = max(0.01, 1.0 - total_model_prob - none_wins_prob)
-        fill_val = leftover / n_missing
-        scenario_weights = [w if w is not None else fill_val for w in scenario_weights]
-    elif n_missing == len(scenario_weights):
-        # No model data at all — fall back to uniform
-        uniform_p = 1.0 / max(1, n_scenarios)
-        scenario_weights = [uniform_p] * len(scenario_weights)
-        none_wins_prob = uniform_p
-
-    scenario_weights.append(none_wins_prob)
-
-    # Normalize weights to sum to 1.0
-    w_total = sum(scenario_weights)
-    if w_total > 0:
-        scenario_weights = [w / w_total for w in scenario_weights]
-    else:
-        scenario_weights = [1.0 / n_scenarios] * n_scenarios
-
-    # Weighted EV: sum(weight_i * pnl_i) instead of simple average
-    avg_pnl = sum(w * p for w, p in zip(scenario_weights, scenario_pnls))
-
-    # --- Fee accounting: use actual fees paid + estimate for proposed order ---
-    # Actual fees from fill records for tickers in this series
-    actual_fees_cents = 0.0
-    try:
-        fee_row = conn.execute(
-            "SELECT COALESCE(SUM(fee_cents), 0) FROM mm_processed_fills WHERE ticker LIKE ?",
-            (series_prefix + "%",)
-        ).fetchone()
-        if fee_row and fee_row[0]:
-            actual_fees_cents = float(fee_row[0])
-    except Exception:
-        pass  # fee_cents/ticker columns may not exist yet
-
-    # Estimate fee for proposed order using Kalshi formula: roundup(0.07 * C * P * (1-P))
-    # For maker: roundup(0.0175 * C * P * (1-P))
-    # We use maker rate since we use post_only
-    p_dollar = proposed_price / 100.0
-    proposed_fee_cents = max(1, int(0.0175 * proposed_qty * p_dollar * (1 - p_dollar) * 100 + 0.99))
-    # Also estimate exit fee (assume we'll close at similar price)
-    exit_fee_cents = proposed_fee_cents
-    total_fees = actual_fees_cents + proposed_fee_cents + exit_fee_cents
-
-    best_pnl_net = best_pnl - total_fees
-    worst_pnl_net = worst_pnl - total_fees
-    avg_pnl_net = avg_pnl - total_fees
-
-    # --- Acceptance criteria (tightened from V2) ---
-    # 1. Must have at least one profitable outcome
-    has_profitable_outcome = any(p > total_fees for p in scenario_pnls)
-    # 2. Best case must be positive after fees
-    # 3. Average (EV) must be positive after fees — not just "one good outcome"
-    # 4. Worst case must not exceed per-event loss budget (50 contracts * 100¢ = $50)
-    EVENT_LOSS_BUDGET_CENTS = MM_MAX_INVENTORY * 100  # worst-case budget per event
-
-    if not has_profitable_outcome:
-        return False, (f"no profitable outcome (net of fees): best={best_pnl_net/100:.2f} "
-                       f"worst={worst_pnl_net/100:.2f} fees~{total_fees/100:.2f} "
-                       f"across {len(all_tickers)} brackets in {series_prefix}")
-
-    if best_pnl_net <= 0:
-        return False, (f"best case negative after fees: best={best_pnl_net/100:.2f} "
-                       f"fees~{total_fees/100:.2f}")
-
-    if avg_pnl_net <= 0:
-        return False, (f"negative EV after fees: EV={avg_pnl_net/100:.2f} "
-                       f"best={best_pnl_net/100:+.2f} worst={worst_pnl_net/100:+.2f} "
-                       f"fees~{total_fees/100:.2f}")
-
-    if worst_pnl_net < -EVENT_LOSS_BUDGET_CENTS:
-        return False, (f"worst case exceeds loss budget: worst={worst_pnl_net/100:.2f} "
-                       f"budget=-{EVENT_LOSS_BUDGET_CENTS/100:.2f}")
-
-    return True, (f"ok: EV={avg_pnl_net/100:+.2f} best={best_pnl_net/100:+.2f} "
-                  f"worst={worst_pnl_net/100:+.2f} (fees~{total_fees/100:.2f})")
-
-
-def mm_post_quotes(conn, m, fair_value_cents, balance_cents, inventory):
-    """Post two-sided limit orders for a market.
-    Returns (orders_posted, capital_used_cents)."""
-    ticker = m.get("ticker", "")
-    now = datetime.now(timezone.utc).isoformat()
-    orders_posted = 0
-    capital_used = 0
-
-    # Calculate skewed bid/ask with category-aware + event-aware spread
-    cat = categorize_market(ticker, (m.get("title") or m.get("subtitle") or "").lower())
-
-    # Weather MM gate: only quote when we have fresh METAR observations (< 10 min old).
-    # Without real-time station data, counterparties with METARs have an information edge.
-    if cat == "weather":
-        _metar_fresh = False
-        # Check both local _CACHE and bot.api._CACHE (METAR source writes to bot.api._CACHE)
-        for _cache_dict in [_CACHE]:
-            if "metar_obs" in _cache_dict:
-                _md, _mt = _cache_dict["metar_obs"]
-                if _md and (time.time() - _mt) < 600:  # < 10 min old
-                    _metar_fresh = True
-                    break
-        if not _metar_fresh:
-            try:
-                from bot.api import _CACHE as _BOT_CACHE
-                if "metar_obs" in _BOT_CACHE:
-                    _md, _mt = _BOT_CACHE["metar_obs"]
-                    if _md and (time.time() - _mt) < 600:
-                        _metar_fresh = True
-            except ImportError:
-                pass
-        if not _metar_fresh:
-            print(f"    SKIP {ticker}: weather MM blocked (no fresh METAR data)")
-            return 0, 0
-
-    # Skip if fair value couldn't be computed (prevents penny-bid trap)
-    if fair_value_cents <= 2 or fair_value_cents >= 98:
-        print(f"    SKIP {ticker}: extreme fair value {fair_value_cents}¢ (no reliable estimate)")
-        return 0, 0
-
-    adaptive_hs = mm_get_effective_spread(conn, ticker, cat)
-    if adaptive_hs < 0:
-        # Economic release imminent or blocked category — skip quoting
-        print(f"    SKIP {ticker}: spread returned -1 (blocked/paused)")
-        return 0, 0
-    bid, ask = mm_calculate_quotes(fair_value_cents, inventory, adaptive_hs)
-
-    # Fee-aware spread floor: ensure round-trip spread > expected maker fees
-    # Kalshi maker fee ≈ roundup(0.0175 * C * P * (1-P)) per side
-    # For C=1 contract, worst case is P=0.50 → fee ≈ 0.44¢/side ≈ 0.88¢ round-trip
-    # At P=0.30 or P=0.70 → fee ≈ 0.37¢/side ≈ 0.74¢ round-trip
-    # With our order sizes (3-6 contracts), round-trip fee ≈ 2-5¢
-    mid_price = (bid + ask) / 200.0  # as fraction [0,1]
-    expected_fee_per_side = max(1, 0.0175 * MM_ORDER_SIZE * mid_price * (1 - mid_price) * 100)
-    expected_round_trip_fee = expected_fee_per_side * 2
-    full_spread = ask - bid
-    if full_spread <= expected_round_trip_fee:
-        # Spread doesn't cover fees — widen to break even + 1¢ margin
-        min_hs = int(expected_round_trip_fee / 2) + 1
-        if min_hs > adaptive_hs:
-            print(f"    [fee] {ticker}: spread {full_spread}¢ < fees ~{expected_round_trip_fee:.1f}¢ — "
-                  f"widening half-spread from {adaptive_hs}¢ to {min_hs}¢")
-            adaptive_hs = min_hs
-            bid, ask = mm_calculate_quotes(fair_value_cents, inventory, adaptive_hs)
-
-    # Adjust order size based on inventory: if we're heavy one side, reduce that side
-    buy_size = MM_ORDER_SIZE
-    sell_size = MM_ORDER_SIZE
-    if inventory > MM_MAX_INVENTORY * 0.5:
-        buy_size = max(2, MM_ORDER_SIZE // 2)   # reduce buying
-        sell_size = min(MM_ORDER_SIZE * 2, MM_MAX_INVENTORY - inventory)  # increase selling
-    elif inventory < -MM_MAX_INVENTORY * 0.5:
-        sell_size = max(2, MM_ORDER_SIZE // 2)
-        buy_size = min(MM_ORDER_SIZE * 2, MM_MAX_INVENTORY + inventory)
-
-    buy_size = max(0, buy_size)
-    sell_size = max(0, sell_size)
-
-    # Hard-cap: never exceed MM_MAX_INVENTORY even if current fill + resting order fills
-    # Include resting (unfilled) orders in exposure calculation to avoid over-commitment
-    resting_buy_qty = 0
-    resting_sell_qty = 0
-    try:
-        resting_rows = conn.execute(
-            "SELECT side, SUM(contracts - fill_qty) FROM mm_orders "
-            "WHERE ticker=? AND status IN ('posted', 'resting', 'cancel_failed') AND contracts > fill_qty "
-            "GROUP BY side", (ticker,)
-        ).fetchall()
-        for side, qty in resting_rows:
-            if side == "yes":
-                resting_buy_qty = int(qty or 0)
-            elif side == "no":
-                resting_sell_qty = int(qty or 0)
-    except Exception as e:
-        # FAIL CLOSED: if we can't see resting exposure, block new orders for this ticker
-        print(f"    [risk] ⚠️ Cannot query resting orders for {ticker}: {e} — blocking new orders")
-        return 0, 0  # post nothing this cycle for safety
-
-    effective_long_exposure = inventory + resting_buy_qty  # could end up this long if all buys fill
-    effective_short_exposure = -inventory + resting_sell_qty  # could end up this short if all sells fill
-    headroom_long = max(0, MM_MAX_INVENTORY - effective_long_exposure)
-    headroom_short = max(0, MM_MAX_INVENTORY - effective_short_exposure)
-    buy_size = min(buy_size, headroom_long)
-    sell_size = min(sell_size, headroom_short)
-
-    # Capital check
-    buy_cost = buy_size * bid
-    sell_cost = sell_size * (100 - ask)  # buying NO at (100-ask) cents
-    total_cost = buy_cost + sell_cost
-    if total_cost > balance_cents * MM_CAPITAL_PCT / max(1, MM_MAX_MARKETS):
-        # Scale down proportionally — let size go to 0 if budget is exhausted
-        scale = (balance_cents * MM_CAPITAL_PCT / max(1, MM_MAX_MARKETS)) / max(1, total_cost)
-        buy_size = int(buy_size * scale)   # no max(1,...) — 0 is correct when budget is 0
-        sell_size = int(sell_size * scale)
-
-    # Reapply hard cap after capital scaling (audit fix: scaling could re-inflate)
-    buy_size = min(buy_size, max(0, MM_MAX_INVENTORY - effective_long_exposure))
-    sell_size = min(sell_size, max(0, MM_MAX_INVENTORY - effective_short_exposure))
-
-    # Post BID (buy YES at bid price)
-    if buy_size > 0 and abs(inventory) < MM_MAX_INVENTORY:
-        # Series profitability gate: reject if adding this position makes ALL outcomes unprofitable
-        sp_ok, sp_reason = mm_check_series_profitability(conn, ticker, "yes", buy_size, bid)
-        if not sp_ok:
-            print(f"    BID {ticker} BLOCKED: {sp_reason}")
-            buy_size = 0
-    if buy_size > 0 and abs(inventory) < MM_MAX_INVENTORY:
-        order_body = {
-            "ticker": ticker, "side": "yes", "type": "limit",
-            "count": buy_size, "yes_price": bid,
-            "action": "buy",
-            "expiration_ts": int(time.time() + 110),
-            "client_order_id": f"mm_bid_{ticker.replace('.', '_')}_{int(time.time())}_{uuid.uuid4().hex[:8]}",
-            "post_only": True,
-        }
-        try:
-            if not MM_DRY_RUN:
-                resp = api_post("/portfolio/orders", order_body)
-                oid = resp.get("order", {}).get("order_id", "")
-                if not oid:
-                    print(f"    BID {ticker} WARNING: API returned empty order_id — skipping DB insert")
-                    raise ValueError("empty order_id from API")
-            else:
-                oid = f"dry_mm_bid_{ticker}_{int(time.time())}"
-            conn.execute("""INSERT INTO mm_orders
-                (timestamp, ticker, side, price_cents, contracts, order_id,
-                 fair_value_cents, inventory_at_post, tag)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (now, ticker, "yes", bid, buy_size, oid,
-                 fair_value_cents, inventory, MM_ORDER_TAG))
-            orders_posted += 1
-            capital_used += buy_size * bid
-            print(f"    BID {ticker} YES x{buy_size} @ {bid}¢")
-        except Exception as e:
-            print(f"    BID {ticker} FAILED: {e}")
-
-    # Post ASK (buy NO at (100-ask) = effectively selling YES at ask price)
-    if sell_size > 0 and abs(inventory) < MM_MAX_INVENTORY:
-        no_price = 100 - ask
-        # Series profitability gate: reject if adding this NO position makes ALL outcomes unprofitable
-        sp_ok, sp_reason = mm_check_series_profitability(conn, ticker, "no", sell_size, no_price)
-        if not sp_ok:
-            print(f"    ASK {ticker} BLOCKED: {sp_reason}")
-            sell_size = 0
-    if sell_size > 0 and abs(inventory) < MM_MAX_INVENTORY:
-        no_price = 100 - ask
-        order_body = {
-            "ticker": ticker, "side": "no", "type": "limit",
-            "count": sell_size, "no_price": no_price,
-            "action": "buy",
-            "expiration_ts": int(time.time() + 110),
-            "client_order_id": f"mm_ask_{ticker.replace('.', '_')}_{int(time.time())}_{uuid.uuid4().hex[:8]}",
-            "post_only": True,
-        }
-        try:
-            if not MM_DRY_RUN:
-                resp = api_post("/portfolio/orders", order_body)
-                oid = resp.get("order", {}).get("order_id", "")
-                if not oid:
-                    print(f"    ASK {ticker} WARNING: API returned empty order_id — skipping DB insert")
-                    raise ValueError("empty order_id from API")
-            else:
-                oid = f"dry_mm_ask_{ticker}_{int(time.time())}"
-            conn.execute("""INSERT INTO mm_orders
-                (timestamp, ticker, side, price_cents, contracts, order_id,
-                 fair_value_cents, inventory_at_post, tag)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (now, ticker, "no", no_price, sell_size, oid,
-                 fair_value_cents, inventory, MM_ORDER_TAG))
-            orders_posted += 1
-            capital_used += sell_size * no_price
-            print(f"    ASK {ticker} NO x{sell_size} @ {no_price}¢ (YES ask={ask}¢)")
-        except Exception as e:
-            print(f"    ASK {ticker} FAILED: {e}")
-
-    conn.commit()
-    return orders_posted, capital_used
-
-def mm_run(conn, markets, balance_cents, portfolio_value, adaptive_weights=None,
-           calibration_corrections=None, disabled_sources=None):
-    """Main market-making pass. Called from the main loop after directional trading.
-
-    Flow:
-    1. Check fills from last cycle → update inventory
-    2. Cancel all stale MM orders
-    3. Select suitable markets
-    4. For each market: get fair value, calculate quotes, post orders
-    5. Log session stats
-
-    Returns dict with MM stats for the session."""
-    if not MM_ENABLED:
-        return {"mm_enabled": False}
-
-    # Reset per-cycle caches
-    global _MM_ADVERSE_CACHE
-    _MM_ADVERSE_CACHE = None
-
-    now = datetime.now(timezone.utc).isoformat()
-    _init_mm_tables(conn)
-
-    stats = {
-        "mm_enabled": True,
-        "fills_detected": 0,
-        "orders_cancelled": 0,
-        "markets_quoted": 0,
-        "orders_posted": 0,
-        "capital_deployed": 0,
-    }
-
-    print("\n[mm] ═══ Market Making Pass ═══")
-
-    # Step 0: Liquidate expiring positions to avoid settlement risk
-    try:
-        liq_count = mm_liquidate_expiring(conn)
-        if liq_count:
-            print(f"[mm] Posted {liq_count} liquidation orders for expiring markets")
-    except Exception as e:
-        print(f"[mm] Liquidation check failed: {e}")
-
-    # Step 1: Check fills from last cycle
-    stats["fills_detected"] = mm_check_fills(conn)
-    if stats["fills_detected"]:
-        print(f"[mm] {stats['fills_detected']} fills detected since last cycle")
-
-    # Step 2: Cancel stale MM orders (we'll re-post at updated prices)
-    stats["orders_cancelled"] = mm_cancel_all_orders(conn)
-    print(f"[mm] Cancelled {stats['orders_cancelled']} stale orders")
-
-    # Step 3: Supplement with targeted series fetching for active markets
-    # The generic /markets endpoint returns newest-first (mostly parlays).
-    # Targeted fetching ensures we see actual high-activity markets.
-    MM_TARGET_SERIES = [
-        # KXBTC/KXETH removed: blocklisted (50%+ adverse selection from crypto bots)
-        "KXINX", "KXGDP", "KXCPI", "KXJOB", "KXUNRATE",
-        "KXFED", "KXGAS",
-        # Weather — ALL REMOVED 2026-04-16: $375 of $400 total losses (94%).
-        # Counterparties have real-time METAR/NWS and reprice faster than our 2-min cycle.
-        # Even with bracket width fix + METAR gating, structural adverse selection persists.
-        # Also blocklisted in bot/market_maker/selection.py as defense-in-depth.
-        # "KXHIGHNY", "KXHIGHCHI", "KXHIGHLAX", "KXHIGHAUS", "KXHIGHMIA",
-        # "KXHIGHHOU", "KXHIGHPHX", "KXHIGHDEN", "KXHIGHSF",
-        # "KXHMONTHRANGE", "KXHURR",
-        # Sports — DISABLED: odds source never matches Kalshi titles in practice.
-        # Re-enable when Odds API integration is fixed with proper game/team matching.
-        # "KXNBA", "KXNFL", "KXMLB", "KXNHL", "KXMMA", "KXSOCCER", "KXNCAA",
-        # Company KPIs — DISABLED: data sources (SensorTower, Finnhub) unreliable/403.
-        # Re-enable when live data feeds are verified working end-to-end.
-        # "KXBOEING", "KXSPOTIFYMAU", "KXUBERTRIPS", "KXMETAHEADCOUNT", "KXHOOD",
-        # "KXDASHORDERS", "KXLYFT", "KXMTCH", "KXPLTR", "KXRACE", "KXPM",
-        # "KXABNB", "KXTESLASEMI", "KXEARNINGSMENTIONNFLX", "KXSTRIPEIPO",
-        "KXISMPMI",          # ISM Manufacturing PMI — uses FRED data (reliable)
-    ]
-    seen_tickers = {m.get("ticker") for m in markets}
-    targeted_count = 0
-    series_counts = {}
-    for series in MM_TARGET_SERIES:
-        try:
-            resp = api_get(f"/markets?limit=200&status=open&series_ticker={series}")
-            batch = resp.get("markets", [])
-            new_count = 0
-            for m in batch:
-                t = m.get("ticker", "")
-                if t and t not in seen_tickers:
-                    markets.append(m)
-                    seen_tickers.add(t)
-                    targeted_count += 1
-                    new_count += 1
-            if new_count > 0:
-                series_counts[series] = new_count
-        except Exception:
-            pass  # series might not exist or have no open markets
-    if targeted_count:
-        print(f"[mm] Fetched {targeted_count} additional markets from {len(MM_TARGET_SERIES)} targeted series")
-        print(f"[mm] Series breakdown: {dict(series_counts)}")
-
-    # Pass category_edges so mm_select_markets can skip unprofitable categories
-    _cat_edges = compute_category_edge_thresholds(conn) if conn else {}
-    mm_candidates = mm_select_markets(markets, conn, balance_cents, category_edges=_cat_edges)
-    print(f"[mm] {len(mm_candidates)} markets eligible for market making")
-
-    # Family scenario caps: block entries to families with worst-case loss > threshold
-    from bot.market_maker.family_caps import check_family_caps, is_family_blocked
-    from bot.config import MM_MAX_FAMILY_LOSS_PCT
-    total_equity_for_caps = balance_cents + portfolio_value
-    _family_exposures = check_family_caps(conn, total_equity_for_caps, MM_MAX_FAMILY_LOSS_PCT)
-    pre_filter_count = len(mm_candidates)
-    mm_candidates = [c for c in mm_candidates if not is_family_blocked(_family_exposures, c[2])]
-    family_blocked = pre_filter_count - len(mm_candidates)
-    if family_blocked > 0:
-        print(f"[mm] Family caps blocked {family_blocked} markets")
-
-    if not mm_candidates:
-        print("[mm] No suitable markets found this cycle")
-        return stats
-
-    # Step 4: Quote each market
-    total_capital_used = 0
-    max_mm_capital = int(balance_cents * MM_CAPITAL_PCT)
-
-    for score, m, ticker, spread, mid, _stale_inventory, cat in mm_candidates:
-        if total_capital_used >= max_mm_capital:
-            print(f"[mm] Capital limit reached ({max_mm_capital/100:.2f})")
-            break
-
-        # CRITICAL: refresh inventory from DB (not stale snapshot from mm_select_markets)
-        inventory, _ = mm_get_inventory(conn, ticker)
-
-        # Get fair value from our ensemble estimate
-        title = m.get("title", "") or m.get("subtitle", "") or ""
-        yes_ask_f = float(m.get("yes_ask") or m.get("yes_ask_dollars") or 99)
-        if yes_ask_f > 1:
-            yes_ask_f /= 100
-        vol = float(m.get("volume") or m.get("volume_24h_fp") or m.get("volume_fp") or 0)
-
-        try:
-            indep_prob, src_desc, n_sources = get_independent_estimate(
-                ticker, m, yes_ask_f, vol,
-                adaptive_weights=adaptive_weights,
-                calibration_corrections=calibration_corrections,
-                disabled_sources=disabled_sources)
-        except Exception:
-            indep_prob, src_desc, n_sources = None, None, 0
-
-        # ── FAILSAFE: never market-make without REAL data ──
-        # LLM estimates are guesses, not data — they provide no real edge for MM.
-        # Only quote when we have at least 1 non-LLM source (weather, FRED, crypto, etc.)
-        # Only EXOGENOUS data sources count — "series" and "momentum" are endogenous
-        # (derived from market prices, not independent information)
-        _MM_REAL_SOURCES = {"weather", "fred", "crypto", "clevfed", "noaa",
-                           "polymarket", "metaculus", "bls", "tomorrow",
-                           "metar", "fedwatch"}
-        src_desc_str = src_desc or ""
-        has_real_source = (indep_prob is not None and n_sources >= 1 and
-                          any(s in src_desc_str for s in _MM_REAL_SOURCES))
-
-        if not has_real_source:
-            stats.setdefault("skipped_no_data", 0)
-            stats["skipped_no_data"] += 1
-            reason = "no data source" if n_sources < 1 else "LLM-only (no real data)"
-            print(f"  {ticker}: SKIP — {reason} [{cat}]")
-            log_opportunity(conn, ticker, "mm", "skip", side="both",
-                            ensemble_prob=indep_prob,
-                            market_prob=mid / 100.0 if mid else None,
-                            source_count=n_sources,
-                            sources_json=src_desc,
-                            skip_reason=reason)
-            continue
-        else:
-            fair_value_cents = max(2, min(98, int(indep_prob * 100)))
-            # Sanity check: fair value too extreme → widen spread or skip
-            if fair_value_cents <= 3 or fair_value_cents >= 85:
-                print(f"  {ticker}: SKIP — extreme fair value {fair_value_cents}¢ (prob={indep_prob:.3f})")
-                stats.setdefault("skipped_extreme_fv", 0)
-                stats["skipped_extreme_fv"] += 1
-                log_opportunity(conn, ticker, "mm", "skip", side="both",
-                                ensemble_prob=indep_prob,
-                                market_prob=mid / 100.0 if mid else None,
-                                source_count=n_sources,
-                                sources_json=src_desc,
-                                skip_reason=f"extreme_fv_{fair_value_cents}c")
-                continue
-            print(f"  {ticker}: fair={fair_value_cents}¢ mid={mid}¢ spread={spread}¢ "
-                  f"inv={inventory:+d} [{cat}] ({n_sources} sources)")
-
-        # Post two-sided quotes
-        remaining_capital = max(0, balance_cents - total_capital_used)
-        posted, capital = mm_post_quotes(conn, m, fair_value_cents, remaining_capital, inventory)
-        stats["orders_posted"] += posted
-        total_capital_used += capital
-        if posted > 0:
-            stats["markets_quoted"] += 1
-
-        # Log with full ensemble data — the critical fix for opportunity_log having
-        # NULL ensemble_prob on all 47K+ rows. The old "candidate" log at selection
-        # time didn't have ensemble data because it's computed here in the quoting phase.
-        log_opportunity(conn, ticker, "mm",
-                        "quoted" if posted > 0 else "skip_capital",
-                        side="both",
-                        ensemble_prob=indep_prob,
-                        market_prob=mid / 100.0 if mid else None,
-                        edge=abs(indep_prob - (mid / 100.0)) if mid and indep_prob else None,
-                        source_count=n_sources,
-                        sources_json=src_desc)
-
-    stats["capital_deployed"] = total_capital_used
-
-    # Step 5: Compute total inventory stats
-    inv_rows = conn.execute(
-        "SELECT ticker, net_position, realized_pnl_cents, avg_entry_cents FROM mm_inventory"
-    ).fetchall()
-    total_inv_value = 0
-    total_realized = 0
-    for ticker, net, rpnl, avg_e in inv_rows:
-        total_inv_value += abs(net) * int(avg_e)
-        total_realized += rpnl
-
-    stats["inventory_value_cents"] = total_inv_value
-    stats["realized_pnl_cents"] = total_realized
-
-    # ── Step 6: QA LOOP — re-check MM inventory against fresh data ─────────
-    # Check a rotating subset of inventory positions each run to avoid
-    # blowing the systemd timeout. Prioritize by unrealized loss and age.
-    from bot.config import MAX_QA_PER_RUN as _MAX_QA_PER_RUN, MM_MAX_LOT_AGE_HOURS
-    qa_flags = 0
-    active_inv = [(t, n, r, a) for t, n, r, a in inv_rows if abs(n) > 0]
-
-    # Priority sampling: sort by (unrealized loss estimate * position size), largest first
-    # Also check age — older positions get priority
-    _age_data = {}
-    try:
-        for row in conn.execute("SELECT ticker, first_fill_at FROM mm_inventory WHERE net_position != 0 AND first_fill_at IS NOT NULL").fetchall():
-            _age_data[row[0]] = row[1]
-    except Exception:
-        pass
-
-    def _qa_priority(item):
-        t, n, r, a = item
-        size_risk = abs(n) * int(a)  # position size in cents
-        age_hours = 0
-        if t in _age_data:
-            try:
-                fill_dt = datetime.fromisoformat(_age_data[t].replace("Z", "+00:00"))
-                age_hours = (datetime.now(timezone.utc) - fill_dt).total_seconds() / 3600
-            except Exception:
-                pass
-        # Older positions get higher priority (age bonus)
-        age_bonus = max(0, age_hours - 12) * 100  # 100 priority points per hour after 12h
-        return size_risk + age_bonus
-
-    active_inv.sort(key=_qa_priority, reverse=True)
-    qa_batch = active_inv[:_MAX_QA_PER_RUN]  # top N by priority (no rotation needed)
-
-    # Track consecutive QA flags per ticker in kv_cache for auto-liquidation
-    _QA_FLAG_THRESHOLD = 3   # liquidate after 3 consecutive flagged cycles
-    _QA_EDGE_THRESHOLD = 0.10  # fair value must be >10¢ against entry to auto-liquidate
-    qa_liquidations = 0
-
-    if qa_batch:
-        print(f"[mm-qa] Checking {len(qa_batch)}/{len(active_inv)} inventory positions")
-    for ticker, net, rpnl, avg_e in qa_batch:
-        try:
-            mkt = api_get(f"/markets/{ticker}")
-            market = mkt.get("market", mkt)
-            yes_ask_f = float(market.get("yes_ask") or market.get("yes_ask_dollars") or 99)
-            if yes_ask_f > 1:
-                yes_ask_f /= 100
-            vol = float(market.get("volume") or market.get("volume_fp") or 0)
-            fresh_prob, _, fresh_n = get_independent_estimate(
-                ticker, market, yes_ask_f, vol,
-                disabled_sources=disabled_sources)
-            if fresh_prob is not None and fresh_n > 0:
-                entry_f = int(avg_e) / 100
-
-                # ── Settlement certainty fast-path for MM positions ──
-                # When outcome is near-certain and close to expiry, bypass the
-                # normal 3-flag QA process and liquidate (or hold) immediately.
-                _qa_close_str = market.get("close_time") or market.get("expiration_time") or ""
-                _qa_hours_left = 999
-                if _qa_close_str:
-                    try:
-                        _qa_close_dt = datetime.fromisoformat(_qa_close_str.replace("Z", "+00:00"))
-                        _qa_hours_left = max(0, (_qa_close_dt - now).total_seconds() / 3600)
-                    except Exception:
-                        pass
-
-                if _qa_hours_left < 4:
-                    pos_side = "yes" if net > 0 else "no"
-                    our_prob = fresh_prob if pos_side == "yes" else (1 - fresh_prob)
-
-                    if our_prob <= 0.10:
-                        # Near-certain LOSER — immediate liquidation, no flag wait
-                        qty = abs(net)
-                        opp_side = "no" if pos_side == "yes" else "yes"
-                        if pos_side == "yes":
-                            liq_price = min(99, max(1, int((1 - fresh_prob) * 100) + 2))
-                        else:
-                            liq_price = min(99, max(1, int(fresh_prob * 100) + 2))
-
-                        print(f"[mm-qa] 🚨 {ticker}: SETTLEMENT CERTAINTY EXIT — "
-                              f"{pos_side} x{qty} P(our_side)={our_prob:.2f} "
-                              f"hrs_left={_qa_hours_left:.1f}h — immediate liquidation")
-
-                        if not MM_DRY_RUN:
-                            try:
-                                client_id = f"mm_settle_liq_{ticker}_{int(time.time())}".replace(".", "_")
-                                resp = api_post("/portfolio/orders", {
-                                    "ticker": ticker,
-                                    "side": opp_side,
-                                    "type": "limit",
-                                    "count": qty,
-                                    ("yes_price" if opp_side == "yes" else "no_price"): liq_price,
-                                    "action": "buy",
-                                    "expiration_ts": int(time.time() + 300),
-                                    "client_order_id": client_id,
-                                })
-                                order_id = resp.get("order", {}).get("order_id", "?")
-                                print(f"[mm-qa]   ✓ settlement certainty liquidation order {order_id}")
-                                qa_liquidations += 1
-                                flag_key = f"mm_qa_flags_{ticker}"
-                                _db_cache_set(conn, flag_key, {"count": 0, "liquidated": True,
-                                              "reason": "settlement_certainty"}, 3600)
-                            except Exception as e:
-                                print(f"[mm-qa]   ✗ settlement certainty liquidation failed: {e}")
-                        else:
-                            print(f"[mm-qa]   [DRY] would buy {opp_side} {qty}x {ticker} "
-                                  f"@ {liq_price}¢ (settlement certainty)")
-                            qa_liquidations += 1
-                        qa_flags += 1
-                        continue  # skip normal QA for this ticker
-
-                    elif our_prob >= 0.93 and _qa_hours_left < 2:
-                        # Near-certain WINNER — hold to settlement, don't flag
-                        print(f"[mm-qa] ✅ {ticker}: SETTLEMENT CERTAINTY HOLD — "
-                              f"{pos_side} x{abs(net)} P(our_side)={our_prob:.2f} "
-                              f"hrs_left={_qa_hours_left:.1f}h — holding to settlement")
-                        # Reset any prior flags (we're winning now)
-                        flag_key = f"mm_qa_flags_{ticker}"
-                        _db_cache_set(conn, flag_key, {"count": 0}, 3600)
-                        continue  # skip normal QA for this ticker
-
-                is_losing = False
-                loss_magnitude = 0.0
-
-                if net > 0 and fresh_prob < entry_f - 0.05:
-                    is_losing = True
-                    loss_magnitude = entry_f - fresh_prob
-                elif net < 0 and (1 - fresh_prob) < (1 - entry_f) - 0.05:
-                    is_losing = True
-                    loss_magnitude = (1 - entry_f) - (1 - fresh_prob)
-
-                # Age-based exit: positions older than MM_MAX_LOT_AGE_HOURS get flagged
-                # even if not losing, to free capital and avoid stale inventory
-                is_aged_out = False
-                pos_age_hours = 0
-                if ticker in _age_data:
-                    try:
-                        fill_dt = datetime.fromisoformat(_age_data[ticker].replace("Z", "+00:00"))
-                        pos_age_hours = (datetime.now(timezone.utc) - fill_dt).total_seconds() / 3600
-                        if pos_age_hours > MM_MAX_LOT_AGE_HOURS:
-                            is_aged_out = True
-                            if not is_losing:
-                                # Force a small loss magnitude so the liquidation path triggers
-                                is_losing = True
-                                loss_magnitude = max(loss_magnitude, 0.05)
-                                print(f"[mm-qa] ⏰ {ticker}: AGED OUT ({pos_age_hours:.0f}h > {MM_MAX_LOT_AGE_HOURS}h) — triggering exit")
-                    except Exception:
-                        pass
-
-                if is_losing:
-                    # Track consecutive flags in kv_cache
-                    flag_key = f"mm_qa_flags_{ticker}"
-                    flag_data = _db_cache_get(conn, flag_key) or {"count": 0, "first_ts": now}
-                    flag_data["count"] = flag_data.get("count", 0) + 1
-                    flag_data["last_fair"] = round(fresh_prob, 4)
-                    flag_data["loss_mag"] = round(loss_magnitude, 4)
-                    _db_cache_set(conn, flag_key, flag_data, 3600)  # 1h TTL
-
-                    consec = flag_data["count"]
-
-                    # Auto-liquidate if flagged >= threshold AND loss is significant
-                    # Aged-out positions have a lower flag threshold (1 instead of 3)
-                    effective_flag_threshold = 1 if is_aged_out else _QA_FLAG_THRESHOLD
-                    effective_edge_threshold = 0.03 if is_aged_out else _QA_EDGE_THRESHOLD
-                    if consec >= effective_flag_threshold and loss_magnitude >= effective_edge_threshold:
-                        pos_side = "yes" if net > 0 else "no"
-                        qty = abs(net)
-                        # Synthetic sell: buy opposite side (maker fee, not taker)
-                        opp_side = "no" if pos_side == "yes" else "yes"
-                        if pos_side == "yes":
-                            # Exit YES → buy NO at aggressive price
-                            liq_price = min(99, max(1, int((1 - fresh_prob) * 100) + 2))
-                        else:
-                            # Exit NO → buy YES at aggressive price
-                            liq_price = min(99, max(1, int(fresh_prob * 100) + 2))
-
-                        print(f"[mm-qa] 🔴 {ticker}: AUTO-LIQUIDATING {pos_side} x{qty} — "
-                              f"flagged {consec}x, entry={entry_f:.2f} fair={fresh_prob:.2f} "
-                              f"loss={loss_magnitude:.2f} (synthetic sell: buy {opp_side})")
-
-                        if not MM_DRY_RUN:
-                            try:
-                                client_id = f"mm_qa_liq_{ticker}_{int(time.time())}".replace(".", "_")
-                                resp = api_post("/portfolio/orders", {
-                                    "ticker": ticker,
-                                    "side": opp_side,
-                                    "type": "limit",
-                                    "count": qty,
-                                    ("yes_price" if opp_side == "yes" else "no_price"): liq_price,
-                                    "action": "buy",
-                                    # No post_only: QA liquidation uses +2 aggressive pricing
-                                    # which crosses the spread. post_only would reject it.
-                                    "expiration_ts": int(time.time() + 300),  # 5 min expiry
-                                    "client_order_id": client_id,
-                                })
-                                order_id = resp.get("order", {}).get("order_id", "?")
-                                print(f"[mm-qa]   ✓ liquidation order {order_id}")
-                                qa_liquidations += 1
-                                # Reset flag counter after liquidation attempt
-                                _db_cache_set(conn, flag_key, {"count": 0, "liquidated": True}, 3600)
-                            except Exception as e:
-                                print(f"[mm-qa]   ✗ liquidation failed: {e}")
-                        else:
-                            print(f"[mm-qa]   [DRY] would buy {opp_side} {qty}x {ticker} @ {liq_price}¢ (synthetic sell)")
-                            qa_liquidations += 1
-                    else:
-                        _side_str = "YES" if net > 0 else "NO"
-                        print(f"[mm-qa] ⚠️  {ticker}: {_side_str} x{abs(net)} entry={entry_f:.2f} "
-                              f"fair={fresh_prob:.2f} — LOSING (flagged {consec}x"
-                              f"{f', need {_QA_EDGE_THRESHOLD:.0%} edge for auto-liq' if consec >= _QA_FLAG_THRESHOLD else ''})")
-                    qa_flags += 1
-                else:
-                    # Position is OK — reset consecutive flag counter
-                    flag_key = f"mm_qa_flags_{ticker}"
-                    prev_flags = _db_cache_get(conn, flag_key)
-                    if prev_flags and prev_flags.get("count", 0) > 0:
-                        _db_cache_set(conn, flag_key, {"count": 0}, 3600)
-                    print(f"[mm-qa] ✓ {ticker}: net={net:+d} entry={entry_f:.2f} "
-                          f"fair={fresh_prob:.2f} — OK ({fresh_n} sources)")
-        except Exception:
-            pass
-    if qa_flags:
-        print(f"[mm-qa] {qa_flags} positions flagged as potentially losing"
-              f"{f', {qa_liquidations} auto-liquidated' if qa_liquidations else ''}")
-    stats["qa_flags"] = qa_flags
-    stats["qa_liquidations"] = qa_liquidations
-
-    # Log MM session
-    conn.execute("""INSERT INTO mm_sessions
-        (recorded_at, markets_quoted, orders_posted, orders_cancelled,
-         fills_detected, inventory_value_cents, realized_pnl_cents, unrealized_pnl_cents)
-        VALUES (?,?,?,?,?,?,?,?)""",
-        (now, stats["markets_quoted"], stats["orders_posted"], stats["orders_cancelled"],
-         stats["fills_detected"], total_inv_value, total_realized, 0))
-    conn.commit()
-
-    skipped = stats.get('skipped_no_data', 0)
-    print(f"[mm] Summary: {stats['markets_quoted']} markets quoted, {skipped} skipped (no data), "
-          f"{stats['orders_posted']} orders, {stats['fills_detected']} fills, "
-          f"inventory=${total_inv_value/100:.2f}, realized P&L=${total_realized/100:+.2f}"
-          f"{f', {qa_flags} QA flags' if qa_flags else ''}")
-
-    return stats
-
-
-def mm_compute_adverse_selection(conn):
-    """Analyze MM fills for adverse selection using short-horizon markouts.
-
-    Instead of waiting for settlement (days/weeks), compares each fill's price to
-    the fair value estimated on a *subsequent* cycle for the same ticker.
-    This measures whether informed traders are picking us off in real-time.
-
-    Method: For each filled order, find the next order's fair_value_cents for the
-    same ticker (posted on a later cycle). The markout = fair_value_next - fill_price.
-    Adverse = markout is negative for buys (price dropped after we bought) or
-    positive for sells (price rose after we sold).
-
-    Falls back to settlement-based analysis for tickers with no markout data.
-
-    Returns dict of {ticker: adverse_selection_rate} for markets we should avoid or widen spreads on."""
-    adverse = {}
-    try:
-        # --- Primary: short-horizon markouts ---
-        # Get all filled orders with their fair values, ordered by time
-        rows = conn.execute("""
-            SELECT ticker, side, price_cents, fair_value_cents, timestamp
-            FROM mm_orders
-            WHERE status IN ('filled', 'partial') AND price_cents > 0
-            ORDER BY ticker, timestamp
-        """).fetchall()
-
-        per_ticker_fills = {}
-        for ticker, side, price, fair_val, ts in rows:
-            if ticker not in per_ticker_fills:
-                per_ticker_fills[ticker] = []
-            per_ticker_fills[ticker].append((side, price, fair_val, ts))
-
-        markout_tickers = set()
-        for ticker, fills in per_ticker_fills.items():
-            total = 0
-            adverse_count = 0
-            for i, (side, price, fair_val, ts) in enumerate(fills):
-                # Find next entry for this ticker to get the "next cycle fair value"
-                next_fv = None
-                for j in range(i + 1, len(fills)):
-                    if fills[j][2] and fills[j][2] > 0:  # fair_value_cents > 0
-                        next_fv = fills[j][2]
-                        break
-                if next_fv is None:
-                    continue  # no markout available yet
-
-                total += 1
-                # Markout: how did fair value move after our fill?
-                if side == "yes":
-                    # We bought YES at price. If next fair value < price, adverse.
-                    if next_fv < price:
-                        adverse_count += 1
-                else:  # side == "no"
-                    # We bought NO at `price` cents (price_cents stores the NO price for NO fills).
-                    # NO value at next cycle = 100 - next_fv (since next_fv is YES fair value).
-                    # Adverse if NO value dropped below what we paid.
-                    next_no_value = 100 - next_fv
-                    if next_no_value < price:
-                        adverse_count += 1
-
-            if total >= 3:  # Lower threshold since markouts are more informative
-                rate = adverse_count / total
-                adverse[ticker] = rate
-                markout_tickers.add(ticker)
-                if rate > 0.65:
-                    print(f"[mm_learn] ⚠️  High adverse selection (markout) on {ticker}: "
-                          f"{rate:.0%} ({adverse_count}/{total} fills)")
-
-        # --- Fallback: settlement-based for tickers without enough markout data ---
-        try:
-            settle_rows = conn.execute("""
-                SELECT mm.ticker, mm.side, mm.price_cents, s.won
-                FROM mm_orders mm
-                JOIN settlements s ON mm.ticker = s.ticker
-                WHERE mm.status IN ('filled', 'partial')
-                AND mm.ticker NOT IN (SELECT DISTINCT ticker FROM mm_orders
-                    WHERE status IN ('filled', 'partial') AND price_cents > 0
-                    GROUP BY ticker HAVING COUNT(*) >= 6)
-            """).fetchall()
-
-            per_ticker_settle = {}
-            for ticker, side, price, won in settle_rows:
-                if ticker in markout_tickers:
-                    continue  # already have markout data
-                if ticker not in per_ticker_settle:
-                    per_ticker_settle[ticker] = {"total": 0, "adverse": 0}
-                per_ticker_settle[ticker]["total"] += 1
-                if (side == "yes" and not won) or (side == "no" and won):
-                    per_ticker_settle[ticker]["adverse"] += 1
-
-            for ticker, stats in per_ticker_settle.items():
-                if stats["total"] >= 5:
-                    rate = stats["adverse"] / stats["total"]
-                    adverse[ticker] = rate
-                    if rate > 0.65:
-                        print(f"[mm_learn] ⚠️  High adverse selection (settlement) on {ticker}: "
-                              f"{rate:.0%} ({stats['adverse']}/{stats['total']})")
-        except Exception:
-            pass  # settlements table may not have data yet
-
-    except Exception as e:
-        print(f"[mm_learn] Error computing adverse selection: {e}")
-    return adverse
-
-
-def mm_liquidate_expiring(conn):
-    """Check for MM inventory in markets that are about to expire (<1h) or already expired.
-    - Expiring (<1h): post aggressive exit orders to avoid holding through settlement.
-    - Already expired/settled/closed with confirmed result: record settlement P&L.
-    - SAFETY: never zero inventory without confirmed settlement or confirmed flattening fill.
-    Returns count of liquidation orders posted."""
-    liquidated = 0
-    try:
-        inv_rows = conn.execute(
-            "SELECT ticker, net_position, avg_entry_cents FROM mm_inventory WHERE net_position != 0"
-        ).fetchall()
-        for ticker, net, avg_entry in inv_rows:
-            try:
-                m_data = api_get(f"/markets/{ticker}")
-                market = m_data.get("market", m_data)
-
-                # Check if market is already settled/closed
-                status = (market.get("status") or "").lower()
-                result = (market.get("result") or market.get("expiration_value") or "").lower()
-
-                if status in ("settled", "closed", "finalized", "determined") and result in ("yes", "no"):
-                    # Market settled with confirmed result — safe to zero + record P&L
-                    # Convention: avg_entry is YES-equivalent cost basis
-                    #   long YES (net>0): avg_entry = what we paid for YES
-                    #   short YES (net<0): avg_entry = 100 - what_we_paid_for_NO
-                    if result == "yes":
-                        # YES pays $1: long YES profits, short YES loses
-                        pnl_cents = net * (100 - avg_entry)
-                    else:  # result == "no"
-                        # NO pays $1: long YES loses, short YES profits
-                        pnl_cents = -net * avg_entry
-
-                    # Subtract actual fees from P&L (same as record_settlements path)
-                    fee_cents = 0.0
-                    try:
-                        fee_row = conn.execute(
-                            "SELECT COALESCE(SUM(fee_cents), 0) FROM mm_processed_fills WHERE ticker=?",
-                            (ticker,)
-                        ).fetchone()
-                        if fee_row and fee_row[0]:
-                            fee_cents = float(fee_row[0])
-                    except Exception:
-                        pass  # fee_cents column may not exist yet
-                    pnl_cents -= fee_cents
-
-                    conn.execute("""UPDATE mm_inventory SET net_position=0,
-                                   realized_pnl_cents = realized_pnl_cents + ?
-                                   WHERE ticker=?""", (int(pnl_cents), ticker))
-                    conn.commit()
-                    print(f"[mm] Settled {ticker}: net={net:+d} result={result} "
-                          f"pnl=${pnl_cents/100:+.2f} (fees=${fee_cents/100:.2f})")
-                    continue
-
-                if status in ("settled", "closed", "finalized", "determined") and result not in ("yes", "no"):
-                    # Market closed but no clear result yet — do NOT zero, wait for result
-                    print(f"[mm] ⚠️  {ticker}: status={status} but result='{result}' — waiting for confirmed settlement")
-                    continue
-
-                close_time = market.get("close_time") or market.get("expiration_time")
-                if not close_time:
-                    continue
-                ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
-                hours_left = (ct - datetime.now(timezone.utc)).total_seconds() / 3600
-
-                if hours_left < -1:
-                    # Market closed >1h ago but not yet marked settled in API
-                    # Do NOT zero — let record_settlements() handle it with confirmed fill data
-                    print(f"[mm] ⚠️  {ticker}: closed {-hours_left:.1f}h ago, awaiting settlement confirmation")
-                    continue
-
-                if hours_left > 1:
-                    continue  # not expiring yet
-
-                # Liquidate: post market-crossing order to exit
-                qty = abs(net)
-                liq_client_id = f"mm_liq_{ticker.replace('.', '_')}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-                if net > 0:
-                    yes_bid = market.get("yes_bid") or market.get("yes_bid_dollars") or 0
-                    if isinstance(yes_bid, str):
-                        yes_bid = round(float(yes_bid) * 100)
-                    elif isinstance(yes_bid, float) and yes_bid < 1:
-                        yes_bid = round(yes_bid * 100)
-                    no_price = max(1, 100 - yes_bid + 2)
-                    order_body = {
-                        "ticker": ticker, "side": "no", "type": "limit",
-                        "count": qty, "no_price": no_price, "action": "buy",
-                        "client_order_id": liq_client_id,
-                        "expiration_ts": int(time.time() + 3600),
-                        # No post_only: liquidation must cross the spread to fill
-                        # before market expires. +2 ensures we take available liquidity.
-                    }
-                else:
-                    yes_ask = market.get("yes_ask") or market.get("yes_ask_dollars") or 99
-                    if isinstance(yes_ask, str):
-                        yes_ask = round(float(yes_ask) * 100)
-                    elif isinstance(yes_ask, float) and yes_ask < 1:
-                        yes_ask = round(yes_ask * 100)
-                    order_body = {
-                        "ticker": ticker, "side": "yes", "type": "limit",
-                        "count": qty, "yes_price": min(99, yes_ask + 2), "action": "buy",
-                        "client_order_id": liq_client_id,
-                        "expiration_ts": int(time.time() + 3600),
-                        # No post_only: same as above — urgent liquidation.
-                    }
-
-                if not MM_DRY_RUN:
-                    resp = api_post("/portfolio/orders", order_body)
-                    liq_order_id = resp.get("order", {}).get("order_id", "")
-                    # Track in mm_orders so fills are detected by mm_check_fills()
-                    if liq_order_id:
-                        liq_side = order_body["side"]
-                        liq_price = order_body.get("no_price") or order_body.get("yes_price", 0)
-                        conn.execute("""INSERT OR IGNORE INTO mm_orders
-                            (timestamp, order_id, ticker, side, price_cents, contracts, tag, status, fill_qty, fair_value_cents)
-                            VALUES (?, ?, ?, ?, ?, ?, 'liquidation', 'posted', 0, 0)""",
-                            (datetime.now(timezone.utc).isoformat(), liq_order_id, ticker, liq_side, liq_price, qty))
-                        conn.commit()
-                    print(f"[mm] Liquidating {ticker}: {qty} contracts "
-                          f"(net={net:+d}, {hours_left:.1f}h left) order={liq_order_id[:12] if liq_order_id else '?'}")
-                    liquidated += 1
-                else:
-                    print(f"[mm] DRY: Would liquidate {ticker}: {qty} contracts")
-                    liquidated += 1
-            except Exception as e:
-                err_str = str(e)
-                if "404" in err_str:
-                    # Market no longer exists — do NOT zero silently, log for manual review
-                    print(f"[mm] ⚠️  {ticker}: market 404 (net={net:+d}) — awaiting settlement to zero")
-                elif "400" in err_str:
-                    # Cannot trade — market may be frozen/closed, let settlement handle it
-                    print(f"[mm] ⚠️  {ticker}: order rejected 400 (net={net:+d}) — awaiting settlement")
-                else:
-                    print(f"[mm] Error liquidating {ticker}: {e}")
-    except Exception as e:
-        print(f"[mm] Error in liquidation scan: {e}")
-    return liquidated
-
-
-_MM_ADVERSE_CACHE = None  # computed once per cycle
-
-def mm_adaptive_spread(conn, ticker, base_half_spread):
-    """Adjust spread width based on learned adverse selection rate.
-    Markets with high adverse selection get wider spreads.
-    Returns adjusted half-spread in cents. Returns -1 to signal quoting block."""
-    global _MM_ADVERSE_CACHE
-    if _MM_ADVERSE_CACHE is None:
-        _MM_ADVERSE_CACHE = mm_compute_adverse_selection(conn)
-
-    # Check exact ticker first, then series prefix
-    rate = _MM_ADVERSE_CACHE.get(ticker)
-    if rate is None:
-        prefix = ticker[:12] if len(ticker) > 12 else ticker[:6]
-        series_rates = [r for t, r in _MM_ADVERSE_CACHE.items() if t.startswith(prefix)]
-        rate = sum(series_rates) / len(series_rates) if series_rates else 0.5
-
-    if rate > 0.85:
-        # Extremely toxic — but only block if we have enough data
-        # Check fill count for this ticker/series to avoid blocking on sparse data
-        prefix = ticker[:12] if len(ticker) > 12 else ticker[:6]
-        try:
-            fill_count = conn.execute(
-                "SELECT COUNT(*) FROM mm_orders WHERE ticker LIKE ? AND fill_qty > 0",
-                (prefix + "%",)).fetchone()[0]
-        except Exception:
-            fill_count = 0
-        if fill_count >= 30:  # Only block with 30+ fills of evidence
-            print(f"    [adverse] {ticker}: rate={rate:.0%} ({fill_count} fills) — BLOCKING quotes")
-            return -1
-        else:
-            # Not enough data — triple spread instead
-            print(f"    [adverse] {ticker}: rate={rate:.0%} but only {fill_count} fills — widening 3x (need 30+ to block)")
-            return min(20, base_half_spread * 3)
-    elif rate > 0.7:
-        # Very high — triple the spread
-        return min(20, base_half_spread * 3)
-    elif rate > 0.6:
-        # High — double the spread
-        return min(15, base_half_spread * 2)
-    elif rate > 0.5:
-        # Moderate — widen by 50%
-        return min(12, int(base_half_spread * 1.5))
-    elif rate < 0.35:
-        # Low adverse selection — tighten slightly for more fills
-        return max(2, base_half_spread - 1)
-    return base_half_spread
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
-def main():
+def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
+    """Run one full trading cycle.
+
+    Args:
+        conn: optional pre-opened sqlite3 connection (daemon use). If None,
+            a new connection is opened via init_db() at cycle start.
+        close_conn: close the connection at cycle end. Defaults True for
+            oneshot backward-compat; daemon passes False to keep the
+            persistent connection alive.
+        write_json_report: write /task/trades.json snapshot. Daemon
+            passes False so we don't rewrite a file every 60 seconds.
+    """
     global MIN_EDGE, SINGLE_SOURCE_EDGE, _PERSIST_CONN
-    conn = init_db()
+    if conn is None:
+        conn = init_db()
     _PERSIST_CONN = conn  # Enable persistent cross-run caching
     _db_cache_cleanup(conn)  # Remove expired cache entries
     now  = datetime.now(timezone.utc).isoformat()
@@ -8147,21 +6578,17 @@ def main():
               "phase_stats": phase_stats, "effective_limits": effective_limits}
 
     # ── Pre-fetch balance for dynamic sizing (needed by manage_positions) ──
-    global MM_ORDER_SIZE, MM_MAX_INVENTORY
     try:
         _early_balance, _early_portfolio = get_portfolio()
         total_equity_cents = _early_balance + _early_portfolio
     except Exception:
         total_equity_cents = 100_000  # fallback $1K if API fails
     dyn = compute_dynamic_sizing(total_equity_cents, conn=conn)
-    MM_ORDER_SIZE = dyn["mm_order_size"]
-    MM_MAX_INVENTORY = dyn["mm_max_inventory"]
     result["dynamic_sizing"] = dyn
     conf_str = (f"confidence={dyn['confidence']:.0%} "
                 f"(WR={dyn['recent_wr']:.0%} on {dyn['recent_n']} settlements, "
                 f"target={dyn['target_order_size']}/{dyn['target_max_inventory']})")
     print(f"[sizing] Equity=${total_equity_cents/100:.2f} → "
-          f"MM_ORDER_SIZE={MM_ORDER_SIZE}  MM_MAX_INVENTORY={MM_MAX_INVENTORY}  "
           f"trim≥{dyn['trim_threshold']}  major≥{dyn['major_threshold']}  "
           f"{conf_str}")
 
@@ -8169,22 +6596,52 @@ def main():
     result["orders_pruned"] = prune_stale_orders()
     track_fills(conn)
     result["settlements_recorded"] = record_settlements(conn)
+
+    # Phase 1: cascade newly-settled alpha_backtest rows into the learning
+    # tables (calibration / timing_patterns / edge_convergence / postmortems).
+    # Legacy writers below still run on `trades`+`mm_orders`; this adds the
+    # shadow-decision rows so directional DRY_RUN isn't invisible.
+    try:
+        result["alpha_populated"] = _alpha_populate_all(conn)
+    except Exception as e:
+        print(f"[alpha_log] populate_all failed: {e}")
+        result["alpha_populated"] = {}
+
     result["positions_managed"] = manage_positions(conn, dyn)
     avoid_filters = compute_avoid_filters(conn)
     result["patterns_avoided"] = avoid_filters.get("summary", [])
 
     # ── Adaptive learning: compute updated weights, calibration, and edge thresholds
     # Reset per-run caches so we recompute from latest settlement data
-    global _LEARNED_WEIGHTS, _CALIBRATION_CURVE, _CATEGORY_EDGES
+    global _LEARNED_WEIGHTS, _CATEGORY_EDGES
     _LEARNED_WEIGHTS = None
-    _CALIBRATION_CURVE = None
+    _cal_reset_cache()
     _CATEGORY_EDGES = None
     adaptive_weights = compute_adaptive_weights(conn)
-    calibration_corrections = compute_calibration_correction(conn)
+    # Fit Platt curve once per cycle from the calibration table and persist to
+    # kv_cache (keyed "calibration_curve_v2", 1h TTL). The ensemble reads via
+    # the `calibration_corrections` parameter; see bot/learning/calibration.py.
+    try:
+        calibration_corrections = _cal_fit_and_persist(conn)
+    except Exception as e:
+        print(f"[calibration] fit_and_persist failed: {e}")
+        calibration_corrections = _cal_load_curve(conn) or {}
     category_edges = compute_category_edge_thresholds(conn)
     result["adaptive_weights"] = adaptive_weights
     result["calibration_corrections"] = calibration_corrections
     result["category_edges"] = category_edges
+    # Observability: surface fit diagnostics so the pipeline_health tail and
+    # daemon logs make the curve visible without spelunking kv_cache.
+    if isinstance(calibration_corrections, dict):
+        _cal_method = calibration_corrections.get("method", "identity")
+        _cal_n = calibration_corrections.get("n_samples", 0)
+        _cal_A = calibration_corrections.get("A", 1.0)
+        _cal_B = calibration_corrections.get("B", 0.0)
+        _cal_bb = calibration_corrections.get("brier_before", 0.0)
+        _cal_ba = calibration_corrections.get("brier_after", 0.0)
+        _cal_fams = len(calibration_corrections.get("families", {}) or {})
+        print(f"[calibration] method={_cal_method} n={_cal_n} A={_cal_A:.3f} "
+              f"B={_cal_B:+.3f} brier {_cal_bb:.4f}→{_cal_ba:.4f} families={_cal_fams}")
 
     # ── Advanced learning loops ─────────────────────────────────────────────
     # Loss post-mortems: classify why we lose (directional trades)
@@ -8192,13 +6649,6 @@ def main():
         result["postmortems"] = run_loss_postmortems(conn)
     except Exception as e:
         print(f"[postmortem] Error: {e}"); result["postmortems"] = 0
-
-    # MM post-mortems: classify MM-specific losses (joins mm_orders, not trades)
-    try:
-        from bot.learning.postmortems import run_mm_postmortems
-        result["mm_postmortems"] = run_mm_postmortems(conn)
-    except Exception as e:
-        print(f"[mm-postmortem] Error: {e}"); result["mm_postmortems"] = 0
 
     # Edge convergence: are we actually smarter than the market?
     try:
@@ -8230,13 +6680,17 @@ def main():
             "convergence_rate": active_feedback["convergence_rate"],
             "strategy_stats": active_feedback.get("strategy_stats", {}),
         }
-        # Apply edge multiplier from convergence + loss analysis
+        # Apply edge multiplier from convergence + loss analysis. Derive from
+        # the phase-applied effective_limits (not current globals) so the
+        # multiplication cannot compound across daemon cycles. See T0.1 notes
+        # on apply_phase_limits.
         if active_feedback["edge_multiplier"] != 1.0:
-            MIN_EDGE *= active_feedback["edge_multiplier"]
-            SINGLE_SOURCE_EDGE *= active_feedback["edge_multiplier"]
+            fb_mult = active_feedback["edge_multiplier"]
+            MIN_EDGE = effective_limits["min_edge"] * fb_mult
+            SINGLE_SOURCE_EDGE = effective_limits["single_source_edge"] * fb_mult
             print(f"[feedback] Adjusted MIN_EDGE to {MIN_EDGE:.3f}, "
                   f"SINGLE_SOURCE_EDGE to {SINGLE_SOURCE_EDGE:.3f} "
-                  f"(multiplier={active_feedback['edge_multiplier']:.2f})")
+                  f"(multiplier={fb_mult:.2f})")
 
         # Check if current hour should be skipped
         current_hour = datetime.now(timezone.utc).hour
@@ -8269,6 +6723,11 @@ def main():
 
     markets = []  # populated in Phase 3; used by both Phase 4 (directional) and Phase 4a (MM)
 
+    # Funnel counters — initialised here so every code path (including
+    # halted / skip-hour) emits a (possibly zero-filled) funnel line.
+    from collections import defaultdict as _defdict
+    cycle_counters = _defdict(int)
+
     day_start = get_day_start_balance(conn)
     if day_start is None:
         day_start = initial_balance + portfolio_value  # first run of the day — use total equity
@@ -8286,52 +6745,92 @@ def main():
         result["trades_skipped_reason"] = "active_feedback_skip_hour"
     else:
         # ── Phase 3: Scan & score ─────────────────────────────────────────
+        # Per-series fetch. Unfiltered `/markets?status=open` started returning
+        # ~99% KXMVE parlay legs (50K rows) somewhere on or before 2026-04-25;
+        # the previous 10-page (5K-market) cursor walk hit zero non-parlay
+        # markets per cycle for days. We now enumerate the series we have
+        # ensemble signal for explicitly. New series get surfaced by the
+        # `series_discovery` daemon task — alert-only, no auto-add.
+        from bot.config import TRADE_SERIES_ALLOWLIST
         print("[trade.py] Fetching markets …")
-        markets = []
-        cursor = None
-        MAX_PAGES = 10  # scan up to 5000 markets to get past parlay flood
-        try:
-            for page in range(MAX_PAGES):
-                url = "/markets?limit=500&status=open"
-                if cursor:
-                    url += f"&cursor={cursor}"
-                resp = api_get(url)
-                batch = resp.get("markets", [])
-                markets.extend(batch)
-                cursor = resp.get("cursor")
-                print(f"[trade.py] Page {page+1}: fetched {len(batch)} markets (total {len(markets)})")
-                if not cursor or len(batch) < 500:
-                    break  # no more pages
-        except Exception as e:
-            print(f"[trade.py] ERROR fetching markets: {e}")
+        markets: list[dict] = []
+        for series in TRADE_SERIES_ALLOWLIST:
+            try:
+                cursor = None
+                series_count = 0
+                while True:
+                    url = f"/markets?limit=200&status=open&series_ticker={series}"
+                    if cursor:
+                        url += f"&cursor={cursor}"
+                    resp = api_get(url)
+                    batch = resp.get("markets", [])
+                    markets.extend(batch)
+                    series_count += len(batch)
+                    cursor = resp.get("cursor")
+                    if not cursor or len(batch) < 200:
+                        break
+                print(f"[trade.py]   {series}: {series_count} markets")
+            except Exception as e:
+                # One bad series shouldn't abort the whole scan — log and continue.
+                print(f"[trade.py] ERROR fetching {series}: {e}")
         result["markets_scanned"] = len(markets)
-        print(f"[trade.py] Scanned {len(markets)} markets total")
+        print(f"[trade.py] Scanned {len(markets)} markets total across "
+              f"{len(TRADE_SERIES_ALLOWLIST)} allowlisted series")
+
+        # ── Cycle funnel counters (2026-04-22 audit — observability #4) ──
+        # Bundled with the avoid-filter partition fix. Without this funnel
+        # there is no way to MEASURE whether the partitioning actually
+        # unblocks KXHIGH* directional candidates; every filter stage now
+        # increments a named counter that gets printed at end-of-cycle.
+        cycle_counters["markets_scanned"] = len(markets)
 
         candidates = []
         for m in markets:
             # Skip multi-leg parlay/combo markets — synthetic, not real tradeable markets
             _t = m.get("ticker", "")
             if "KXMVE" in _t or "MULTIGAME" in _t or m.get("mve_collection_ticker"):
+                cycle_counters["parlay_skipped"] += 1
                 continue
-            score, side, strategy, detail, volume, sc, indep_prob, mkt_prob, edge = score_market(
+            score, side, strategy, detail, volume, sc, indep_prob, mkt_prob, edge, _score_skip = score_market(
                 m, adaptive_weights=adaptive_weights,
                 calibration_corrections=calibration_corrections,
                 category_edges=category_edges,
                 disabled_sources=active_feedback.get("disabled_sources"),
                 disabled_strategies=active_feedback.get("disabled_strategies"),
                 strategy_bandit=active_feedback.get("strategy_bandit"))
-            if score <= 0: continue
+            if score <= 0:
+                # Partition score_zero by reason so the funnel reveals WHICH
+                # gate is eating the non-parlay universe. Six reasons map 1:1
+                # to score_market's six EMPTY exits. See bot/scoring/
+                # market_scorer.py SKIP_* constants.
+                cycle_counters[f"score_zero_{_score_skip or 'unknown'}"] += 1
+                continue
             ticker = m.get("ticker", "")
             ok_t, skip_reason = passes_filters(ticker, strategy, volume, sc, avoid_filters)
-            if not ok_t: print(f"  ⊘ {ticker}: {skip_reason}"); continue
+            if not ok_t:
+                # Partition by filter stage so we can see per-strategy prefix
+                # rejection rates separately from volume/strategy rejections.
+                if "vol " in skip_reason:
+                    cycle_counters["filter_volume"] += 1
+                elif "prefix" in skip_reason:
+                    cycle_counters[f"filter_prefix_{strategy}"] += 1
+                elif "strat" in skip_reason:
+                    cycle_counters["filter_strategy"] += 1
+                else:
+                    cycle_counters["filter_other"] += 1
+                print(f"  ⊘ {ticker}: {skip_reason}"); continue
+            cycle_counters["passed_filters"] += 1
             candidates.append((score, side, strategy, detail, volume, sc, indep_prob, mkt_prob, edge, m))
 
         # Dedup against open orders
         open_positions = get_open_tickers()
+        _pre_dedup = len(candidates)
         candidates = [c for c in candidates if (c[9].get("ticker",""), c[1]) not in open_positions]
+        cycle_counters["dedup_open_orders"] += _pre_dedup - len(candidates)
 
         # ── Correlation limits: max positions per risk category ───────
         category_counts = {}
+        existing_pos = []
         try:
             resp = api_get("/portfolio/positions?limit=100")
             existing_pos = resp.get("market_positions", resp.get("positions", []))
@@ -8345,6 +6844,28 @@ def main():
         except Exception as e:
             print(f"[correlation] Could not fetch positions: {e}")
 
+        # ── Per-family exposure cap (correlated-basket risk) ──────────
+        # Kelly-by-market assumes independence; KXFED-26MAY / 26JUN / 26JUL
+        # are one bet on Fed rate path, not three. Without this cap the
+        # Apr 17 book ran 95% KXFED. Tracked in cents across the cycle,
+        # including within-cycle accumulation from accepted candidates.
+        from bot.core.exposure import (
+            compute_family_exposures,
+            compute_expiry_exposures,
+            size_trade_against_family_cap,
+            size_trade_against_expiry_cap,
+        )
+        from bot.config import MAX_FAMILY_EXPOSURE_RATIO, MAX_EXPIRY_EXPOSURE_RATIO
+        family_exposures = compute_family_exposures(existing_pos)
+        expiry_exposures = compute_expiry_exposures(existing_pos)
+        total_equity_cents = initial_balance + portfolio_value
+        if family_exposures:
+            print(f"[family_cap] Existing exposure by family (cents): "
+                  f"{dict(sorted(family_exposures.items(), key=lambda kv: -kv[1])[:5])}")
+        if expiry_exposures:
+            print(f"[expiry_cap] Existing exposure by expiry (cents): "
+                  f"{dict(sorted(expiry_exposures.items(), key=lambda kv: -kv[1])[:5])}")
+
         filtered_candidates = []
         for c in candidates:
             cticker = c[9].get("ticker", "")
@@ -8352,11 +6873,13 @@ def main():
             cat = categorize_market(cticker, ctitle)
             current = category_counts.get(cat, 0)
             if current >= MAX_PER_CATEGORY:
+                cycle_counters["category_full"] += 1
                 print(f"  ⊘ {cticker}: category '{cat}' full ({current}/{MAX_PER_CATEGORY})")
                 continue
             category_counts[cat] = current + 1
             filtered_candidates.append(c)
         candidates = filtered_candidates
+        cycle_counters["candidates_final"] = len(candidates)
 
         candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -8373,10 +6896,10 @@ def main():
               f"({len(top) - n_explore} exploit + {n_explore} explore)")
 
         # ── Phase 4: Execute ──────────────────────────────────────────────
-        # Separate MM vs directional exposure budgets.
-        # MM inventory is managed by its own capital cap (MM_CAPITAL_PCT).
-        # Directional trades get their own budget so MM doesn't crowd them out.
-        mm_inventory_cents = 0
+        # Legacy MM inventory (if any — MM code has been deleted but mm_inventory
+        # may still hold pre-deletion positions) is subtracted from the directional
+        # exposure budget to avoid double-counting while they settle naturally.
+        legacy_mm_inventory_cents = 0
         try:
             inv_rows = conn.execute(
                 """SELECT SUM(
@@ -8385,16 +6908,16 @@ def main():
                          ELSE 0 END
                 ) FROM mm_inventory"""
             ).fetchone()
-            mm_inventory_cents = int(inv_rows[0] or 0)
+            legacy_mm_inventory_cents = int(inv_rows[0] or 0)
         except Exception as e:
             print(f"[trade] mm_inventory exposure query failed: {e}")
-        directional_exposure = max(0, portfolio_value - mm_inventory_cents)
+        directional_exposure = max(0, portfolio_value - legacy_mm_inventory_cents)
         total_exposure_cents = directional_exposure
         max_exposure_cents = int(initial_balance * MAX_PORTFOLIO_PCT)
 
-        # Global portfolio risk check: MM + directional + SC total exposure
+        # Global portfolio risk check: directional + SC + legacy MM total exposure
         from bot.config import MAX_PORTFOLIO_EXPOSURE_RATIO
-        total_portfolio_exposure = portfolio_value  # includes MM + directional + SC
+        total_portfolio_exposure = portfolio_value  # includes directional + SC + legacy MM
         global_exposure_limit = int(initial_balance * MAX_PORTFOLIO_EXPOSURE_RATIO)
         _global_throttle = total_portfolio_exposure > global_exposure_limit
         if _global_throttle:
@@ -8403,7 +6926,7 @@ def main():
                   f"— blocking new directional entries")
 
         print(f"[exposure] Directional={directional_exposure/100:.2f} "
-              f"MM_inv={mm_inventory_cents/100:.2f} Total={total_portfolio_exposure/100:.2f} "
+              f"LegacyMM={legacy_mm_inventory_cents/100:.2f} Total={total_portfolio_exposure/100:.2f} "
               f"Max_dir={max_exposure_cents/100:.2f} Global_cap={global_exposure_limit/100:.2f}")
 
         current_balance = initial_balance
@@ -8431,11 +6954,98 @@ def main():
             # Kelly with independent estimate
             prob_for_kelly = indep_prob if indep_prob else (1 - price_cents/100)
             contracts = kelly_contracts(prob_for_kelly, price_cents, current_balance)
-            if contracts <= 0:
-                print(f"  \u2192 {ticker}: Kelly skip (no edge)")
-                log_opportunity(conn, ticker, strategy, "skip_kelly", side=side,
+
+            # ── Per-family graduated sizing (step 9) ────────────────
+            # Scale Kelly contracts by the family's live-state multiplier:
+            # shadow=0 (logged only), canary=0.5 (half size), full=1.0.
+            # Default for unseen families is shadow — safe-by-default.
+            _family = _family_from_ticker(ticker).upper()
+            _live_flag = _get_live_state(conn, _family)
+            _kelly_mult = _get_kelly_multiplier(conn, _family)
+            if _kelly_mult < 1.0 and _kelly_mult > 0.0:
+                _full_contracts = contracts
+                contracts = max(1, int(round(contracts * _kelly_mult)))
+                if contracts != _full_contracts:
+                    print(f"  → {ticker}: {_live_flag.state} sizing "
+                          f"{_full_contracts}→{contracts} (mult={_kelly_mult})")
+
+            # ── Directional shadow evaluator (step 7) ────────────────
+            # Pure gate: block-list → kelly_zero → below_edge → shadow_pass.
+            # `indep_prob` here is already P(our_side) (see score_market
+            # construction), so pass-through. Market mid stays YES-side.
+            _mkt_snap = _alpha_market_snapshot(m)
+            _mid = None
+            if _mkt_snap.yes_bid_cents is not None and _mkt_snap.yes_ask_cents is not None:
+                _mid = (_mkt_snap.yes_bid_cents + _mkt_snap.yes_ask_cents) // 2
+            elif _mkt_snap.yes_last_cents is not None:
+                _mid = _mkt_snap.yes_last_cents
+            # METAR-required gate for weather families. Validation 2026-04-29:
+            # combined μ degrades 1-3°F cold without fresh METAR, producing
+            # catastrophic Brier on bracket-edge calls. Refuse to trade
+            # weather without it. Non-weather tickers skip this check.
+            _is_weather_family = ticker.upper().startswith("KXHIGH")
+            _metar_fresh = (
+                _is_metar_fresh_for_ticker(ticker)
+                if (_is_weather_family and _is_metar_fresh_for_ticker is not None)
+                else True  # non-weather: gate is a no-op
+            )
+
+            # TTE window for weather families. Validation 2026-04-29:
+            # daily highs occur ~3pm LST, settlement is midnight LST, so
+            # TTE <9h means peak already passed and market is at trivial
+            # certainty (Brier ~0.0001) — unwinnable. Trade-eligible
+            # window is TTE ≥12h. Non-weather skips the gate.
+            _tte_hours = None
+            _min_tte_hours = 0.0
+            if _is_weather_family:
+                _close_time = m.get("close_time") if isinstance(m, dict) else None
+                if isinstance(_close_time, str):
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        _expiry_dt = _dt.fromisoformat(
+                            _close_time.replace("Z", "+00:00")
+                        )
+                        _tte_hours = (
+                            _expiry_dt - _dt.now(_tz.utc)
+                        ).total_seconds() / 3600.0
+                        _min_tte_hours = 12.0
+                    except (ValueError, TypeError):
+                        pass
+
+            shadow_dec = _eval_directional_shadow(
+                ticker=ticker, side=side,
+                indep_prob=float(indep_prob) if indep_prob is not None else 0.5,
+                contracts=int(contracts),
+                price_cents=int(price_cents),
+                market_mid_cents=_mid,
+                min_edge=MIN_EDGE,
+                metar_required=_is_weather_family,
+                metar_fresh=_metar_fresh,
+                tte_hours=_tte_hours,
+                min_tte_hours=_min_tte_hours,
+            )
+            if shadow_dec.outcome != _ShadowOutcome.SHADOW_PASS:
+                print(f"  → {ticker}: shadow={shadow_dec.outcome} "
+                      f"({shadow_dec.skip_reason})")
+                log_opportunity(conn, ticker, strategy,
+                                f"skip_{shadow_dec.outcome}", side=side,
                                 ensemble_prob=indep_prob, market_prob=mkt_prob,
-                                edge=edge, source_count=sc, skip_reason="kelly_zero")
+                                edge=edge, source_count=sc,
+                                skip_reason=shadow_dec.skip_reason)
+                if indep_prob is not None:
+                    _alpha_log_decision(
+                        conn, ticker=ticker,
+                        decision_type=_AlphaType.DIRECTIONAL_SHADOW,
+                        decision_outcome=_AlphaOutcome.DISCARDED,
+                        ensemble=_AlphaEnsemble(
+                            p_yes=_to_canonical_p_yes(indep_prob, side),
+                            source_count=sc,
+                        ),
+                        market=_mkt_snap,
+                        side=side, price_cents=int(price_cents),
+                        skip_reason=shadow_dec.skip_reason,
+                        notes=f"strategy={strategy};shadow={shadow_dec.outcome}",
+                    )
                 continue
 
             # Order book depth check: cap contracts to what the book can absorb
@@ -8464,6 +7074,63 @@ def main():
                 order_cost_cents = contracts * price_cents
                 print(f"  → {ticker}: reduced to {contracts} contracts for exposure limit")
 
+            # Per-family exposure cap: bounds aggregate correlated bets
+            # (KXFED-26MAY + KXFED-26JUN + KXFED-26JUL are one rate-path
+            # thesis, not three). Runs after the global cap so it's the
+            # tighter of the two constraints that binds.
+            _fam_contracts, _fam_skip = size_trade_against_family_cap(
+                ticker=ticker,
+                proposed_contracts=contracts,
+                price_cents=price_cents,
+                family_exposures=family_exposures,
+                total_equity_cents=total_equity_cents,
+                max_family_ratio=MAX_FAMILY_EXPOSURE_RATIO,
+            )
+            if _fam_skip is not None:
+                print(f"  → {ticker}: SKIP — {_fam_skip} "
+                      f"(cap={MAX_FAMILY_EXPOSURE_RATIO:.0%} of equity)")
+                continue
+            if _fam_contracts < contracts:
+                print(f"  → {ticker}: family cap reduced {contracts}→{_fam_contracts}")
+                contracts = _fam_contracts
+                order_cost_cents = contracts * price_cents
+
+            # Per-settlement-event cap: bounds one-FOMC or one-weather-date
+            # concentration where family-cap pools unrelated settle dates.
+            # Runs after family cap so the tighter of the two binds.
+            _exp_contracts, _exp_skip = size_trade_against_expiry_cap(
+                ticker=ticker,
+                proposed_contracts=contracts,
+                price_cents=price_cents,
+                expiry_exposures=expiry_exposures,
+                total_equity_cents=total_equity_cents,
+                max_expiry_ratio=MAX_EXPIRY_EXPOSURE_RATIO,
+            )
+            if _exp_skip is not None:
+                print(f"  → {ticker}: SKIP — {_exp_skip} "
+                      f"(cap={MAX_EXPIRY_EXPOSURE_RATIO:.1%} of equity)")
+                continue
+            if _exp_contracts < contracts:
+                print(f"  → {ticker}: expiry cap reduced {contracts}→{_exp_contracts}")
+                contracts = _exp_contracts
+                order_cost_cents = contracts * price_cents
+            # Update running accumulators so the next candidate in this
+            # cycle sees what we just committed to (both family + expiry).
+            from bot.core.exposure import (
+                family_from_ticker as _fam_of,
+                expiry_from_ticker as _exp_of,
+            )
+            _fam_key = _fam_of(ticker)
+            if _fam_key:
+                family_exposures[_fam_key] = (
+                    family_exposures.get(_fam_key, 0) + order_cost_cents
+                )
+            _exp_key = _exp_of(ticker)
+            if _exp_key:
+                expiry_exposures[_exp_key] = (
+                    expiry_exposures.get(_exp_key, 0) + order_cost_cents
+                )
+
             opp = {"ticker":ticker, "side":side, "strategy":strategy,
                    "score":round(score,3), "detail":detail, "price_cents":price_cents,
                    "contracts":contracts, "volume":volume, "spread_cents":sc,
@@ -8474,16 +7141,51 @@ def main():
             log_opportunity(conn, ticker, strategy, "trade", side=side,
                             ensemble_prob=indep_prob, market_prob=mkt_prob,
                             edge=edge, source_count=sc)
+            # Per-family live state routes decision outcome + order posting:
+            # shadow families stay DRY_RUN + SHADOW_ONLY; canary/full families
+            # post real orders and log POSTED (picked up by the kill-switch
+            # sweep). Global DRY_RUN remains an outer kill-switch — even a
+            # canary/full family skips the order post if DRY_RUN is true.
+            _is_live_family = _live_flag.state != _LiveState.SHADOW
+            if indep_prob is not None:
+                _evm = shadow_dec.edge_vs_mid
+                _outcome = (
+                    _AlphaOutcome.POSTED if _is_live_family
+                    else _AlphaOutcome.SHADOW_ONLY
+                )
+                _notes = (
+                    f"strategy={strategy};shadow=shadow_pass;"
+                    f"state={_live_flag.state};mult={_kelly_mult:.2f}"
+                    + (f";edge_vs_mid={_evm:+.3f}" if _evm is not None else "")
+                )
+                _alpha_log_decision(
+                    conn, ticker=ticker,
+                    decision_type=_AlphaType.DIRECTIONAL_SHADOW,
+                    decision_outcome=_outcome,
+                    ensemble=_AlphaEnsemble(
+                        p_yes=_to_canonical_p_yes(indep_prob, side),
+                        source_count=sc,
+                    ),
+                    market=_mkt_snap,
+                    side=side, price_cents=int(price_cents),
+                    contracts=int(contracts),
+                    notes=_notes,
+                )
             print(f"  → {ticker} {side} @ {price_cents}¢ x{contracts}  "
-                  f"edge={edge:.1%}  [{strategy}]")
+                  f"edge={edge:.1%}  [{strategy}/{_live_flag.state}]")
 
             order_id = error = None
-            if not DRY_RUN and ticker:
+            if not DRY_RUN and _is_live_family and ticker:
+                # mm_dir_ prefix: fills writer's source_tagger routes this to
+                # `directional`. Periods stripped per Kalshi constraint
+                # (CLAUDE.md §Known Bug Pattern #1).
+                client_id = f"mm_dir_{ticker.replace('.', '_')}_{int(time.time())}"
                 order_body = {"ticker":ticker, "side":side, "type":"limit",
                     "count":contracts,
                     ("yes_price" if side=="yes" else "no_price"): price_cents,
                     "action":"buy",
-                    "expiration_ts": int(time.time() + ORDER_MAX_AGE_HOURS * 3600)}
+                    "expiration_ts": int(time.time() + ORDER_MAX_AGE_HOURS * 3600),
+                    "client_order_id": client_id}
                 try:
                     resp = api_post("/portfolio/orders", order_body)
                     order_id = resp.get("order",{}).get("order_id") or str(resp)
@@ -8497,13 +7199,13 @@ def main():
             else:
                 result["orders_placed"].append({"ticker":ticker,"contracts":contracts,"dry_run":True})
 
-            conn.execute("""INSERT INTO trades
-                (timestamp,ticker,side,action,score,reason,strategy,price_cents,contracts,
-                 volume,spread_cents,independent_prob,market_prob,edge,dry_run,order_id,error)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (now,ticker,side,"buy",score,detail,strategy,price_cents,contracts,
-                 volume,sc,indep_prob,mkt_prob,edge,int(DRY_RUN),order_id,error))
-            conn.commit()
+            with db_write_ctx(conn):
+                conn.execute("""INSERT INTO trades
+                    (timestamp,ticker,side,action,score,reason,strategy,price_cents,contracts,
+                     volume,spread_cents,independent_prob,market_prob,edge,dry_run,order_id,error)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (now,ticker,side,"buy",score,detail,strategy,price_cents,contracts,
+                     volume,sc,indep_prob,mkt_prob,edge,int(DRY_RUN),order_id,error))
 
     # ── Phase 4sc: Safe Compounder ──────────────────────────────────────
     # Buy NO on near-certain outcomes (YES ≤ 20¢) for low-risk income.
@@ -8520,22 +7222,9 @@ def main():
         print(f"[sc] Error in Safe Compounder: {e}")
         result["safe_compounder"] = {"error": str(e)}
 
-    # ── Phase 4a: Market Making ──────────────────────────────────────────
-    # Run AFTER directional trading, using remaining capital headroom.
-    # Market making posts two-sided limit orders in thin markets to earn spread.
-    try:
-        if markets and MM_ENABLED:
-            mm_stats = mm_run(
-                conn, markets, initial_balance, portfolio_value,
-                adaptive_weights=adaptive_weights,
-                calibration_corrections=calibration_corrections,
-                disabled_sources=active_feedback.get("disabled_sources"))
-            result["mm_stats"] = mm_stats
-        else:
-            result["mm_stats"] = {"mm_enabled": False, "reason": "no markets or disabled"}
-    except Exception as e:
-        print(f"[mm] Error in market making pass: {e}")
-        result["mm_stats"] = {"mm_enabled": True, "error": str(e)}
+    # ── Phase 4a: Market Making ── REMOVED ───────────────────────────────
+    # Market making was deleted in the 2026-04-16 pivot. All remaining MM
+    # inventory will settle naturally via record_settlements() / manage_positions().
 
     # ── Phase 4b: Post-trade learning ───────────────────────────────────
     # Record shadow hyperparam evaluations for this run's trades
@@ -8551,16 +7240,16 @@ def main():
         print(f"[pipeline] Error recording: {e}")
 
     # ── Phase 5: Log session ──────────────────────────────────────────────
-    conn.execute("""INSERT INTO sessions
-        (timestamp,balance_cents,portfolio_cents,markets_scanned,opportunities_found,
-         orders_attempted,positions_managed,orders_pruned,dry_run,halted,halt_reason,patterns_avoided)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (now,initial_balance,portfolio_value,result["markets_scanned"],
-         len(result["opportunities"]),len(result["orders_placed"]),
-         result["positions_managed"],result["orders_pruned"],
-         int(DRY_RUN),int(result["halted"]),result["halt_reason"],
-         json.dumps(result["patterns_avoided"])))
-    conn.commit()
+    with db_write_ctx(conn):
+        conn.execute("""INSERT INTO sessions
+            (timestamp,balance_cents,portfolio_cents,markets_scanned,opportunities_found,
+             orders_attempted,positions_managed,orders_pruned,dry_run,halted,halt_reason,patterns_avoided)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now,initial_balance,portfolio_value,result["markets_scanned"],
+             len(result["opportunities"]),len(result["orders_placed"]),
+             result["positions_managed"],result["orders_pruned"],
+             int(DRY_RUN),int(result["halted"]),result["halt_reason"],
+             json.dumps(result["patterns_avoided"])))
 
     # ── Phase 6: Generate human-readable performance report ──────────────
     try:
@@ -8568,9 +7257,7 @@ def main():
     except Exception as e:
         print(f"[report] Error generating report: {e}")
 
-    conn.close()
-
-    # ── Telegram alerts ─────────────────────────────────────────────────
+    # ── Telegram alerts (before close so conn is still usable) ──────────
     try:
         from bot.observability.alerts import (
             alert_circuit_breaker, alert_large_loss, alert_daily_summary,
@@ -8582,32 +7269,43 @@ def main():
             alert_large_loss(s["profit_cents"], s["ticker"])
         # Daily summary (only on first run of the hour to avoid spam)
         if datetime.now(timezone.utc).minute < 2:
-            total_pnl = conn.execute(
-                "SELECT COALESCE(SUM(profit_cents),0) FROM settlements WHERE recorded_at > date('now')"
-            ).fetchone()[0] if not conn.closed else 0
-            settled_today = conn.execute(
-                "SELECT COUNT(*) FROM settlements WHERE recorded_at > date('now')"
-            ).fetchone()[0] if not conn.closed else 0
-            wins_today = conn.execute(
-                "SELECT COUNT(*) FROM settlements WHERE recorded_at > date('now') AND won=1"
-            ).fetchone()[0] if not conn.closed else 0
-            wr = wins_today / settled_today if settled_today > 0 else 0
-            mm_stats = result.get("mm_stats", {})
-            alert_daily_summary({
-                "daily_pnl_cents": total_pnl,
-                "trades": settled_today,
-                "win_rate": wr,
-                "mm_markets": mm_stats.get("markets_quoted", 0),
-                "mm_fills": mm_stats.get("fills_detected", 0),
-            })
+            try:
+                total_pnl = conn.execute(
+                    "SELECT COALESCE(SUM(profit_cents),0) FROM settlements WHERE recorded_at > date('now')"
+                ).fetchone()[0]
+                settled_today = conn.execute(
+                    "SELECT COUNT(*) FROM settlements WHERE recorded_at > date('now')"
+                ).fetchone()[0]
+                wins_today = conn.execute(
+                    "SELECT COUNT(*) FROM settlements WHERE recorded_at > date('now') AND won=1"
+                ).fetchone()[0]
+                wr = wins_today / settled_today if settled_today > 0 else 0
+                alert_daily_summary({
+                    "daily_pnl_cents": total_pnl,
+                    "trades": settled_today,
+                    "win_rate": wr,
+                })
+            except Exception:
+                pass  # conn may be closed or DB locked; skip summary
     except Exception as e:
         print(f"[alerts] Error: {e}")
 
-    task_dir = "/task" if os.path.exists("/task") else "/tmp"
-    with open(f"{task_dir}/trades.json","w") as f: json.dump(result, f, indent=2)
+    if close_conn:
+        conn.close()
+
+    if write_json_report:
+        task_dir = "/task" if os.path.exists("/task") else "/tmp"
+        with open(f"{task_dir}/trades.json","w") as f: json.dump(result, f, indent=2)
     print(f"[trade.py] Done → markets={result['markets_scanned']} opps={len(result['opportunities'])} "
           f"orders={len(result['orders_placed'])} positions_managed={result['positions_managed']} "
           f"pruned={result['orders_pruned']} settlements={result['settlements_recorded']}")
+    # Funnel line — ordered by scan-loop stage so a single grep on
+    # `cycle_funnel` shows where candidates are lost. Stash on result
+    # so daemon health logs can surface it too.
+    result["cycle_counters"] = dict(cycle_counters)
+    if cycle_counters:
+        _funnel = " ".join(f"{k}={v}" for k, v in sorted(cycle_counters.items()))
+        print(f"[cycle_funnel] {_funnel}")
     return result
 
 if __name__ == "__main__":

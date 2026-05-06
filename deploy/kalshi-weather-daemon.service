@@ -1,0 +1,45 @@
+# Weather Market Making Daemon
+# Persistent process that polls METAR every 30s for sub-minute weather requoting.
+# Runs alongside the main kalshi-bot.timer (which handles KXFED, economics, etc.)
+#
+# Install: cp deploy/kalshi-weather-daemon.service /etc/systemd/system/
+# Enable:  systemctl enable kalshi-weather-daemon
+# Start:   systemctl start kalshi-weather-daemon
+# Logs:    journalctl -u kalshi-weather-daemon -f
+#          or: tail -f /home/kalshi/autoagent/weather_daemon.log
+
+[Unit]
+Description=Kalshi Weather Market Making Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kalshi
+Group=kalshi
+WorkingDirectory=/home/kalshi/autoagent
+ExecStart=/usr/bin/python3 -m bot.daemon.orchestrator --poll-interval 30 --log-level INFO
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Environment
+EnvironmentFile=/home/kalshi/autoagent/.env
+
+# Logging to file (append mode, like the main bot)
+StandardOutput=append:/home/kalshi/autoagent/weather_daemon.log
+StandardError=append:/home/kalshi/autoagent/weather_daemon.log
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=25%
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/kalshi/autoagent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

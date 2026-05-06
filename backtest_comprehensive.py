@@ -125,10 +125,13 @@ def analyze_calibration(conn) -> dict:
     """).fetchall()
 
     # Method 2: Use opportunity_log joined with settlements
-    # CRITICAL: won=1 means "we profited", NOT "YES happened".
+    # CRITICAL #1: won=1 means "we profited", NOT "YES happened".
     # Must use settlement side to convert: side=yes,won=1→YES; side=no,won=1→NO
+    # CRITICAL #2: opportunity_log.ensemble_prob is stored as P(our chosen side),
+    # NOT P(YES). For side='no' rows it's actually (1 - P(YES)). Normalize here.
     opp_rows = conn.execute("""
-        SELECT o.ensemble_prob, s.won, o.ticker, o.strategy, o.sources_json, s.side
+        SELECT CASE WHEN o.side='no' THEN 1.0 - o.ensemble_prob ELSE o.ensemble_prob END AS yes_prob,
+               s.won, o.ticker, o.strategy, o.sources_json, s.side
         FROM opportunity_log o
         JOIN settlements s ON o.ticker = s.ticker
         WHERE o.ensemble_prob IS NOT NULL
@@ -137,12 +140,19 @@ def analyze_calibration(conn) -> dict:
     """).fetchall()
 
     # Method 3: Use mm_orders fair_value_cents vs settlements
-    # Use s.side (net settlement side), NOT m.side (individual order side)
+    # CRITICAL: fair_value_cents is stored per ORDER SIDE (YES orders store YES-prob,
+    # NO orders store NO-prob = 100 - YES-prob). Naively averaging across sides
+    # inverts probability on tickers where we quoted both sides. Normalize to
+    # YES-probability BEFORE averaging: yes_fv = fv; no_fv → (100 - fv).
     mm_rows = conn.execute("""
-        SELECT m.ticker, AVG(m.fair_value_cents), s.side, s.won
+        SELECT m.ticker,
+               AVG(CASE WHEN m.side='yes' THEN m.fair_value_cents
+                        ELSE 100 - m.fair_value_cents END) AS avg_yes_fv,
+               s.side, s.won
         FROM mm_orders m
         JOIN settlements s ON m.ticker = s.ticker
         WHERE m.fair_value_cents > 0 AND m.fill_qty > 0
+          AND m.side IN ('yes', 'no')
         GROUP BY m.ticker
     """).fetchall()
 
@@ -279,6 +289,9 @@ def analyze_edge_vs_winrate(conn) -> dict:
     """).fetchall()
 
     # Also from MM: avg edge per ticker (not per fill — avoids counting same settlement N times)
+    # fv-mixed-side-ok: storage is P(YES) on both rows; AVG returns P(YES)
+    # which is what the per-ticker edge computation here expects
+    # (CLAUDE.md Known Bug Pattern #13).
     mm_rows = conn.execute("""
         SELECT AVG(m.fair_value_cents), AVG(m.price_cents), s.won, m.ticker
         FROM mm_orders m
@@ -736,22 +749,38 @@ def analyze_mm_performance(conn) -> dict:
     print(f"\n  ─── Fee Impact ───")
 
     try:
-        # Try new schema first (price_cents, contracts, fee_cents)
+        # T3.3: read from the canonical fills ledger. Price-per-side comes
+        # from yes_price_cents when side='yes' else no_price_cents — same
+        # CASE pattern used in regime.detect_regime.
         fee_rows = conn.execute("""
-            SELECT price_cents, contracts, fee_cents FROM mm_processed_fills
+            SELECT CASE WHEN side='yes' THEN yes_price_cents
+                         ELSE no_price_cents END,
+                   contracts, fee_cents
+            FROM fills_ledger
         """).fetchall()
         total_fees = sum(int(f[2] or 0) for f in fee_rows)
         total_notional = sum(int(f[0] or 0) * int(f[1] or 0) for f in fee_rows)
     except Exception:
-        # Old schema: fill_id, processed_at, fee_cents, order_id, ticker
+        # Fallback: legacy mm_processed_fills (pre-T3 data only; no
+        # live writer since the MM path was removed). Kept as a
+        # read-through so historical DBs still report a fee total.
         try:
-            fee_rows = conn.execute("SELECT fee_cents FROM mm_processed_fills").fetchall()
-            total_fees = sum(int(f[0] or 0) for f in fee_rows)
-            total_notional = 0  # can't compute without price/contracts
+            fee_rows = conn.execute(
+                "SELECT price_cents, contracts, fee_cents FROM mm_processed_fills"
+            ).fetchall()
+            total_fees = sum(int(f[2] or 0) for f in fee_rows)
+            total_notional = sum(int(f[0] or 0) * int(f[1] or 0) for f in fee_rows)
         except Exception:
-            fee_rows = []
-            total_fees = 0
-            total_notional = 0
+            try:
+                fee_rows = conn.execute(
+                    "SELECT fee_cents FROM mm_processed_fills"
+                ).fetchall()
+                total_fees = sum(int(f[0] or 0) for f in fee_rows)
+                total_notional = 0
+            except Exception:
+                fee_rows = []
+                total_fees = 0
+                total_notional = 0
 
     if fee_rows:
         print(f"  Total fees paid: {fmt_pnl(total_fees)}")

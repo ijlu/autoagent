@@ -5,20 +5,34 @@ Extracted from trade.py. This is the canonical source for all table schemas.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional, TypeVar
 
 from bot.config import DB_PATH
+from bot.daemon.locks import DB_WRITE_LOCK
 
 
-# Global persistent connection (set by init_db, used by oneshot architecture)
+# Global persistent connection (set by init_db, used by oneshot + daemon).
+# Under the daemon, this single connection is shared by all threads.
+# SQLite 3.11+ is thread-safe for a shared connection when built with
+# threadsafe=1 (the default on macOS/Ubuntu). We additionally serialize
+# WRITES through DB_WRITE_LOCK so no two threads hit "database is locked".
 _PERSIST_CONN: Optional[sqlite3.Connection] = None
+
+_T = TypeVar("_T")
 
 
 def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Initialize database: create tables, run migrations, return connection.
+
+    Daemon-ready: sets WAL journal mode (lock-free concurrent readers),
+    synchronous=NORMAL (durable enough for our purposes, ~3x faster than FULL),
+    and busy_timeout=5000ms so writers retry rather than raising immediately
+    on lock contention. These pragmas persist for the lifetime of the DB file,
+    but re-running is harmless.
 
     Args:
         db_path: Override path (for testing). Defaults to config.DB_PATH.
@@ -28,7 +42,25 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
     """
     global _PERSIST_CONN
     path = db_path or DB_PATH
-    conn = sqlite3.connect(path)
+    # check_same_thread=False because the daemon shares one connection across
+    # poller threads and the cycle-runner thread. Safety is preserved by
+    # serializing writes via DB_WRITE_LOCK (see db_write() helper below).
+    conn = sqlite3.connect(path, check_same_thread=False)
+
+    # ── Daemon pragmas ─────────────────────────────────────────────────
+    # WAL: lock-free concurrent readers, single-writer semantics. Survives
+    # across connections (PRAGMA is persistent on-disk).
+    conn.execute("PRAGMA journal_mode=WAL")
+    # NORMAL is durable against app crashes, sacrifices durability only
+    # against OS-level crashes. Acceptable for trading bot (we replay
+    # last-known state from Kalshi API on restart anyway).
+    conn.execute("PRAGMA synchronous=NORMAL")
+    # 5-second busy_timeout: if another writer holds the lock, retry for
+    # this long before raising. Prevents transient sqlite3.OperationalError.
+    conn.execute("PRAGMA busy_timeout=5000")
+    # Foreign keys off by default in SQLite; we don't use them but make it
+    # explicit so future schema changes don't silently enable them.
+    conn.execute("PRAGMA foreign_keys=OFF")
 
     # ── Core trading tables ──
     conn.execute("""CREATE TABLE IF NOT EXISTS trades (
@@ -61,7 +93,18 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         health_score REAL, remaining_edge REAL, edge_trend REAL,
         action TEXT, exit_qty INTEGER,
         settlement_result TEXT DEFAULT NULL,
-        settlement_pnl_cents INTEGER DEFAULT NULL)""")
+        settlement_pnl_cents INTEGER DEFAULT NULL,
+        fresh_prob REAL DEFAULT NULL,
+        fresh_source_count INTEGER DEFAULT NULL,
+        entry_edge REAL DEFAULT NULL)""")
+    # Idempotent backfill for DBs created before these columns existed.
+    for _col, _type in (("fresh_prob", "REAL"),
+                         ("fresh_source_count", "INTEGER"),
+                         ("entry_edge", "REAL")):
+        try:
+            conn.execute(f"ALTER TABLE position_health_log ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass
 
     # ── Learning tables ──
     conn.execute("""CREATE TABLE IF NOT EXISTS calibration (
@@ -170,6 +213,149 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         skip_reason TEXT,
         outcome TEXT)""")
 
+    # ── Weather ensemble (Phase 2) ──
+    # Per-source weights for the weather sub-ensemble. Nightly calibration
+    # job updates these from strategy_journal settlements; defaults come
+    # from bot/signals/weather_ensemble.DEFAULT_WEATHER_PRIORS.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_source_weights (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        series TEXT NOT NULL,
+        source TEXT NOT NULL,
+        weight REAL NOT NULL,
+        updated_at TEXT,
+        n_samples INTEGER DEFAULT 0,
+        UNIQUE(series, source))""")
+
+    # Source state machine — Phase B.2 (2026-04-29).
+    # Each source × city has a lifecycle state that controls combine
+    # inclusion. Updated daily by ``source_state_evaluator``:
+    #
+    #   shadow        — snapshotted but excluded from combine. Default
+    #                    for new sources without eval validation.
+    #   probationary  — included in combine with σ inflated × 1.3 (capped
+    #                    weight). Pre-seeded sources start here.
+    #   active        — full weight in combine. Earned by accumulating
+    #                    50+ settled rows in probationary with non-
+    #                    regression on combined Brier.
+    #   demoted       — was active but chronically broke or σ blew up.
+    #                    Excluded from combine. After 7 days returns to
+    #                    shadow for clean re-trial (no eternal blacklist).
+    #
+    # Transition rules and the daily evaluator live in
+    # ``bot.learning.source_state_machine``. Transitions are logged to
+    # this table's ``last_state_change_iso`` plus the daemon log so
+    # operators can verify the dynamic system is doing what it should.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_source_state (
+        source TEXT NOT NULL,
+        city TEXT NOT NULL,
+        state TEXT NOT NULL,
+        n_settled INTEGER DEFAULT 0,
+        mae_7d REAL,
+        mae_30d REAL,
+        brier_7d REAL,
+        brier_30d REAL,
+        sigma_fitted REAL,
+        bias_fitted REAL,
+        indep_vs_combine REAL,
+        last_state_change_iso TEXT,
+        last_evaluated_iso TEXT,
+        notes TEXT,
+        PRIMARY KEY (source, city))""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wss_state "
+        "ON weather_source_state(state)")
+
+    # Per-source component estimates logged per cycle for post-hoc
+    # calibration. Joined against settlements to compute per-source Brier
+    # and update weather_source_weights.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_forecast_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recorded_at TEXT NOT NULL,
+        series TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        source TEXT NOT NULL,
+        forecast_prob REAL,
+        forecast_high_f REAL,
+        sigma_f REAL,
+        hours_out INTEGER)""")
+
+    # A2.5 — backfill table populated by tools/backfill_weather_effective_n.py.
+    # Each row is one historical forecast observation: "at `lead_hours`
+    # before settlement of (city, settlement_date), source `source` would
+    # have emitted forecast mean/sigma, and the realized observed daily
+    # high was `observed_high_f`". Rows are used to fit per-source bias,
+    # RMSE, sigma calibration, and eventually within-group correlation for
+    # the effective-N discount in weather_ensemble_v2.
+    #
+    # Kept separate from weather_forecast_snapshots because: (a) this table
+    # is populated retroactively from archive APIs (not per-cycle), (b) it
+    # carries the `observed_high_f` ground-truth column the live snapshot
+    # table doesn't, and (c) the analysis workflows join against
+    # settlements OR NWS CLI archive (not the live Kalshi market
+    # population) so mixing them would complicate both readers.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_gaussian_snapshots_backfill (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        city TEXT NOT NULL,
+        settlement_date TEXT NOT NULL,
+        lead_hours INTEGER,
+        forecast_mean_f REAL,
+        forecast_sigma_f REAL,
+        observed_high_f REAL,
+        UNIQUE(source, city, settlement_date, lead_hours))""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_backfill_source_city
+                    ON weather_gaussian_snapshots_backfill(source, city)""")
+
+    # ── A4: per-(station, LST hour) METAR hourly archive ──
+    #
+    # Row semantics: "at LST hour `lst_hour` on `lst_date` at `station`, the
+    # observed 2m temperature was `temp_f`, and the eventual LST-day daily
+    # high was `daily_high_f`". The fitter regresses daily_high_f on temp_f
+    # within each (station, lst_hour) cell to produce α_h + β_h·T(h)
+    # predictors + their RMSE, persisted to kv_cache for
+    # `metar_observations.get_metar_gaussian`.
+    #
+    # Separate from `weather_gaussian_snapshots_backfill` because the unit
+    # of analysis is an hourly observation, not a daily forecast snapshot.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_metar_hourly_backfill (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        station TEXT NOT NULL,
+        lst_date TEXT NOT NULL,
+        lst_hour INTEGER NOT NULL,
+        temp_f REAL NOT NULL,
+        daily_high_f REAL,
+        UNIQUE(station, lst_date, lst_hour))""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_metar_hourly_station_hour
+                    ON weather_metar_hourly_backfill(station, lst_hour)""")
+
+    # ── Stage 1 (regime conditioning): regime-feature sibling backfill ──
+    #
+    # Same (station, lst_date, lst_hour) key as weather_metar_hourly_backfill
+    # but adds wind direction, sky cover, dewpoint — features that determine
+    # the prevailing weather regime (sea breeze vs continental, clear vs
+    # overcast, etc). Used by bot/learning/regime_residual_fitter.py to fit
+    # per-(station, hour, regime) residual peak σ. Sibling rather than
+    # extension columns because: (a) regime data has a different freshness
+    # cycle (pulled together with tmpf, but doesn't gate on CF6), (b) the
+    # production fitter for METAR residual σ hasn't been touched since its
+    # original ship — keep its read schema stable while we layer regime
+    # conditioning.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_metar_hourly_regime (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        station TEXT NOT NULL,
+        lst_date TEXT NOT NULL,
+        lst_hour INTEGER NOT NULL,
+        dwpf REAL,
+        drct REAL,
+        sknt REAL,
+        skyc1 TEXT,
+        UNIQUE(station, lst_date, lst_hour))""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_metar_hourly_regime_station_hour
+                    ON weather_metar_hourly_regime(station, lst_hour)""")
+
     # ── Decision log (full audit trail per decision) ──
     conn.execute("""CREATE TABLE IF NOT EXISTS decision_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +370,256 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         regime TEXT,
         active_feedback TEXT,
         outcome TEXT)""")
+
+    # ── alpha_backtest (Phase 1 gate evaluation) ──
+    # Atomic decision-time log for the Phase 0 gate's "beat market-mid by ≥0.005"
+    # leg. Every decision (MM quote, directional shadow/live, weather shadow) writes
+    # one row with ensemble estimate + raw market snapshot + (later) settlement.
+    #
+    # Raw market fields (yes_bid/ask/last_cents, spread, age) are stored in addition
+    # to the canonical market_prob_yes so analysis can re-run the gate under multiple
+    # definitions without re-collecting data. See bot/learning/alpha_log.py for the
+    # resolution rules and market_prob_source tags.
+    conn.execute("""CREATE TABLE IF NOT EXISTS alpha_backtest (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_decision TEXT NOT NULL,
+        ts_decision_unix REAL NOT NULL,
+        ticker TEXT NOT NULL,
+        family TEXT,
+        decision_type TEXT NOT NULL,
+        decision_outcome TEXT NOT NULL,
+        side TEXT,
+        price_cents INTEGER,
+        contracts INTEGER,
+        skip_reason TEXT,
+        ensemble_p_yes REAL NOT NULL,
+        ensemble_confidence REAL,
+        source_count INTEGER,
+        sources_json TEXT,
+        source_estimates_json TEXT,
+        yes_bid_cents INTEGER,
+        yes_ask_cents INTEGER,
+        yes_last_cents INTEGER,
+        last_trade_age_s REAL,
+        spread_cents INTEGER,
+        volume_fp INTEGER,
+        market_prob_yes REAL,
+        market_prob_source TEXT,
+        ts_settle TEXT,
+        ts_settle_unix REAL,
+        settlement_result TEXT,
+        won_yes INTEGER,
+        realized_pnl_cents INTEGER,
+        cycle_id TEXT,
+        notes TEXT,
+        market_id TEXT DEFAULT NULL,
+        portfolio_leg_count INTEGER DEFAULT NULL)""")
+    # Idempotent backfill for DBs created before market_id/portfolio_leg_count existed
+    # (Phase B.3 cross-bracket portfolio reconstruction).
+    for _col, _type in (("market_id", "TEXT"),
+                         ("portfolio_leg_count", "INTEGER")):
+        try:
+            conn.execute(f"ALTER TABLE alpha_backtest ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_ticker_ts "
+        "ON alpha_backtest(ticker, ts_decision_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_family_settle "
+        "ON alpha_backtest(family, ts_settle_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_market_id "
+        "ON alpha_backtest(market_id) WHERE market_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_type_outcome "
+        "ON alpha_backtest(decision_type, decision_outcome)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alpha_bt_pending_settle "
+        "ON alpha_backtest(ticker, side) WHERE ts_settle_unix IS NULL"
+    )
+
+    # ── Phase 1: weather MM shadow log ──
+    # Every quote the event-driven WeatherQuoter WOULD have posted (when
+    # WEATHER_MM_LIVE=false) is written here — with the FV, proposed bid/ask,
+    # the market snapshot at shadow time, the gate decision, and the METAR
+    # context that triggered the requote. The step-9 shadow-to-live gate joins
+    # this against `settlements` to compute counterfactual P&L: did the +4.7¢
+    # historical markout convert to realized P&L under the new cancel-replace
+    # path? Flip to live only if yes.
+    #
+    # All prices are stored as YES-equivalent cents (per-side normalization,
+    # CLAUDE.md bug pattern #13) so joins against `settlements` and
+    # `opportunity_log` don't need side-aware CASE expressions.
+    conn.execute("""CREATE TABLE IF NOT EXISTS weather_mm_shadow (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_unix INTEGER NOT NULL,
+        ts_iso TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        series TEXT NOT NULL,
+        station TEXT NOT NULL,
+        old_temp_f REAL,
+        new_temp_f REAL,
+        running_high_f REAL,
+        forecast_high_f REAL,
+        hours_left REAL,
+        trajectory_f_per_hr REAL,
+        fair_value_cents INTEGER,
+        proposed_bid_cents INTEGER,
+        proposed_ask_cents INTEGER,
+        half_spread_cents INTEGER,
+        market_yes_bid INTEGER,
+        market_yes_ask INTEGER,
+        market_mid INTEGER,
+        inventory INTEGER,
+        gate_should_quote INTEGER,
+        gate_reason TEXT,
+        gate_spread_mult REAL,
+        latency_ms REAL,
+        live_mode INTEGER NOT NULL DEFAULT 0)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wx_shadow_ticker_ts "
+        "ON weather_mm_shadow(ticker, ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wx_shadow_series_ts "
+        "ON weather_mm_shadow(series, ts_unix)"
+    )
+
+    # ── Phase 1 step 9: shadow-to-live promotion event log ──
+    # One row per state transition (shadow → canary → full and reverse).
+    # Used for post-mortems and to preserve the history that kv_cache loses
+    # on overwrite. `metrics_json` captures the decision-time stats
+    # (brier beat, realized P&L, N, OOS split) so we can reproduce why a
+    # family was promoted or demoted weeks later.
+    conn.execute("""CREATE TABLE IF NOT EXISTS promotion_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_unix REAL NOT NULL,
+        ts_iso TEXT NOT NULL,
+        family TEXT NOT NULL,
+        old_state TEXT NOT NULL,
+        new_state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        metrics_json TEXT,
+        manual INTEGER NOT NULL DEFAULT 0)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_promo_family_ts "
+        "ON promotion_events(family, ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_promo_trigger_ts "
+        "ON promotion_events(trigger, ts_unix)"
+    )
+
+    # ── Phase 1 step 10: threshold-tuner proposal log (T.8) ──
+    # Weekly tuner job writes one row per proposed threshold change. `applied`
+    # flips when an operator (or, eventually, an auto-apply guard) merges the
+    # proposal. The table is the forever-audit-log for "why did we move
+    # min_pnl_floor from $30 to $35 on date X."
+    conn.execute("""CREATE TABLE IF NOT EXISTS threshold_proposals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_unix REAL NOT NULL,
+        ts_iso TEXT NOT NULL,
+        tuner TEXT NOT NULL,
+        evidence_window_days INTEGER,
+        n_observations INTEGER,
+        current_thresholds_json TEXT NOT NULL,
+        proposed_thresholds_json TEXT NOT NULL,
+        objective_current REAL,
+        objective_proposed REAL,
+        objective_delta REAL,
+        supporting_metrics_json TEXT,
+        applied INTEGER NOT NULL DEFAULT 0,
+        applied_ts_unix REAL,
+        applied_by TEXT)""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_threshold_proposals_tuner_ts "
+        "ON threshold_proposals(tuner, ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_threshold_proposals_applied "
+        "ON threshold_proposals(applied, ts_unix)"
+    )
+
+    # ── T3.1: canonical fills ledger ──
+    # Append-only, Kalshi-owned primary key (trade_id). One row per Kalshi
+    # fill event. Every reader of "realized fill P&L" must read from here
+    # rather than deriving from mm_processed_fills/weather_mm_shadow/
+    # settlements. The scoping doc at reports/T3_FILLS_LEDGER_SCOPING.md
+    # has the full rationale.
+    #
+    # Schema decisions (see scoping doc §7 open questions):
+    #   Q6: ingested_ts_unix is first-write-only via INSERT OR IGNORE.
+    #   Q7: no cycle_id column — we don't have a producer today, and
+    #       weather-MM fills come from an event-driven path with no cycle.
+    #   Q4: source values are drawn from a closed set of client_order_id
+    #       prefix matches: mm_quote, safe_compounder, exit, directional,
+    #       legacy, manual. Never null, never "unknown".
+    conn.execute("""CREATE TABLE IF NOT EXISTS fills_ledger (
+        -- Identity (immutable, Kalshi-owned)
+        trade_id              TEXT    PRIMARY KEY,
+        order_id              TEXT    NOT NULL,
+        client_order_id       TEXT,
+        ticker                TEXT    NOT NULL,
+        series                TEXT    NOT NULL,
+        family                TEXT    NOT NULL,
+
+        -- Fill semantics
+        side                  TEXT    NOT NULL,
+        action                TEXT    NOT NULL,
+        contracts             INTEGER NOT NULL,
+        yes_price_cents       INTEGER NOT NULL,
+        no_price_cents        INTEGER NOT NULL,
+        is_taker              INTEGER NOT NULL,
+        fee_cents             INTEGER NOT NULL,
+
+        -- Time
+        fill_ts_iso           TEXT    NOT NULL,
+        fill_ts_unix          REAL    NOT NULL,
+        ingested_ts_unix      REAL    NOT NULL,
+
+        -- Write-time context (derived once, never updated)
+        live_mode             INTEGER NOT NULL,
+        source                TEXT    NOT NULL
+    )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_ticker_ts "
+        "ON fills_ledger(ticker, fill_ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_order_id "
+        "ON fills_ledger(order_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_series_ts "
+        "ON fills_ledger(series, fill_ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fills_family_ts "
+        "ON fills_ledger(family, fill_ts_unix)"
+    )
+
+    # ── Discovered series (alert-only registry) ──
+    # Daily `series_discovery` task lists `/events?status=open`, filters to
+    # routable prefixes (weather + macro), and inserts any series_ticker not
+    # already in TRADE_SERIES_ALLOWLIST. One row per (series_ticker). Auto-add
+    # is intentionally NOT done — adding a new weather city to scanning without
+    # a station registered in bot/daemon/stations.py would mis-route the
+    # ensemble. Josh reviews the alert and decides to wire it explicitly.
+    conn.execute("""CREATE TABLE IF NOT EXISTS discovered_series (
+        series_ticker         TEXT PRIMARY KEY,
+        first_seen_unix       REAL NOT NULL,
+        last_seen_unix        REAL NOT NULL,
+        sample_event_ticker   TEXT,
+        sample_market_count   INTEGER,
+        family_prefix         TEXT,
+        alert_sent_unix       REAL
+    )""")
 
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
@@ -210,12 +646,63 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         ("opportunity_log", "four_factor_scores", "TEXT"),
         ("opportunity_log", "regime", "TEXT"),
         ("opportunity_log", "rank", "INTEGER"),
+        # Phase 1: link learning rows back to their alpha_backtest source for
+        # idempotent population. Legacy rows pass through as alpha_id IS NULL.
+        ("calibration", "alpha_id", "INTEGER"),
+        ("timing_patterns", "alpha_id", "INTEGER"),
+        ("edge_convergence", "alpha_id", "INTEGER"),
+        ("loss_postmortems", "alpha_id", "INTEGER"),
+        # Phase 1 step 10: MM promotion gate needs per-shadow-quote fill
+        # status and settlement P&L. Matcher populates shadow_bid_filled /
+        # shadow_ask_filled from subsequent market snapshots; settlement
+        # annotator fills shadow_pnl_cents + (if live) live_pnl_cents. T.6
+        # paired-logging: live_pnl_cents is non-null on live-mode rows so
+        # mm_promotion can compute realized/shadow ratio for fill-model
+        # calibration monitoring.
+        ("weather_mm_shadow", "ticker_settled_yes", "INTEGER"),
+        ("weather_mm_shadow", "ts_settle_unix", "REAL"),
+        ("weather_mm_shadow", "shadow_bid_filled", "INTEGER"),
+        ("weather_mm_shadow", "shadow_bid_fill_ts_unix", "REAL"),
+        ("weather_mm_shadow", "shadow_ask_filled", "INTEGER"),
+        ("weather_mm_shadow", "shadow_ask_fill_ts_unix", "REAL"),
+        ("weather_mm_shadow", "shadow_pnl_cents", "INTEGER"),
+        ("weather_mm_shadow", "live_pnl_cents", "INTEGER"),
+        ("weather_mm_shadow", "live_order_id_bid", "TEXT"),
+        ("weather_mm_shadow", "live_order_id_ask", "TEXT"),
+        ("weather_mm_shadow", "order_size", "INTEGER"),
+        # T1.2: trigger attribution. `metar_change` = METAR delta ≥1°F
+        # (legacy default), `time_decay` = sigma-shrink requote fired by
+        # TimeDecayDriver, `forecast_change` = Open-Meteo forecast high
+        # moved ≥1°F between refreshes. The step-9 shadow-to-live gate
+        # breaks P&L out by reason so we can measure whether added
+        # requotes earn edge or just burn fees.
+        ("weather_mm_shadow", "trigger_reason", "TEXT DEFAULT 'metar_change'"),
+        # Stage 1 regime-conditioning telemetry. Captured on every snapshot
+        # row regardless of WEATHER_REGIME_SIGMA flag, so we have the
+        # longitudinal "what would Stage 2 have done" data ready when the
+        # promotion gate fires. Populated only on the METAR row of each
+        # ticker's snapshot (other source rows leave them NULL).
+        #   regime_label     — e.g. "E|partly", "S|moderate", "unknown"
+        #   regime_tier_used — "regime_hour" / "station_regime" / "pooled_hour" / "schedule"
+        #   regime_sigma_f   — σ that the regime-conditional path WOULD have used
+        #   pooled_sigma_f   — σ the pooled path actually used (= production today)
+        ("weather_forecast_snapshots", "regime_label", "TEXT"),
+        ("weather_forecast_snapshots", "regime_tier_used", "TEXT"),
+        ("weather_forecast_snapshots", "regime_sigma_f", "REAL"),
+        ("weather_forecast_snapshots", "pooled_sigma_f", "REAL"),
     ]
     for table, col, coltype in _migrations:
         try:
             conn.execute(f"SELECT {col} FROM {table} LIMIT 1")
         except sqlite3.OperationalError:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+
+    # Partial unique indexes on alpha_id (null rows exempt, non-null must be unique)
+    for tbl in ("calibration", "timing_patterns", "edge_convergence", "loss_postmortems"):
+        conn.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{tbl}_alpha_id "
+            f"ON {tbl}(alpha_id) WHERE alpha_id IS NOT NULL"
+        )
 
     conn.commit()
     _PERSIST_CONN = conn
@@ -257,11 +744,76 @@ def get_connection() -> sqlite3.Connection:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Thread-safe write helper (daemon-era)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def db_write(fn: Callable[[sqlite3.Connection], _T], conn: Optional[sqlite3.Connection] = None) -> _T:
+    """Run a write transaction under DB_WRITE_LOCK.
+
+    Args:
+        fn: callable taking a connection and returning some result. The callable
+            is responsible for executing the write; this helper takes the lock,
+            invokes fn, then commits atomically. On exception the transaction
+            rolls back automatically (since COMMIT isn't reached).
+        conn: optional connection; defaults to the persistent _PERSIST_CONN.
+
+    WAL gives us lock-free READERS, so reads do NOT need to use this helper —
+    call conn.execute(SELECT …).fetchall() directly. Reserve db_write() for
+    INSERT/UPDATE/DELETE/DDL.
+
+    Example:
+        db_write(lambda c: c.execute("UPDATE x SET y=1 WHERE z=?", (z,)))
+    """
+    c = conn or _PERSIST_CONN
+    if c is None:
+        raise RuntimeError("Database not initialized — call init_db() first")
+    with DB_WRITE_LOCK:
+        try:
+            result = fn(c)
+            c.commit()
+            return result
+        except Exception:
+            c.rollback()
+            raise
+
+
+@contextlib.contextmanager
+def db_write_ctx(conn: Optional[sqlite3.Connection] = None) -> Iterator[sqlite3.Connection]:
+    """Context-manager form of db_write() — holds DB_WRITE_LOCK for the whole
+    `with` block, commits on clean exit, rolls back on exception.
+
+    Prefer this over bare `conn.execute(...); conn.commit()` pairs in any
+    daemon-shared connection context: two threads calling .execute() on the
+    same connection object concurrently is not safe in sqlite3, and the lock
+    must protect the full execute→commit region, not just the commit.
+
+    Example:
+        with db_write_ctx(conn):
+            conn.execute("INSERT INTO settlements ...", row)
+            conn.execute("UPDATE ... WHERE ...", params)
+        # commit happens at `with` exit
+    """
+    c = conn or _PERSIST_CONN
+    if c is None:
+        raise RuntimeError("Database not initialized — call init_db() first")
+    with DB_WRITE_LOCK:
+        try:
+            yield c
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Key-value cache (persistent across oneshot runs)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def kv_get(conn: sqlite3.Connection, key: str) -> Any:
-    """Read from persistent kv_cache. Returns parsed JSON value or None if expired/missing."""
+    """Read from persistent kv_cache. Returns parsed JSON value or None if expired/missing.
+
+    Lock-free under WAL — readers don't need DB_WRITE_LOCK.
+    """
     try:
         row = conn.execute(
             "SELECT value, expires_at FROM kv_cache WHERE key=?", (key,)
@@ -274,21 +826,23 @@ def kv_get(conn: sqlite3.Connection, key: str) -> Any:
 
 
 def kv_set(conn: sqlite3.Connection, key: str, value: Any, ttl_seconds: int) -> None:
-    """Write to persistent kv_cache with TTL."""
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO kv_cache (key, value, expires_at) VALUES (?, ?, ?)",
-            (key, json.dumps(value), time.time() + ttl_seconds),
-        )
-        conn.commit()
-    except Exception as e:
-        print(f"[kv_cache] set({key!r}) failed: {e}")
+    """Write to persistent kv_cache with TTL. Takes DB_WRITE_LOCK."""
+    with DB_WRITE_LOCK:
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_cache (key, value, expires_at) VALUES (?, ?, ?)",
+                (key, json.dumps(value), time.time() + ttl_seconds),
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"[kv_cache] set({key!r}) failed: {e}")
 
 
 def kv_cleanup(conn: sqlite3.Connection) -> None:
-    """Remove expired entries from kv_cache."""
-    try:
-        conn.execute("DELETE FROM kv_cache WHERE expires_at < ?", (time.time(),))
-        conn.commit()
-    except Exception as e:
-        print(f"[kv_cache] cleanup failed: {e}")
+    """Remove expired entries from kv_cache. Takes DB_WRITE_LOCK."""
+    with DB_WRITE_LOCK:
+        try:
+            conn.execute("DELETE FROM kv_cache WHERE expires_at < ?", (time.time(),))
+            conn.commit()
+        except Exception as e:
+            print(f"[kv_cache] cleanup failed: {e}")

@@ -27,6 +27,7 @@ from bot.config import (
     SOURCE_WEIGHTS,
 )
 from bot.core.money import estimate_round_trip_cost
+from bot.db import db_write_ctx
 from bot.types import FourFactorScore, Regime
 
 
@@ -395,13 +396,13 @@ def log_four_factor_decision(
     try:
         now = datetime.now(timezone.utc).isoformat()
         four_factor_json = json.dumps(score.to_dict())
-        conn.execute(
-            """INSERT INTO decision_log
-               (timestamp, ticker, action, strategy, four_factor)
-               VALUES (?, ?, ?, ?, ?)""",
-            (now, ticker, action, "four_factor_gate", four_factor_json),
-        )
-        conn.commit()
+        with db_write_ctx(conn):
+            conn.execute(
+                """INSERT INTO decision_log
+                   (timestamp, ticker, action, strategy, four_factor)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (now, ticker, action, "four_factor_gate", four_factor_json),
+            )
     except Exception:
         # Logging must never break the trading pipeline.
         # If the table doesn't exist or schema mismatches, silently skip.

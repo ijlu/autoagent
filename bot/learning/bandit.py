@@ -17,7 +17,7 @@ from __future__ import annotations
 import random
 from datetime import datetime, timezone
 
-from bot.market_maker.selection import categorize_market
+from bot.core.categorization import categorize_market
 
 EXPLORE_BUDGET_PCT = 0.10   # 10% of trades reserved for exploration (up from 5%)
 EXPLORE_MIN_VOLUME = 100    # don't explore truly dead markets

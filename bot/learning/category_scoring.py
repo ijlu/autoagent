@@ -6,7 +6,7 @@ we consistently win can have slightly relaxed requirements.
 
 from __future__ import annotations
 
-from bot.market_maker.selection import categorize_market
+from bot.core.categorization import categorize_market
 
 _CATEGORY_EDGES = None  # cached per run
 

@@ -3,8 +3,10 @@
 Classifies the current market environment into one of:
 TRENDING, RANGE_BOUND, VOLATILE, QUIET, UNKNOWN.
 
-Uses settlements and MM fill data from SQLite to compute
-win rate trends, P&L volatility, spread compression, and fill rate.
+Uses settlements and fills_ledger (T3.3) to compute win rate trends,
+P&L volatility, spread compression, and fill rate. Pre-T3.3 this module
+read from mm_processed_fills, which no longer has a writer; reads from
+fills_ledger are the canonical source going forward.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ def detect_regime(conn: sqlite3.Connection) -> Regime:
     """Classify the current market regime from recent trading data.
 
     Args:
-        conn: Active SQLite connection with settlements and mm_processed_fills tables.
+        conn: Active SQLite connection with settlements and fills_ledger tables.
 
     Returns:
         A Regime enum value. Returns UNKNOWN if insufficient data.
@@ -49,11 +51,15 @@ def detect_regime(conn: sqlite3.Connection) -> Regime:
     if len(settlements) < _MIN_SETTLEMENTS:
         return Regime.UNKNOWN
 
-    # ── 2. Query recent MM fills ──
+    # ── 2. Query recent fills from the canonical ledger ──
+    # fills_ledger stores yes_price_cents and no_price_cents separately;
+    # the price WE transacted at on this side is picked by the CASE.
     fills = conn.execute(
-        """SELECT price_cents, side, recorded_at
-           FROM mm_processed_fills
-           ORDER BY id DESC LIMIT 100"""
+        """SELECT CASE WHEN side='yes' THEN yes_price_cents
+                       ELSE no_price_cents END AS price_cents,
+                  side, fill_ts_unix
+           FROM fills_ledger
+           ORDER BY fill_ts_unix DESC LIMIT 100"""
     ).fetchall()
 
     # ── 3. Compute metrics ──
@@ -148,18 +154,24 @@ def _compute_avg_spread(fills: list[tuple]) -> float | None:
 def _compute_fill_rate(conn: sqlite3.Connection) -> float:
     """Compute fill rate: recent fills / recent orders posted.
 
-    Uses the last 7 days of data from mm_orders and mm_processed_fills.
+    Uses the last 7 days of data from mm_orders (legacy order log) and
+    fills_ledger. mm_orders no longer has a live writer but carries a
+    tail of pre-daemon rows; once that drains to zero, fill_rate will
+    fall back to 0.0 regardless of fills. The denominator switches
+    source once a replacement posted-orders table lands.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    cutoff_unix = (datetime.now(timezone.utc) - timedelta(days=7)).timestamp()
 
     try:
         orders_row = conn.execute(
-            "SELECT COUNT(*) FROM mm_orders WHERE timestamp >= ?", (cutoff,)
+            "SELECT COUNT(*) FROM mm_orders WHERE timestamp >= ?", (cutoff_iso,)
         ).fetchone()
         orders_posted = orders_row[0] if orders_row else 0
 
         fills_row = conn.execute(
-            "SELECT COUNT(*) FROM mm_processed_fills WHERE recorded_at >= ?", (cutoff,)
+            "SELECT COUNT(*) FROM fills_ledger WHERE fill_ts_unix >= ?",
+            (cutoff_unix,),
         ).fetchone()
         fills_detected = fills_row[0] if fills_row else 0
     except Exception:

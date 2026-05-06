@@ -11,7 +11,7 @@ import sqlite3
 from typing import Optional
 
 from bot.types import Regime, Side, TradeSignal
-from bot.market_maker.series_profitability import _get_series_prefix
+from bot.core.categorization import _get_series_prefix
 
 
 # ---------------------------------------------------------------------------

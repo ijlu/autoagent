@@ -16,7 +16,9 @@ Known bug regression watchlist:
   1. _apply_trade() short-close P&L was inverted (avg_entry - price, not price - avg_entry)
   2. record_settlements() missing fee subtraction
   3. int(float(...)) rounding — always use round(float(...))
-  4. mm_liquidate_expiring() zeroing inventory without settlement confirmation
+  4. Exit paths zeroing inventory without settlement confirmation (original
+     offender mm_liquidate_expiring was removed; pattern still applies to
+     manage_positions and any future exit policy)
   5. MM spread not checked against expected maker fees
 """
 
