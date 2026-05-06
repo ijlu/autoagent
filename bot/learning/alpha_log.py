@@ -135,12 +135,18 @@ class MarketSnapshot:
 @dataclass
 class EnsembleSnapshot:
     """Ensemble output at decision time. `p_yes` MUST be canonical P(YES),
-    not per-side probability — caller is responsible for normalization."""
+    not per-side probability — caller is responsible for normalization.
+
+    `raw_p_yes` is the pre-`apply_calibration` value, also canonical P(YES).
+    When the calibration gate is off (or the path bypasses calibration —
+    weather v2 short-circuits), raw_p_yes == p_yes. Logged separately so
+    future calibrator bake-offs can recover the unconditioned input."""
     p_yes: float
     confidence: Optional[float] = None
     source_count: Optional[int] = None
     sources: Optional[list[str]] = None
     source_estimates: Optional[dict[str, float]] = None
+    raw_p_yes: Optional[float] = None
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────
@@ -351,27 +357,36 @@ def log_decision(
             else None
         )
 
+        # raw_p_yes defaults to p_yes when caller didn't supply a separate raw
+        # value (e.g. paths that don't call apply_calibration anyway).
+        raw_p_yes = (
+            float(ensemble.raw_p_yes) if ensemble.raw_p_yes is not None
+            else float(ensemble.p_yes)
+        )
         with db_write_ctx(conn):
             cur = conn.execute(
                 """INSERT INTO alpha_backtest (
                     ts_decision, ts_decision_unix, ticker, family,
                     decision_type, decision_outcome, side, price_cents,
                     contracts, skip_reason,
-                    ensemble_p_yes, ensemble_confidence, source_count,
+                    ensemble_p_yes, raw_ensemble_p_yes,
+                    ensemble_confidence, source_count,
                     sources_json, source_estimates_json,
                     yes_bid_cents, yes_ask_cents, yes_last_cents,
                     last_trade_age_s, spread_cents, volume_fp,
                     market_prob_yes, market_prob_source,
                     cycle_id, notes, market_id, portfolio_leg_count
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, ?, ?, ?, ?,
+                          ?, ?,
+                          ?, ?, ?, ?,
                           ?, ?, ?, ?, ?, ?,
                           ?, ?, ?, ?, ?, ?)""",
                 (
                     ts_decision, ts_decision_unix, ticker, family,
                     decision_type, decision_outcome, side, price_cents,
                     contracts, skip_reason,
-                    float(ensemble.p_yes), ensemble.confidence, ensemble.source_count,
+                    float(ensemble.p_yes), raw_p_yes,
+                    ensemble.confidence, ensemble.source_count,
                     sources_json, estimates_json,
                     market.yes_bid_cents, market.yes_ask_cents, market.yes_last_cents,
                     market.last_trade_age_s, spread_cents, market.volume_fp,

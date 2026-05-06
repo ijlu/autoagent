@@ -119,6 +119,10 @@ EXPECTED_INSERT_WRITERS: dict[str, set[str]] = {
     # INSERT and UPDATE — the table is purely an internal dedup ledger and
     # has no other writer.
     "discovered_series": {"bot/daemon/series_discovery.py"},
+    # Market snapshots — Layer 2 prereq for city expansion. Single writer,
+    # the snapshotter poller. INSERT OR REPLACE on (ticker, ts) PK so the
+    # rare same-second double-write coalesces rather than duplicating.
+    "kalshi_market_snapshots": {"bot/daemon/market_snapshotter_poller.py"},
     # settlements, kv_cache — bot/db.py owns via helpers.
     "settlements": {"bot/db.py", "trade.py"},
     # kv_cache: bot/db.py provides the generic put/expiry plumbing;

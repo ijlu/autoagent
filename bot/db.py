@@ -621,6 +621,93 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         alert_sent_unix       REAL
     )""")
 
+    # ── Kalshi market snapshots (city-expansion Layer 2 prereq) ──
+    # Per-cycle bid/ask + liquidity capture for every weather series in
+    # bot.config.WEATHER_SNAPSHOT_SERIES. Driven by
+    # bot/daemon/market_snapshotter_poller.py. Required so we have ≥14d of
+    # historical market data on candidate cities (PHX/SEA/HOU/...) BEFORE
+    # they're promoted to shadow/live — without this, Layer 2 (capacity)
+    # and Layer 3 (strategy P&L sim) have nothing to evaluate.
+    #
+    # Write rule (change-detection + heartbeat):
+    #   1. Quote moved (yes_bid|yes_ask|no_bid|no_ask|last_price|volume|status diff)
+    #   2. ≥5 minutes since last stored row for this ticker (heartbeat)
+    #   3. First observation of a ticker
+    #
+    # Payload column populated only on:
+    #   - First observation (full open-state capture)
+    #   - Status transition (open → closed → settled → finalized)
+    #   - Hourly schema sample (most recent payload < 60min ago → skip)
+    # Otherwise NULL — schema-evolution safety net at ~3 GB/yr extra.
+    #
+    # Storage: ~10 GB/yr base + ~3 GB/yr payload at 16 candidate series.
+    # Retention: forever by default. Cleanup task in scheduler reads
+    # kv_cache:market_snapshots_ttl_days; NULL/missing → no deletion.
+    conn.execute("""CREATE TABLE IF NOT EXISTS kalshi_market_snapshots (
+        ticker                    TEXT    NOT NULL,
+        ts                        INTEGER NOT NULL,
+
+        -- Identity
+        event_ticker              TEXT,
+        series_ticker             TEXT,
+        market_type               TEXT,
+        status                    TEXT    NOT NULL,
+
+        -- Strikes (avoid re-parsing tickers; bracket math depends on these)
+        strike_type               TEXT,
+        floor_strike              REAL,
+        cap_strike                REAL,
+        custom_strike             TEXT,
+
+        -- Top-of-book (cents)
+        yes_bid                   INTEGER,
+        yes_ask                   INTEGER,
+        no_bid                    INTEGER,
+        no_ask                    INTEGER,
+        last_price                INTEGER,
+        previous_yes_bid          INTEGER,
+        previous_yes_ask          INTEGER,
+        previous_price            INTEGER,
+        yes_bid_size              INTEGER,
+        yes_ask_size              INTEGER,
+
+        -- Liquidity
+        volume                    INTEGER,
+        volume_24h                INTEGER,
+        liquidity                 INTEGER,
+        open_interest             INTEGER,
+        notional_value            INTEGER,
+        tick_size                 INTEGER,
+        risk_limit_cents          INTEGER,
+
+        -- Timing
+        open_time                 INTEGER,
+        close_time                INTEGER,
+        expected_expiration_time  INTEGER,
+        expiration_time           INTEGER,
+
+        -- Settlement (populated post-settle only)
+        settlement_value          INTEGER,
+        result                    TEXT,
+
+        -- Schema-evolution safety net (NULL on most rows)
+        payload                   TEXT,
+
+        PRIMARY KEY (ticker, ts)
+    ) WITHOUT ROWID""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_snap_ts "
+        "ON kalshi_market_snapshots(ts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_snap_event_ts "
+        "ON kalshi_market_snapshots(event_ticker, ts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_snap_series_ts "
+        "ON kalshi_market_snapshots(series_ticker, ts)"
+    )
+
     # ── Migrations for existing tables (backward compat) ──
     _migrations = [
         ("trades", "action", "TEXT DEFAULT 'buy'"),
@@ -652,6 +739,13 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         ("timing_patterns", "alpha_id", "INTEGER"),
         ("edge_convergence", "alpha_id", "INTEGER"),
         ("loss_postmortems", "alpha_id", "INTEGER"),
+        # 2026-05-04: split raw vs calibrated probability so future calibrator
+        # bake-offs aren't fitting on doubly-processed data. estimated_prob is
+        # post-apply_calibration (or raw, if the path bypassed calibration —
+        # weather v2 short-circuits before apply_calibration). The new
+        # raw_estimated_prob column always holds pre-calibration value.
+        ("alpha_backtest", "raw_ensemble_p_yes", "REAL"),
+        ("calibration", "raw_estimated_prob", "REAL"),
         # Phase 1 step 10: MM promotion gate needs per-shadow-quote fill
         # status and settlement P&L. Matcher populates shadow_bid_filled /
         # shadow_ask_filled from subsequent market snapshots; settlement
@@ -690,6 +784,13 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         ("weather_forecast_snapshots", "regime_tier_used", "TEXT"),
         ("weather_forecast_snapshots", "regime_sigma_f", "REAL"),
         ("weather_forecast_snapshots", "pooled_sigma_f", "REAL"),
+        # Snapshotter additions: top-of-book depth + previous_price.
+        # The Kalshi /markets response carries yes_bid_size_fp / yes_ask_size_fp
+        # for free; capacity analysis (Layer 2) wants this without an extra
+        # /orderbook round-trip.
+        ("kalshi_market_snapshots", "previous_price", "INTEGER"),
+        ("kalshi_market_snapshots", "yes_bid_size", "INTEGER"),
+        ("kalshi_market_snapshots", "yes_ask_size", "INTEGER"),
     ]
     for table, col, coltype in _migrations:
         try:

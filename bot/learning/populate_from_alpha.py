@@ -89,7 +89,7 @@ def populate_calibration(conn) -> int:
         now = _now_iso()
         rows = conn.execute(
             """SELECT ab.id, ab.ticker, ab.side, ab.ensemble_p_yes,
-                      ab.source_count, ab.won_yes
+                      ab.raw_ensemble_p_yes, ab.source_count, ab.won_yes
                FROM alpha_backtest ab
                WHERE ab.ts_settle_unix IS NOT NULL
                  AND ab.won_yes IS NOT NULL
@@ -104,18 +104,24 @@ def populate_calibration(conn) -> int:
 
         inserted = 0
         with db_write_ctx(conn):
-            for alpha_id, ticker, side, p_yes, src_count, won_yes in rows:
+            for alpha_id, ticker, side, p_yes, raw_p_yes, src_count, won_yes in rows:
                 if p_yes is None:
                     continue
                 # p(our side wins) for calibration bucket
                 our_prob = p_yes if side == "yes" else (1.0 - p_yes)
+                # Same per-side flip for the raw value. NULL raw_p_yes (legacy
+                # rows) → fall through to our_prob so the column isn't NULL.
+                if raw_p_yes is None:
+                    raw_our_prob = our_prob
+                else:
+                    raw_our_prob = raw_p_yes if side == "yes" else (1.0 - raw_p_yes)
                 bucket = _prob_bucket(our_prob)
                 conn.execute(
                     """INSERT INTO calibration
-                       (recorded_at, ticker, estimated_prob, actual_outcome,
-                        source_desc, n_sources, bucket, alpha_id)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (now, ticker, our_prob, int(won_yes),
+                       (recorded_at, ticker, estimated_prob, raw_estimated_prob,
+                        actual_outcome, source_desc, n_sources, bucket, alpha_id)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (now, ticker, our_prob, raw_our_prob, int(won_yes),
                      "alpha:shadow", src_count, bucket, alpha_id),
                 )
                 inserted += 1

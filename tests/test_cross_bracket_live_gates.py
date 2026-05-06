@@ -258,16 +258,20 @@ def test_process_decisions_default_keeps_shadow_only(memdb):
     assert stats["live_skipped_family_off"] >= 1
 
 
-def test_process_decisions_with_live_on_but_tte_outside(memdb, monkeypatch):
-    """Even with env + kv both on, an out-of-window TTE must skip live.
+def test_process_decisions_with_live_on_but_out_of_window(memdb, monkeypatch):
+    """Even with env + kv both on, an out-of-window decision must skip live.
 
-    This is the second-most-critical safety test: the TTE window is
-    where the backtest measured the alpha. Outside it, we have no
-    evidence of edge and must stay shadow.
+    2026-05-06 (Phase 3e cleanup): the primary entry gate is the
+    per-city LST+stability check (``_is_in_lst_gate``), with TTE as
+    belt-and-suspenders backstop. For an Aug ticker evaluated today,
+    the LST date check fails first (current LST date != Aug 30) so
+    the skip gets bucketed as ``live_skipped_lst`` rather than
+    ``live_skipped_tte``. Either is acceptable — the contract is
+    "no live order placed for out-of-window legs."
     """
     monkeypatch.setattr(cb, "CROSS_BRACKET_LIVE", True)
     kv_set(memdb, "cross_bracket_live:KXHIGHNY", True, ttl_seconds=86400)
-    # KXHIGHNY-26AUG30 is months away → out of TTE window.
+    # KXHIGHNY-26AUG30 is months away → out of LST date and TTE window.
     decisions = [
         _FakeDecision(ticker="KXHIGHNY-26AUG30-B62", action="buy_yes",
                       side="yes", price_cents=30, p_yes=0.55, edge_yes=0.20),
@@ -277,15 +281,18 @@ def test_process_decisions_with_live_on_but_tte_outside(memdb, monkeypatch):
         "live_orders_posted": 0, "live_orders_failed": 0,
         "live_skipped_tte": 0, "live_skipped_edge": 0,
         "live_skipped_exposure_cap": 0, "live_skipped_leg_cap": 0,
-        "live_skipped_family_off": 0,
+        "live_skipped_family_off": 0, "live_skipped_lst": 0,
     }
 
     with patch("bot.api.api_post",
-                side_effect=AssertionError("api_post must not be called for out-of-TTE leg")):
+                side_effect=AssertionError("api_post must not be called for out-of-window leg")):
         cb._process_decisions(memdb, "KXHIGHNY-26AUG30", [market], decisions, stats)
 
+    # Contract: no live order placed; SOME skip counter incremented.
     assert stats["live_orders_posted"] == 0
-    assert stats["live_skipped_tte"] >= 1
+    assert (stats["live_skipped_tte"] + stats["live_skipped_lst"]) >= 1, (
+        "Expected one of (tte, lst) skip buckets to fire"
+    )
 
 
 # ── Layer 1+2: slippage protection in _post_live_order ────────────────

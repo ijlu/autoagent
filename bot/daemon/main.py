@@ -37,6 +37,10 @@ from bot.daemon.cycle_runner import CycleRunner
 from bot.daemon.dispatcher import AsyncEventDispatcher
 from bot.daemon.fills_writer import FillsWriter
 from bot.daemon.forecast_cache import ForecastCache, FORECAST_REFRESH_INTERVAL_S
+from bot.daemon.market_snapshotter_poller import (
+    MarketSnapshotPoller,
+    cleanup_old_snapshots,
+)
 from bot.daemon.metar_poller import METARPoller
 from bot.daemon.poller_base import Poller
 from bot.daemon.requote_triggers import (
@@ -48,7 +52,7 @@ from bot.daemon.series_discovery import run_discovery as run_series_discovery
 from bot.daemon.shadow_integrity import run_shadow_integrity_check
 from bot.daemon.weather_handler import WeatherChangeHandler
 from bot.daemon.weather_quoter import WeatherQuoter
-from bot.db import init_db, kv_cleanup
+from bot.db import init_db, kv_cleanup, kv_get, kv_set
 from bot.learning.fills_validator import compare_last_n_days, format_report
 from bot.learning.mm_promotion import (
     match_shadow_fills,
@@ -256,6 +260,98 @@ def _run_fills_sync(
             "[fills_sync] inserted=%d new rows (since_unix=%.0f)",
             inserted, since,
         )
+
+
+def _run_cross_bracket_scoreboard(conn) -> None:
+    """Emit a daily cross-bracket performance summary to the daemon log.
+
+    Net P&L (already net of fees), win rate, contracts, and explicit
+    fees-paid breakdown from fills_ledger. One line per window-section
+    so dashboards can grep for [scoreboard] and chart over time.
+    """
+    from bot.observability.cross_bracket_scoreboard import (
+        build_scoreboard, render_scoreboard,
+    )
+    scoreboard = build_scoreboard(conn)
+    rendered = render_scoreboard(scoreboard, header="cross-bracket daily scoreboard")
+    # Multi-line: emit each line with [scoreboard] prefix so grep is easy
+    for line in rendered.splitlines():
+        if line.strip():
+            logger.info("[scoreboard] %s", line)
+
+
+def _run_cross_bracket_exit(conn) -> None:
+    """Evaluate open cross-bracket positions; post exit orders when
+    realized gain crosses threshold. Logs stats line for visibility.
+    No-op when CROSS_BRACKET_LIVE is off."""
+    from bot.daemon.cross_bracket_exit import run_exit_check
+    stats = run_exit_check(conn)
+    if stats["positions_checked"] > 0 or stats["exits_posted"] > 0:
+        logger.info(
+            "[cb_exit] checked=%d posted=%d skipped(no_book/no_gain/below/settle/pending)="
+            "%d/%d/%d/%d/%d failed=%d",
+            stats["positions_checked"],
+            stats["exits_posted"],
+            stats["exits_skipped_no_book"],
+            stats["exits_skipped_no_gain"],
+            stats["exits_skipped_below_threshold"],
+            stats["exits_skipped_close_to_settle"],
+            stats["exits_skipped_pending"],
+            stats["exits_failed"],
+        )
+
+
+def _run_cross_bracket_rearm(conn) -> None:
+    """Refresh per-family ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h
+    so the strategy keeps firing across daily restarts. Gated by global
+    ``CROSS_BRACKET_LIVE`` — when that's off this is a no-op so we don't
+    silently re-arm after an operator turns the strategy off at the
+    global level.
+
+    Idempotent (kv_set is INSERT OR REPLACE). Lives here rather than in
+    cross_bracket_shadow.py because re-arming is a daemon-lifecycle
+    concern, not a per-cycle decision.
+    """
+    from bot.config import CROSS_BRACKET_LIVE
+    if not CROSS_BRACKET_LIVE:
+        logger.info("[cross_bracket_rearm] skipped — CROSS_BRACKET_LIVE=false")
+        return
+    families = (
+        "KXHIGHNY", "KXHIGHMIA", "KXHIGHCHI",
+        "KXHIGHLAX", "KXHIGHAUS", "KXHIGHDEN",
+    )
+    for fam in families:
+        kv_set(conn, f"cross_bracket_live:{fam}", True, 24 * 3600)
+    logger.info(
+        "[cross_bracket_rearm] refreshed %d weather families (TTL=24h)",
+        len(families),
+    )
+
+
+def _run_cross_bracket_lst_refresh(conn) -> None:
+    """Recompute per-city cross-bracket LST gates from current METAR
+    backfill and persist to kv_cache. See
+    bot/learning/cross_bracket_lst_gate.py.
+
+    Falls back to defaults per-series when data is insufficient — does
+    NOT make the gate looser than the hardcoded defaults. Safe to run
+    even with no data (the kv_cache writes are skipped, defaults stay
+    in effect).
+    """
+    from bot.learning.cross_bracket_lst_gate import refresh_all_from_metar
+    try:
+        results = refresh_all_from_metar(conn=conn)
+    except Exception as exc:
+        logger.warning("[cross_bracket_lst_refresh] failed: %s", exc)
+        return
+    empirical = sum(1 for r in results.values() if r.get("source") == "empirical")
+    fallback = len(results) - empirical
+    logger.info(
+        "[cross_bracket_lst_refresh] %d empirical, %d fallback-to-default",
+        empirical, fallback,
+    )
+    for series, info in sorted(results.items()):
+        logger.info("  %s → %s", series, info)
 
 
 def _run_fills_validator(conn) -> None:
@@ -1108,7 +1204,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     # followed by a redundant time-decay fire at T + 45 s.
     weather_handler.on_fire = time_decay_driver.note_external_fire
 
-    pollers: list[Poller] = [metar_poller]
+    # ── Market snapshotter (city-expansion Layer 2 prereq) ────────────
+    # Standalone poller (not piggybacking the trading scan): the cycle
+    # fetches /markets per series in TRADE_SERIES_ALLOWLIST, which excludes
+    # candidate cities (PHX/SEA/HOU/...). Snapshotter runs on its own 60s
+    # cadence over WEATHER_SNAPSHOT_SERIES so we accumulate bid/ask history
+    # on candidates *before* they're promoted.
+    market_snapshotter = MarketSnapshotPoller(conn=conn)
+
+    pollers: list[Poller] = [metar_poller, market_snapshotter]
 
     # Forecast refresh wrapper: captures a before/after snapshot and feeds
     # the delta to ForecastChangeDriver. Returns number of synthetic
@@ -1280,6 +1384,42 @@ def main(argv: Optional[list[str]] = None) -> int:
         interval_s=300.0,
         initial_delay_s=120.0,  # let first cycle settle before first run
     )
+    # Cross-bracket per-family kv re-arm. Each
+    # ``cross_bracket_live:<FAMILY>`` key has TTL=24h; without an
+    # automatic refresh, an operator who armed a family yesterday would
+    # quietly stop trading them tomorrow. 12h cadence means even if one
+    # run fails, the next still keeps the keys alive within their TTL.
+    # Gated internally by CROSS_BRACKET_LIVE (the global kill switch).
+    scheduler.register(
+        "cross_bracket_rearm",
+        lambda: _run_cross_bracket_rearm(conn),
+        interval_s=12 * 3600,
+        initial_delay_s=15.0,  # arm immediately on boot
+    )
+    # Cross-bracket position exit logic. Watches our open cross-bracket
+    # positions (identified by mm_xb_ client_order_id prefix in
+    # fills_ledger) and posts synthetic-sell limit orders when realized
+    # gain ≥ 50% of max upside or ≥25¢ absolute. Skips if TTE < 30 min
+    # (avoid settle-race) and idempotent via pending-order check. Runs
+    # 5 min after each cross_bracket_shadow (offset to avoid contending
+    # for the same orderbook lookups).
+    scheduler.register(
+        "cross_bracket_exit",
+        lambda: _run_cross_bracket_exit(conn),
+        interval_s=300.0,
+        initial_delay_s=240.0,  # 2 min after boot, between cross_bracket_shadow runs
+    )
+    # Cross-bracket performance scoreboard. First fire 5 min after boot
+    # (immediate baseline), then every 24h. Emits a multi-line summary
+    # to daemon.log with [scoreboard] prefix so dashboards can grep and
+    # chart over time. Net P&L is already net of fees (settlements writer
+    # subtracts them); fills_ledger fees are reported explicitly.
+    scheduler.register(
+        "cross_bracket_scoreboard",
+        lambda: _run_cross_bracket_scoreboard(conn),
+        interval_s=24 * 3600,
+        initial_delay_s=300.0,
+    )
     # Dashboard regen — also daily, ~30min after the state evaluator
     # so the dashboard reflects fresh state-machine transitions.
     scheduler.register(
@@ -1296,6 +1436,40 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_cross_bracket_validation(conn),
         interval_s=86400.0,
         initial_delay_s=_seconds_until_utc_hour(8),
+    )
+    # 2026-05-05: per-city LST gate refresh from METAR backfill. Runs
+    # once per day at 09:00 UTC, after the daily scoreboard + dashboard
+    # tasks have finished. See bot/learning/cross_bracket_lst_gate.py.
+    scheduler.register(
+        "cross_bracket_lst_refresh",
+        lambda: _run_cross_bracket_lst_refresh(conn),
+        interval_s=86400.0,
+        initial_delay_s=_seconds_until_utc_hour(9),
+    )
+    # market_snapshots cleanup — wired up but inert by default. Reads
+    # the kv_cache key set by the operator; NULL/missing → no deletion.
+    # Runs at 09:30 UTC (after the LST refresh) so cleanup never overlaps
+    # with morning audit tasks. Storage is "forever" per design until
+    # the operator decides to flip on a TTL.
+    def _run_market_snapshot_cleanup() -> None:
+        ttl = kv_get(conn, "market_snapshots_ttl_days")
+        try:
+            ttl_days = int(ttl) if ttl is not None else None
+        except (TypeError, ValueError):
+            ttl_days = None
+        if ttl_days is None or ttl_days <= 0:
+            return
+        deleted = cleanup_old_snapshots(conn, ttl_days)
+        if deleted:
+            logger.info(
+                "[market_snapshots] cleanup deleted %d rows older than %d days",
+                deleted, ttl_days,
+            )
+    scheduler.register(
+        "market_snapshots_cleanup",
+        _run_market_snapshot_cleanup,
+        interval_s=86400.0,
+        initial_delay_s=_seconds_until_utc_hour(9) + 1800,
     )
 
     # Start pollers on scheduler start, stop them on scheduler stop.

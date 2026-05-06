@@ -142,6 +142,76 @@ class TestPlattFit:
         A, B, _ = cal._fit_platt(xs, ys)
         assert math.isfinite(A) and math.isfinite(B)
 
+    def test_bounds_respected_on_bimodal_overconfident_data(self):
+        """Regression for the step-function pathology (CALIBRATION_INVESTIGATION
+        2026-05-04): on bimodal raw probabilities clustered near 0 and 1 with
+        actual rates that don't match the extremes, the unconstrained MLE chases
+        A → millions. Bounded Newton must keep A in [PLATT_A_MIN, PLATT_A_MAX]
+        and B in [PLATT_B_MIN, PLATT_B_MAX]."""
+        rng = random.Random(2026)
+        data = []
+        # cluster near 0 — raw says ~5%, reality is ~14%
+        for _ in range(2000):
+            raw_p = 0.02 + rng.random() * 0.06
+            y = 1 if rng.random() < 0.14 else 0
+            data.append((raw_p, y))
+        # cluster near 1 — raw says ~99%, reality is ~59%
+        for _ in range(2000):
+            raw_p = 0.95 + rng.random() * 0.04
+            y = 1 if rng.random() < 0.59 else 0
+            data.append((raw_p, y))
+        xs = [cal._logit(p) for p, _ in data]
+        ys = [y for _, y in data]
+        A, B, _ = cal._fit_platt(xs, ys)
+        assert cal.PLATT_A_MIN <= A <= cal.PLATT_A_MAX, f"A={A} out of bounds"
+        assert cal.PLATT_B_MIN <= B <= cal.PLATT_B_MAX, f"B={B} out of bounds"
+
+    def test_brier_improves_on_bimodal_overconfident_data(self):
+        """Bounded Newton on bimodal overconfident data must produce a fit that
+        REDUCES Brier vs raw — that's the whole point of running the calibrator
+        on the live weather pipeline."""
+        rng = random.Random(2027)
+        data = []
+        for _ in range(2000):
+            raw_p = 0.02 + rng.random() * 0.06
+            y = 1 if rng.random() < 0.14 else 0
+            data.append((raw_p, y))
+        for _ in range(2000):
+            raw_p = 0.95 + rng.random() * 0.04
+            y = 1 if rng.random() < 0.59 else 0
+            data.append((raw_p, y))
+        ps = [p for p, _ in data]
+        ys = [y for _, y in data]
+        xs = [cal._logit(p) for p in ps]
+        A, B, _ = cal._fit_platt(xs, ys)
+        brier_before = cal._brier(ps, ys)
+        calibrated = [cal._sigmoid(A * x + B) for x in xs]
+        brier_after = cal._brier(calibrated, ys)
+        assert brier_after < brier_before - 0.01, (
+            f"bounded Platt did not improve Brier on bimodal data: "
+            f"{brier_before:.4f} -> {brier_after:.4f}"
+        )
+
+    def test_no_step_function_on_separable_data(self):
+        """Pin: even on near-perfectly-separable data (the regime where
+        unconstrained MLE wants A → ∞), bounded Newton must NOT collapse to a
+        step function. A must stay ≤ PLATT_A_MAX."""
+        rng = random.Random(2028)
+        data = []
+        for _ in range(500):
+            raw_p = 0.02 + rng.random() * 0.06
+            y = 1 if rng.random() < 0.05 else 0  # nearly always 0
+            data.append((raw_p, y))
+        for _ in range(500):
+            raw_p = 0.95 + rng.random() * 0.04
+            y = 1 if rng.random() < 0.95 else 0  # nearly always 1
+            data.append((raw_p, y))
+        xs = [cal._logit(p) for p, _ in data]
+        ys = [y for _, y in data]
+        A, B, _ = cal._fit_platt(xs, ys)
+        assert A <= cal.PLATT_A_MAX, f"A={A} exceeds PLATT_A_MAX"
+        assert math.isfinite(A) and math.isfinite(B)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Isotonic PAV

@@ -90,17 +90,24 @@ class TestPortfolio:
     confirm the decisions match expectation."""
 
     def test_buys_yes_on_high_edge_bracket(self):
-        # B68.5 = bracket [68, 70], we predict ~41%, market mid 30¢ →
-        # ~11% YES edge → buy YES
+        # 2026-05-05: updated for the conviction gate (Phase 3d).
+        # The original case (μ=68, σ=1.5 → p_yes ≈ 0.41) now correctly
+        # skips because 0.41 is in the "weak conviction" zone — strategy
+        # design says cross-bracket only fires on confident directional
+        # views, not coin-flips.
+        # Updated case: μ=69, σ=1.0 → P(B68.5) ≈ 0.68, above the 0.65
+        # conviction threshold; with market priced ~30¢ (yes_ask=32),
+        # edge_yes = 0.68 - 0.32 = 0.36 → fire YES.
         markets = [_market("KXHIGHNY-26APR30-B68.5", yes_bid=28, yes_ask=32)]
-        decisions = score_market_portfolio(markets, combined_mu=68.0,
-                                            combined_sigma=1.5)
+        decisions = score_market_portfolio(markets, combined_mu=69.0,
+                                            combined_sigma=1.0)
         assert len(decisions) == 1
         d = decisions[0]
         assert d.action == "buy_yes"
         assert d.side == "yes"
         assert d.price_cents == 32
         assert d.edge_yes is not None and d.edge_yes > 0.05
+        assert d.p_yes >= 0.65, "test must use a high-conviction p_yes"
 
     def test_buys_no_on_far_bracket(self):
         # B62.5 = bracket [62, 64], we predict ~3% YES (i.e., 97% NO)
@@ -146,23 +153,30 @@ class TestPortfolio:
         assert d.action == "skip"
 
     def test_full_portfolio_5_brackets(self):
-        """The headline worked example: 5 brackets, predicted N(68, 1.5)."""
+        """The headline worked example: 5 brackets, predicted N(69, 1.0).
+
+        2026-05-05: updated for the conviction gate (Phase 3d). With
+        μ=69, σ=1.0:
+          - B68.5 [68, 70): p_yes ≈ 0.683 (above 0.65 → fires)
+          - B62/64/66.5: p_yes ≈ 0 (below 0.35 ⇒ p_no above 0.65 → fires NO)
+          - B70.5 [70, 72): p_yes ≈ 0.16 (p_no = 0.84 → fires NO if edge)
+        """
         markets = [
-            _market("KXHIGHNY-26APR30-B62.5", yes_bid=2, yes_ask=4),    # cheap; edge_no should NOT be huge (penny)
+            _market("KXHIGHNY-26APR30-B62.5", yes_bid=2, yes_ask=4),    # cheap
             _market("KXHIGHNY-26APR30-B64.5", yes_bid=8, yes_ask=12),
-            _market("KXHIGHNY-26APR30-B66.5", yes_bid=20, yes_ask=24),  # ~16% pred vs 22% mid → small edge
-            _market("KXHIGHNY-26APR30-B68.5", yes_bid=28, yes_ask=32),  # ~41% pred vs 30% mid → buy YES
+            _market("KXHIGHNY-26APR30-B66.5", yes_bid=20, yes_ask=24),
+            _market("KXHIGHNY-26APR30-B68.5", yes_bid=28, yes_ask=32),  # ~68% pred vs 30% mid → buy YES
             _market("KXHIGHNY-26APR30-B70.5", yes_bid=12, yes_ask=16),
         ]
-        decisions = score_market_portfolio(markets, combined_mu=68.0,
-                                            combined_sigma=1.5)
+        decisions = score_market_portfolio(markets, combined_mu=69.0,
+                                            combined_sigma=1.0)
         assert len(decisions) == 5
 
-        # B68.5 should be buy YES
+        # B68.5 should be buy YES (high conviction P(YES) ≈ 0.68)
         b685 = next(d for d in decisions if "B68.5" in d.ticker)
         assert b685.action == "buy_yes"
 
-        # The portfolio should have at least one fire (B68.5 confirmed)
+        # The portfolio should have at least one fire
         n_fired = sum(1 for d in decisions if d.action != "skip")
         assert n_fired >= 1
 
@@ -199,6 +213,51 @@ class TestGroupBySettlement:
         # No bracket / threshold suffix — falls into its own group
         grouped = group_markets_by_settlement([{"ticker": "KXFED-26JUN-T425"}])
         assert "KXFED" in str(grouped)
+
+
+# ── Conviction gate (Phase 3d, 2026-05-05) ──────────────────────────
+class TestConvictionGate:
+    """Cross-bracket fires only when our model has a clear directional
+    view (P(picked side) ≥ 0.65). On bracket-boundary cases where p_yes
+    sits in [0.35, 0.65], skip even if there's nominal edge against the
+    market — the market may know more than we do via real-time METAR.
+
+    See bot/scoring/bracket_portfolio.py::_CONVICTION_THRESHOLD and
+    reports/PHASE_3C_COUNTERFACTUAL_2026-05-05.md.
+    """
+
+    def test_skips_boundary_case_no_side_has_conviction(self):
+        # μ at exact bracket boundary → p_yes ≈ 0.5 → no conviction either way.
+        # B68.5 = [68, 70), μ=68.0 σ=1.5: p_yes ≈ 0.41 (below 0.65)
+        # market priced YES at 86% (yes_ask=87) — huge nominal edge_no
+        # but conviction gate must SKIP (NY-B72.5 boundary regression).
+        markets = [_market("KXHIGHNY-26APR30-B68.5", yes_bid=86, yes_ask=87)]
+        decisions = score_market_portfolio(markets, combined_mu=68.0,
+                                            combined_sigma=1.5)
+        d = decisions[0]
+        # p_yes ≈ 0.41 — neither YES (need ≥0.65) nor NO (need ≤0.35) is confident
+        assert d.action == "skip"
+        assert d.skip_reason and "conviction_fail" in d.skip_reason
+
+    def test_fires_no_when_high_p_no_conviction(self):
+        # μ far below bracket → p_yes very low → p_no very high → fires NO with conviction.
+        # B68.5 = [68, 70), μ=60, σ=1: p_yes ≈ 0 → p_no ≈ 1.0
+        markets = [_market("KXHIGHNY-26APR30-B68.5", yes_bid=20, yes_ask=24)]
+        decisions = score_market_portfolio(markets, combined_mu=60.0,
+                                            combined_sigma=1.0)
+        d = decisions[0]
+        assert d.action == "buy_no"
+        assert d.p_yes < 0.05  # very high P(NO) conviction
+
+    def test_fires_yes_when_high_p_yes_conviction(self):
+        # μ at bracket center, tight σ → p_yes high → fires YES with conviction.
+        # B68.5 = [68, 70), μ=69, σ=0.5: p_yes ≈ Φ(2)-Φ(-2) ≈ 0.954
+        markets = [_market("KXHIGHNY-26APR30-B68.5", yes_bid=20, yes_ask=24)]
+        decisions = score_market_portfolio(markets, combined_mu=69.0,
+                                            combined_sigma=0.5)
+        d = decisions[0]
+        assert d.action == "buy_yes"
+        assert d.p_yes >= 0.65
 
 
 # ── Edge-band guard ───────────────────────────────────────────────────

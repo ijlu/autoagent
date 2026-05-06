@@ -544,21 +544,27 @@ def get_metar_gaussian(ticker: str, market_data: dict) -> GaussianForecast | Non
     # 69.08°F (2.77°F warmer than the actual peak) because the diurnal
     # fit predicted continued warming when temp had clearly turned over.
     #
-    # The LST gate (≥14) prevents false positives in the morning when
-    # a passing cloud or brief cold-front gust can transiently push
-    # the running_high above current temp. After 2pm LST, that pattern
-    # is much more likely to be the real day-peak transition.
-    #
-    # _PAST_PEAK_DELTA_F: how far below running_high the current temp
-    # has to be before we declare "past peak". 2°F is conservative —
-    # normal sub-hourly METAR jitter is well under 1°F, so a 2°F gap
-    # is clear cooling not measurement noise.
+    # 2026-05-05: tightened threshold + added evening-hard-gate after
+    # cross-bracket losses on KXHIGHAUS/KXHIGHLAX showed the metar
+    # source was still projecting +3-4°F more warming at 5pm LST when
+    # the day was effectively done. Changes:
+    #   1. _PAST_PEAK_DELTA_F lowered 2.0 → 1.0°F (1°F is still
+    #      above typical sub-hourly METAR jitter, but catches the
+    #      common "current temp briefly drops 1°F from peak" case).
+    #   2. _PAST_PEAK_HARD_HOUR=18 (6pm LST): after this hour, clamp
+    #      fires regardless of current-vs-running delta. By 6pm local,
+    #      meaningful additional daytime warming is essentially zero
+    #      in any climate; even AUS/MIA/HOU peaks are over by then.
     _PAST_PEAK_LST_HOUR = 14
-    _PAST_PEAK_DELTA_F = 2.0
+    _PAST_PEAK_HARD_HOUR = 18
+    _PAST_PEAK_DELTA_F = 1.0
     _PAST_PEAK_SIGMA_F = 0.3
     is_past_peak = (
-        lst_hour_now >= _PAST_PEAK_LST_HOUR
-        and (running_high - temp_f) >= _PAST_PEAK_DELTA_F
+        lst_hour_now >= _PAST_PEAK_HARD_HOUR
+        or (
+            lst_hour_now >= _PAST_PEAK_LST_HOUR
+            and (running_high - temp_f) >= _PAST_PEAK_DELTA_F
+        )
     )
     if is_past_peak:
         expected_eventual_high = running_high

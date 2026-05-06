@@ -59,6 +59,17 @@ NEWTON_MAX_ITER = 60
 NEWTON_TOL = 1e-6
 L2_REG = 1e-3                # tiny ridge to keep Newton PSD when data is thin
 
+# Bounded-Newton box. Bimodal raw probabilities (clusters near 0 / 1) make the
+# unconstrained MLE chase A → ∞ once a Newton overshoot pushes the sigmoid into
+# its saturated tail (Hessian → 0, step size blows up). Projecting each step
+# back into [PLATT_A_MIN, PLATT_A_MAX] × [PLATT_B_MIN, PLATT_B_MAX] keeps the
+# iteration in the well-conditioned interior of the loss surface and converges
+# to the bounded MLE, which for our data is well inside the box.
+PLATT_A_MIN = 0.5
+PLATT_A_MAX = 5.0
+PLATT_B_MIN = -10.0
+PLATT_B_MAX = 10.0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Math helpers
@@ -70,6 +81,11 @@ def _sigmoid(z: float) -> float:
         return 1.0 / (1.0 + ez)
     ez = math.exp(z)
     return ez / (1.0 + ez)
+
+
+def _log_sigmoid(z: float) -> float:
+    """Numerically stable log σ(z) = -softplus(-z). Bounded above by 0."""
+    return -max(0.0, -z) - math.log1p(math.exp(-abs(z)))
 
 
 def _logit(p: float) -> float:
@@ -96,12 +112,28 @@ def family_key(ticker: Optional[str]) -> Optional[str]:
 # Platt fit
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _platt_loss(xs: list[float], targets: list[float], A: float, B: float) -> float:
+    """Regularized cross-entropy used by the bounded fitter's line search."""
+    loss = 0.0
+    for x, t in zip(xs, targets):
+        z = A * x + B
+        loss -= t * _log_sigmoid(z) + (1.0 - t) * _log_sigmoid(-z)
+    loss += 0.5 * L2_REG * (A * A + B * B)
+    return loss
+
+
 def _fit_platt(xs: list[float], ys: list[int]) -> tuple[float, float, int]:
-    """Newton-Raphson Platt scaling on pre-logit features.
+    """Bounded-Newton Platt scaling on pre-logit features.
 
     Uses the Platt 1999 label-smoothing prior (t+ = (N++1)/(N++2),
     t- = 1/(N-+2)) to prevent overconfidence on tiny samples, plus an L2
     regularizer to keep the Hessian PSD. Returns (A, B, iterations).
+
+    Newton step is projected into [PLATT_A_MIN, PLATT_A_MAX] × [PLATT_B_MIN,
+    PLATT_B_MAX] and accepted only via backtracking line search — required
+    because bimodal raw probabilities make a full Newton step from (A=1, B=0)
+    overshoot into a saturated corner from which gradient information is
+    useless. With line search the iteration converges to the constrained MLE.
     """
     n_pos = sum(ys)
     n_neg = len(ys) - n_pos
@@ -110,6 +142,7 @@ def _fit_platt(xs: list[float], ys: list[int]) -> tuple[float, float, int]:
     targets = [t_pos if y else t_neg for y in ys]
 
     A, B = 1.0, 0.0
+    loss = _platt_loss(xs, targets, A, B)
     for it in range(NEWTON_MAX_ITER):
         grad_A = grad_B = 0.0
         H_AA = H_AB = H_BB = 0.0
@@ -132,9 +165,27 @@ def _fit_platt(xs: list[float], ys: list[int]) -> tuple[float, float, int]:
             break
         dA = (H_BB * grad_A - H_AB * grad_B) / det
         dB = (H_AA * grad_B - H_AB * grad_A) / det
-        A -= dA
-        B -= dB
-        if abs(dA) + abs(dB) < NEWTON_TOL:
+
+        # Projected Newton + backtracking line search. The Newton direction
+        # may overshoot the constrained optimum; halving the step until loss
+        # decreases (or we run out of patience) is the standard fix.
+        step = 1.0
+        A_new, B_new, loss_new = A, B, loss
+        for _ in range(20):
+            A_try = max(PLATT_A_MIN, min(PLATT_A_MAX, A - step * dA))
+            B_try = max(PLATT_B_MIN, min(PLATT_B_MAX, B - step * dB))
+            loss_try = _platt_loss(xs, targets, A_try, B_try)
+            if loss_try < loss:
+                A_new, B_new, loss_new = A_try, B_try, loss_try
+                break
+            step *= 0.5
+        else:
+            # No step-size decreased the loss → already at (constrained) optimum.
+            return A, B, it + 1
+
+        delta = abs(A_new - A) + abs(B_new - B)
+        A, B, loss = A_new, B_new, loss_new
+        if delta < NEWTON_TOL:
             return A, B, it + 1
     return A, B, NEWTON_MAX_ITER
 

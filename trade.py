@@ -3203,7 +3203,7 @@ SOURCE_WEIGHTS = {
 # ── Ensemble router: collect ALL sources, weighted average ────────────────────
 def get_independent_estimate(ticker, market_data, yes_ask, volume,
                              adaptive_weights=None, calibration_corrections=None,
-                             disabled_sources=None):
+                             disabled_sources=None, out=None):
     """
     Returns (independent_prob, source_description, num_sources) by collecting
     ALL available data sources and computing a weighted ensemble average.
@@ -3223,6 +3223,11 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
         Bayesian Gaussian combine.
       * The Platt calibration was fit on historical v1 outputs and would
         re-introduce a known bias if applied to v2. Skipping it is correct.
+
+    If ``out`` is provided, populates ``out["raw_prob"]`` with the
+    pre-calibration probability (== returned prob on paths that bypass
+    apply_calibration — weather v2 and the short-circuit early returns).
+    Used by the alpha_log writer to persist raw separately from calibrated.
     """
     from bot.config import WEATHER_ENSEMBLE_V2
 
@@ -3258,6 +3263,8 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
                 # treat the three correlated models as three separate votes.
                 n_independent = min(n_contributors, 5)
                 print(f"[weather_v2] {ticker} → p={v2_prob:.3f} via {v2_tag}")
+                if out is not None:
+                    out["raw_prob"] = v2_prob
                 return v2_prob, v2_tag, n_independent
         except Exception as exc:
             # Fall through to v1 path on any failure — never leave the caller
@@ -3489,6 +3496,8 @@ def get_independent_estimate(ticker, market_data, yes_ask, volume,
 
     # Safety clamp — never return extreme probabilities regardless of source
     ensemble_prob = max(0.02, min(0.98, ensemble_prob))
+    if out is not None:
+        out["raw_prob"] = max(0.02, min(0.98, raw_prob))
     return ensemble_prob, f"ensemble({sources})", n_sources
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3605,9 +3614,38 @@ def record_settlements(conn):
                 strat = dir_row[1]
                 est_prob = dir_row[2]
             else:
-                # Not in our DB — might be a personal trade or from before bot started
-                skipped_notours += 1
-                continue
+                # Cross-bracket fallback: cross-bracket POSTs don't write to
+                # mm_orders / safe_compounder_orders / trades — they live in
+                # alpha_backtest (notes='cross_bracket;...'). We must filter
+                # by alpha_backtest cross_bracket entries (NOT fills_ledger
+                # alone) because fills_ledger contains all account fills
+                # including the operator's manual trades — using fills_ledger
+                # as sole attribution mis-tagged a manual KXHIGHAUS-B84.5
+                # YES trade as cross_bracket on 2026-05-05.
+                cb_decision = conn.execute(
+                    "SELECT 1 FROM alpha_backtest "
+                    "WHERE ticker = ? AND notes LIKE 'cross_bracket;%' "
+                    "  AND decision_outcome = 'posted' LIMIT 1",
+                    (ticker,)
+                ).fetchone()
+                if not cb_decision:
+                    skipped_notours += 1
+                    continue
+                # Pull avg fill price from fills_ledger (joined via the
+                # cross-bracket-attested ticker).
+                cb_row = conn.execute(
+                    "SELECT AVG(CASE WHEN side='no' THEN no_price_cents "
+                    "                ELSE yes_price_cents END) "
+                    "FROM fills_ledger WHERE ticker = ? AND action = 'buy'",
+                    (ticker,)
+                ).fetchone()
+                if cb_row and cb_row[0] is not None:
+                    strat = "cross_bracket"
+                    est_prob = None
+                    pc = int(round(cb_row[0]))
+                else:
+                    skipped_notours += 1
+                    continue
 
             # Parse settlement data from Kalshi API
             revenue = int(s.get("revenue", 0))
@@ -5500,7 +5538,8 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
     ticker  = m.get("ticker", "")
 
     def _empty(reason):
-        return (0.0, "", "", "", 0, 0, None, None, 0, reason)
+        # 11-tuple: ..., reason, raw_indep_prob_canonical (None when no ensemble fired)
+        return (0.0, "", "", "", 0, 0, None, None, 0, reason, None)
 
     # Skip very illiquid or very cheap markets
     if yes_ask <= 0.08 or yes_ask >= 0.92:
@@ -5511,12 +5550,15 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
         return _empty(SKIP_SPREAD_ZERO)
 
     # ── Get ensemble probability estimate (with adaptive weights + calibration) ─
+    _ens_out: dict = {}
     indep_prob, info_source, n_sources = get_independent_estimate(
         ticker, m, yes_ask, volume,
         adaptive_weights=adaptive_weights,
         calibration_corrections=calibration_corrections,
-        disabled_sources=disabled_sources
+        disabled_sources=disabled_sources,
+        out=_ens_out,
     )
+    raw_indep_prob = _ens_out.get("raw_prob", indep_prob)
 
     # ── Information-edge trading only (ensemble-backed) ──────────────────
     # Market making and liquidity harvest removed — they had no real information edge.
@@ -5650,7 +5692,7 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
         best_detail += f" [also: {', '.join(s for s in strat_names if s != best_strat)}]"
 
     return (best_score, best_side, best_strat, best_detail, volume, sc,
-            best_ip, best_mp, best_edge, "")
+            best_ip, best_mp, best_edge, "", raw_indep_prob)
 
 def passes_filters(ticker, strategy, volume, spread_cents, af):
     """Kept in-sync with ``bot/scoring/market_scorer.py:passes_filters``.
@@ -6791,7 +6833,8 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
             if "KXMVE" in _t or "MULTIGAME" in _t or m.get("mve_collection_ticker"):
                 cycle_counters["parlay_skipped"] += 1
                 continue
-            score, side, strategy, detail, volume, sc, indep_prob, mkt_prob, edge, _score_skip = score_market(
+            (score, side, strategy, detail, volume, sc, indep_prob, mkt_prob,
+             edge, _score_skip, raw_indep_prob) = score_market(
                 m, adaptive_weights=adaptive_weights,
                 calibration_corrections=calibration_corrections,
                 category_edges=category_edges,
@@ -7039,6 +7082,7 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                         decision_outcome=_AlphaOutcome.DISCARDED,
                         ensemble=_AlphaEnsemble(
                             p_yes=_to_canonical_p_yes(indep_prob, side),
+                            raw_p_yes=raw_indep_prob,
                             source_count=sc,
                         ),
                         market=_mkt_snap,
@@ -7164,6 +7208,7 @@ def main(conn=None, close_conn: bool = True, write_json_report: bool = True):
                     decision_outcome=_outcome,
                     ensemble=_AlphaEnsemble(
                         p_yes=_to_canonical_p_yes(indep_prob, side),
+                        raw_p_yes=raw_indep_prob,
                         source_count=sc,
                     ),
                     market=_mkt_snap,

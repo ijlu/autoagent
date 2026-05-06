@@ -11,10 +11,14 @@ Live mode is OFF by default and gated by TWO independent switches:
 Both must pass; either being false keeps the family in shadow.
 
 Additional safety rails (all configurable, see ``bot/config.py``):
-  - TTE window: live trading only fires for portfolios where the
-    decision time is within (``CROSS_BRACKET_MIN_TTE_HOURS``,
-    ``CROSS_BRACKET_MAX_TTE_HOURS``) — defaults 3-7h pre-settle,
-    matching the 96-100% WR backtest band.
+  - LST + stability gate (PRIMARY entry filter): per-city
+    ``is_post_peak_safe(lst_hour, stability_hours)`` from
+    ``bot.learning.cross_bracket_lst_gate``. See Phase 3e in
+    reports/POSTFIX_REASSESSMENT_2026-05-05.md.
+  - TTE backstop: ``CROSS_BRACKET_MIN_TTE_HOURS`` (0.5h) prevents posting
+    minutes before settle; ``CROSS_BRACKET_MAX_TTE_HOURS`` (24h)
+    sanity ceiling. The LST gate is doing the actual entry-window
+    work; TTE is now belt-and-suspenders.
   - Per-leg contract cap: ``CROSS_BRACKET_MAX_CONTRACTS_PER_LEG`` (default 1).
   - Per-portfolio leg cap: ``CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO`` (default 4).
   - Edge floor (live-only, separate from the shadow scorer's 0.07):
@@ -50,6 +54,7 @@ from bot.config import (
 from bot.signals.weather_ensemble_v2 import (
     _city_for_ticker,
     _collect_gaussians,
+    _apply_metar_post_peak_override,
     _weighted_inputs_with_group_discount,
     _COMBINED_SIGMA_FLOOR_F,
 )
@@ -90,10 +95,19 @@ def _is_family_live(conn, family: str) -> bool:
 
 
 def _settlement_unix_from_key(settlement_key: str) -> Optional[int]:
-    """KXHIGHNY-26APR30 → unix ts of 23:59:59 LST that day.
+    """KXHIGHNY-26APR30 → unix ts of 23:59:59 local clock time that day.
 
     Used by the TTE gate. Best-effort parse; returns None on
     unparseable format so the gate can fail-closed (skip live).
+
+    DST-correct: we use IANA timezones via ``zoneinfo`` (Python 3.9+)
+    rather than fixed LST offsets. Previously the function hardcoded
+    LST offsets year-round, which during DST months (March-November)
+    placed settle 1 hour later than the actual local-clock midnight —
+    the cross-bracket TTE gate then thought TTE was 7.78h when reality
+    was 6.78h, missing the first hour of every nightly live window.
+    Confirmed via 2026-05-04 21:00 UTC observation (NY's actual EDT
+    midnight is 04:00 UTC, code-via-LST said 05:00 UTC).
     """
     parts = settlement_key.split("-")
     if len(parts) < 2:
@@ -110,23 +124,22 @@ def _settlement_unix_from_key(settlement_key: str) -> Optional[int]:
         m_idx = months.index(mon) + 1
     except (ValueError, IndexError):
         return None
-    # 23:59:59 LST. Use the family's LST offset so we settle at the
-    # right UTC moment per Kalshi's convention.
     family = _family_from_settlement_key(settlement_key)
-    lst_offsets = {
-        "KXHIGHNY": -5, "KXHIGHMIA": -5,
-        "KXHIGHCHI": -6, "KXHIGHAUS": -6,
-        "KXHIGHDEN": -7, "KXHIGHLAX": -8,
-    }
-    offset = lst_offsets.get(family, -5)
+    iana_tz = {
+        "KXHIGHNY": "America/New_York",
+        "KXHIGHMIA": "America/New_York",
+        "KXHIGHCHI": "America/Chicago",
+        "KXHIGHAUS": "America/Chicago",
+        "KXHIGHDEN": "America/Denver",
+        "KXHIGHLAX": "America/Los_Angeles",
+    }.get(family, "America/New_York")
     try:
-        # 23:59:59 LST = (24 - offset) UTC the same day = 24+|offset| ish
-        # Actually: LST 23:59:59 = LST_unix + 86399. UTC = LST_unix - offset*3600
-        from datetime import datetime, timezone
-        dt = datetime(2000 + yy, m_idx, dd, 23, 59, 59, tzinfo=timezone.utc)
-        # Subtract the offset to convert LST-23:59 to UTC.
-        return int(dt.timestamp() - offset * 3600)
-    except (ValueError, OverflowError):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        local_dt = datetime(2000 + yy, m_idx, dd, 23, 59, 59,
+                            tzinfo=ZoneInfo(iana_tz))
+        return int(local_dt.timestamp())
+    except (ValueError, OverflowError, ImportError):
         return None
 
 
@@ -174,6 +187,44 @@ def _safe_client_order_id(settlement_key: str, leg_idx: int) -> str:
     return f"mm_xb_{safe_key}_{leg_idx}_{int(time.time() * 1000)}"
 
 
+def _fetch_existing_positions() -> dict[str, int]:
+    """Snapshot current Kalshi positions as {ticker: signed_position_qty}.
+
+    Positive = net YES holding, negative = net NO holding, zero = no
+    position. Used by the live-post path to prevent re-posting on a
+    bracket we already own (the strategy logs decisions every 5 min
+    and would otherwise post repeatedly each cycle the edge persists).
+
+    Returns empty dict on fetch failure; the caller treats unknown
+    positions as zero, so a fetch failure produces normal posting
+    behavior — fail-open. We accept that risk because the alternative
+    (fail-closed = no posting) silently breaks the strategy.
+    """
+    from bot.api import api_get
+    try:
+        resp = api_get("/portfolio/positions?limit=200")
+    except Exception as exc:
+        logger.warning(
+            "[cross_bracket_live] positions fetch failed: %s — proceeding "
+            "without position-cap protection (fail-open)", exc,
+        )
+        return {}
+    out: dict[str, int] = {}
+    positions = resp.get("market_positions") or resp.get("positions") or []
+    for pos in positions:
+        ticker = pos.get("ticker") or ""
+        if not ticker:
+            continue
+        raw = pos.get("position_fp") or pos.get("position", 0)
+        try:
+            qty = round(float(raw)) if raw is not None else 0
+        except (TypeError, ValueError):
+            qty = 0
+        if qty != 0:
+            out[ticker] = qty
+    return out
+
+
 def run_cross_bracket_shadow(conn) -> dict:
     """Score all currently-open weather markets via cross-bracket
     portfolio. Log each per-bracket decision to alpha_backtest with
@@ -195,6 +246,7 @@ def run_cross_bracket_shadow(conn) -> dict:
         "live_skipped_exposure_cap": 0,
         "live_skipped_leg_cap": 0,
         "live_skipped_family_off": 0,
+        "live_skipped_already_holding": 0,
     }
 
     try:
@@ -213,6 +265,14 @@ def run_cross_bracket_shadow(conn) -> dict:
 
     grouped = group_markets_by_settlement(markets)
     stats["settlements_scored"] = len(grouped)
+
+    # Snapshot current positions ONCE at the top of the cycle. We pass
+    # this through to the post path so the strategy can check "do we
+    # already hold this bracket?" before posting. Without this guard,
+    # the strategy posts a new order every 5 min on the same bracket
+    # while edge persists, accumulating exposure beyond the intended
+    # ≤4 legs/portfolio cap (which only counts within a single cycle).
+    existing_positions = _fetch_existing_positions()
 
     for settlement_key, group in grouped.items():
         try:
@@ -239,7 +299,8 @@ def run_cross_bracket_shadow(conn) -> dict:
 
         # Log + (conditionally) place orders. Each leg gets its own row,
         # all sharing the settlement_key as market_id.
-        _process_decisions(conn, settlement_key, group, decisions, stats)
+        _process_decisions(conn, settlement_key, group, decisions, stats,
+                           existing_positions=existing_positions)
 
     return stats
 
@@ -281,9 +342,17 @@ def _score_one_settlement(group: list[dict]) -> list:
         return []
 
     sample = group[0]
-    gaussians = _collect_gaussians(sample.get("ticker", ""), sample)
+    ticker = sample.get("ticker", "")
+    gaussians = _collect_gaussians(ticker, sample)
     if not gaussians:
         return []
+
+    # 2026-05-05 (Phase 3d/3e): apply METAR post-peak fast-path BEFORE
+    # combine, same as predict_v2's step 1b. Without this, cross-bracket
+    # was scoring with wide-σ combined while WeatherQuoter (which goes
+    # through predict_v2) was using the tight METAR-only override —
+    # different μ/σ for the same market on the same cycle.
+    gaussians = _apply_metar_post_peak_override(gaussians, ticker)
 
     weighted = _weighted_inputs_with_group_discount(gaussians)
     combined = combine_gaussian(weighted, combined_name="combined_v2")
@@ -307,6 +376,12 @@ def _is_live_eligible_window(settlement_key: str) -> tuple[bool, float]:
     Hours-to-settle is computed from settlement_key. Returns (False, -1)
     on parse failure (fail-closed — won't trade live for unparseable
     keys).
+
+    2026-05-06 (Phase 3e cleanup): this is now a belt-and-suspenders
+    check, NOT the primary entry gate. The real entry gate is the
+    per-city LST+stability check ``_is_in_lst_gate``. TTE thresholds
+    are 0.5h (min — don't post at-settle) and 24h (max — skip
+    next-day-or-later tickers, redundant with LST gate's date check).
     """
     settle_unix = _settlement_unix_from_key(settlement_key)
     if settle_unix is None:
@@ -317,6 +392,90 @@ def _is_live_eligible_window(settlement_key: str) -> tuple[bool, float]:
         CROSS_BRACKET_MIN_TTE_HOURS <= hours_to_settle <= CROSS_BRACKET_MAX_TTE_HOURS
     )
     return in_window, hours_to_settle
+
+
+def _is_in_lst_gate(settlement_key: str) -> tuple[bool, str]:
+    """Return (in_gate, reason) for the per-city LST + stability gate.
+
+    Cross-bracket fires only when the METAR post-peak fast-path is
+    safely armed for this city — i.e., either current LST is past the
+    "always-arm" hour, or the running max has been stable enough hours
+    that "peak surprise" risk is < 5% per the empirical city rules.
+
+    Why same condition as fast-path: when fast-path can't arm, the
+    combine falls back to wide-σ NWP-blended μ which correctly reflects
+    forecast uncertainty for the strategy's purposes. But the strategy
+    will then read that wide σ as "huge edge against market" and fire
+    the wrong side. Phase 3c counterfactual showed this is the loss
+    mechanism. So: gate cross-bracket on the same data the fast-path
+    uses, ensuring the combine is METAR-tight whenever the strategy
+    fires.
+
+    Returns (False, reason) on parse failure, missing METAR state, or
+    unsafe stability. Fails closed.
+    """
+    from bot.learning.cross_bracket_lst_gate import (
+        get_running_high_state, is_post_peak_safe,
+    )
+    from bot.daemon.stations import station_for_ticker
+    from tools.lst_align import lst_hour, lst_date
+
+    family = _family_from_settlement_key(settlement_key)
+    if family is None:
+        return False, "lst_unparseable_family"
+    station = station_for_ticker(f"{family}-stub-Bstub")
+    if station is None:
+        return False, "lst_unknown_station"
+
+    target_lst = _target_lst_date_from_settlement_key(settlement_key)
+    if target_lst is None:
+        return False, "lst_unparseable_settle_date"
+
+    now = time.time()
+    cur_lst_hour = lst_hour(now, lst_offset=station.lst_offset)
+    cur_lst_date = lst_date(now, lst_offset=station.lst_offset)
+
+    if cur_lst_date != target_lst:
+        return False, f"lst_date_{cur_lst_date}_vs_target_{target_lst}"
+
+    # Read METAR poller's persisted running-high state. If absent (poller
+    # didn't run today, kv_cache wiped), fall back to LST 18 as a
+    # universal "definitely past peak" hour for all 6 currently-traded
+    # cities — conservative.
+    state = get_running_high_state(station.icao, target_lst)
+    if state is None or state.get("last_increase_lst_hour", -1) < 0:
+        if cur_lst_hour < 18:
+            return False, f"lst_{cur_lst_hour}_no_metar_state_pre_18"
+        stability_hours = 0  # conservative
+    else:
+        stability_hours = max(0, cur_lst_hour - state["last_increase_lst_hour"])
+
+    if not is_post_peak_safe(station.series, cur_lst_hour, stability_hours):
+        return False, (
+            f"lst_{cur_lst_hour}_K{stability_hours}_unsafe_per_{station.series}_rule"
+        )
+    return True, f"lst_{cur_lst_hour}_K{stability_hours}_safe"
+
+
+def _target_lst_date_from_settlement_key(settlement_key: str) -> Optional[str]:
+    """Parse e.g. ``KXHIGHNY-26MAY04`` into ``2026-05-04``."""
+    parts = settlement_key.split("-")
+    if len(parts) < 2:
+        return None
+    raw = parts[1]
+    if len(raw) != 7:
+        return None
+    months = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    }
+    try:
+        yr = 2000 + int(raw[:2])
+        mon = months[raw[2:5].upper()]
+        day = int(raw[5:7])
+        return f"{yr:04d}-{mon:02d}-{day:02d}"
+    except (ValueError, KeyError):
+        return None
 
 
 def _best_ask_for_buy(
@@ -469,6 +628,7 @@ def _post_live_order(
 def _process_decisions(
     conn, settlement_key: str, group: list[dict],
     decisions: list, stats: dict,
+    existing_positions: Optional[dict] = None,
 ) -> None:
     """For each decision, log to alpha_backtest. Additionally, if live
     mode is on AND the family/TTE/edge/exposure gates pass, place a
@@ -490,10 +650,12 @@ def _process_decisions(
 
     # TTE check fires once per portfolio (all legs share a settlement).
     in_tte_window, hours_to_settle = _is_live_eligible_window(settlement_key)
+    # LST gate (per-city, post-peak only) — also portfolio-level.
+    in_lst_window, lst_reason = _is_in_lst_gate(settlement_key)
 
     # Cap legs per portfolio (live-mode only — shadow logs everything).
     non_skip = [d for d in decisions if d.action != "skip"]
-    if family_live and in_tte_window and \
+    if family_live and in_tte_window and in_lst_window and \
             len(non_skip) > CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO:
         # Sort by edge desc and take top N. We compute a single edge
         # number per leg = max(edge_yes, edge_no) (whichever side fired).
@@ -540,9 +702,17 @@ def _process_decisions(
             leg_can_go_live = False
             live_skip_reason = "family_not_live"
             stats["live_skipped_family_off"] += 1
-        elif not in_tte_window:
+        elif not in_lst_window:
+            # Primary entry gate (Phase 3e): per-city LST + stability.
+            # See _is_in_lst_gate / is_post_peak_safe.
             leg_can_go_live = False
-            live_skip_reason = f"tte_{hours_to_settle:.1f}h_outside_band"
+            live_skip_reason = lst_reason
+            stats["live_skipped_lst"] = stats.get("live_skipped_lst", 0) + 1
+        elif not in_tte_window:
+            # Belt-and-suspenders: 0.5h floor avoids posting at-settle;
+            # 24h ceiling is redundant with LST gate's date check.
+            leg_can_go_live = False
+            live_skip_reason = f"tte_{hours_to_settle:.1f}h_outside_backstop"
             stats["live_skipped_tte"] += 1
         elif leg_edge < CROSS_BRACKET_LIVE_MIN_EDGE:
             leg_can_go_live = False
@@ -565,6 +735,23 @@ def _process_decisions(
                 f"{CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS}c"
             )
             stats["live_skipped_exposure_cap"] += 1
+
+        # Existing-position gate: don't re-post on a bracket where we
+        # already have a position on the side we're about to buy. Without
+        # this, the strategy posts a new order every cycle while edge
+        # persists. Position sign convention: + = net YES holding,
+        # − = net NO holding. We're posting to BUY, so block if we already
+        # hold the same side.
+        if leg_can_go_live and existing_positions:
+            existing_qty = existing_positions.get(d.ticker, 0)
+            same_side_holding = (
+                (d.side == "yes" and existing_qty > 0)
+                or (d.side == "no" and existing_qty < 0)
+            )
+            if same_side_holding:
+                leg_can_go_live = False
+                live_skip_reason = f"already_holding:{d.side}={existing_qty}"
+                stats["live_skipped_already_holding"] += 1
 
         # ── Live path ──
         order_id: Optional[str] = None

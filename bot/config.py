@@ -74,14 +74,22 @@ CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO = int(
 CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS = int(
     os.environ.get("CROSS_BRACKET_DAILY_EXPOSURE_CAP_CENTS", "500")
 )
-# TTE window (hours pre-settle) where cross-bracket has demonstrated
-# alpha. Outside this window the strategy is shadow-only regardless
-# of live flags. The 4-6h band is where the 96-100% WR was measured.
+# TTE backstop bounds. As of 2026-05-06 (Phase 3e cleanup) the primary
+# entry filter is the per-city LST+stability gate
+# (bot.learning.cross_bracket_lst_gate.is_post_peak_safe), NOT TTE.
+# These values are belt-and-suspenders only:
+#   - MIN 0.5h: don't post orders that arrive within 30min of settle
+#     (Kalshi may stop accepting + settlement timing edge cases).
+#   - MAX 24h: skip next-day-or-later tickers — but the LST gate
+#     ``cur_lst_date == target_lst_date`` check already enforces this
+#     more precisely. Wide ceiling avoids suppressing legitimate
+#     marine-layer-city opportunities (e.g., LAX always_arm@LST 14 =
+#     TTE ~9h, below the old 7h cap).
 CROSS_BRACKET_MIN_TTE_HOURS = float(
-    os.environ.get("CROSS_BRACKET_MIN_TTE_HOURS", "3.0")
+    os.environ.get("CROSS_BRACKET_MIN_TTE_HOURS", "0.5")
 )
 CROSS_BRACKET_MAX_TTE_HOURS = float(
-    os.environ.get("CROSS_BRACKET_MAX_TTE_HOURS", "7.0")
+    os.environ.get("CROSS_BRACKET_MAX_TTE_HOURS", "24.0")
 )
 # Edge floor (we already gate at 0.07 in score_market_portfolio, but
 # the live path can be tightened further). Higher than shadow's gate
@@ -121,10 +129,21 @@ WEATHER_REGIME_SIGMA = os.environ.get("WEATHER_REGIME_SIGMA", "false").lower() i
 # per-category with ≥200 settled rows per family from the v2 path.
 CALIBRATION_ENABLED = os.environ.get("CALIBRATION_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# 2026-05-04: weather-only mode. When true, the scan / score / log paths
+# all skip non-weather families. Effects:
+#   - TRADE_SERIES_ALLOWLIST narrows to KXHIGH* only (no KXFED, KXBTC, etc.)
+#   - SC_ENABLED is forced off (Safe Compounder is non-weather)
+#   - cross-bracket strategy is unaffected (already weather-only)
+# Re-enable non-weather families by flipping this off and (separately)
+# resolving the per-family signal issues that put them in the blocklist.
+WEATHER_ONLY_MODE = os.environ.get("WEATHER_ONLY_MODE", "false").lower() in ("true", "1", "yes")
+
 # Directional families hard-blocked from trading regardless of
-# per-family shadow-to-live flags. Anti-calibrated in Phase 0 backtests:
-# KXBTC / KXETH (Brier 0.76–0.94) and KXHIGHDEN (0.316 vs 0.244 baseline).
-# Env override: DIRECTIONAL_BLOCKLIST="KXBTC,KXETH,KXHIGHDEN,KXFOO" (comma-sep).
+# per-family shadow-to-live flags. KXBTC/KXETH have catastrophic raw Brier
+# (0.76–0.94 in Phase 0). KXHIGHDEN was historically pathological but the
+# 2026-05-04 station-mapping fix may have resolved this — we leave it in the
+# blocklist for now and re-evaluate after the weather-only mode collects
+# clean post-fix data. Env override: DIRECTIONAL_BLOCKLIST="..." (comma-sep).
 _DEFAULT_DIRECTIONAL_BLOCKLIST = "KXBTC,KXETH,KXHIGHDEN"
 DIRECTIONAL_BLOCKED_FAMILIES: frozenset[str] = frozenset(
     f.strip().upper()
@@ -147,13 +166,35 @@ DIRECTIONAL_BLOCKED_FAMILIES: frozenset[str] = frozenset(
 # gating (KXFED). Crypto stays in for shadow-mode evaluation despite the
 # directional blocklist — the alpha_backtest log needs the rows so calibration
 # can keep tracking the families we'd un-block once signal improves.
-TRADE_SERIES_ALLOWLIST: tuple[str, ...] = (
-    # Weather (one per WeatherStation in bot/daemon/stations.py)
+_WEATHER_SERIES: tuple[str, ...] = (
     "KXHIGHNY", "KXHIGHCHI", "KXHIGHLAX", "KXHIGHAUS", "KXHIGHMIA", "KXHIGHDEN",
-    # Macro
-    "KXFED", "KXJOB", "KXGDP", "KXCPI",
-    # Crypto (shadow-eval only via DIRECTIONAL_BLOCKED_FAMILIES)
-    "KXBTC", "KXETH",
+)
+if WEATHER_ONLY_MODE:
+    TRADE_SERIES_ALLOWLIST: tuple[str, ...] = _WEATHER_SERIES
+else:
+    TRADE_SERIES_ALLOWLIST = (
+        *_WEATHER_SERIES,
+        # Macro
+        "KXFED", "KXJOB", "KXGDP", "KXCPI",
+        # Crypto (shadow-eval only via DIRECTIONAL_BLOCKED_FAMILIES)
+        "KXBTC", "KXETH",
+    )
+
+# Series the market_snapshotter poller persists to kalshi_market_snapshots.
+# Superset of _WEATHER_SERIES — includes city-expansion candidates from
+# reports/SESSION_HANDOFF_CITY_EXPANSION_2026-05-06.md §6 so we accumulate
+# bid/ask + capacity history *before* a city is promoted to live trading.
+# Layer 2 of the city-expansion framework requires ≥14 days of this data
+# per candidate before the per-city scorecard runs.
+#
+# Maintenance: when bot/daemon/series_discovery.py alerts on a new weather
+# series, add it here. Auto-add deferred per existing "alert-only" intent.
+WEATHER_SNAPSHOT_SERIES: tuple[str, ...] = (
+    *_WEATHER_SERIES,
+    # Candidates (handoff §6 recommended order)
+    "KXHIGHPHX", "KXHIGHDFW", "KXHIGHPHL", "KXHIGHDTW",
+    "KXHIGHHOU", "KXHIGHATL",
+    "KXHIGHSEA", "KXHIGHBOS", "KXHIGHSFO", "KXHIGHLAS",
 )
 MM_MIN_SPREAD = int(os.environ.get("MM_MIN_SPREAD_CENTS", "4"))
 MM_HALF_SPREAD = int(os.environ.get("MM_HALF_SPREAD_CENTS", "2"))
@@ -173,7 +214,10 @@ MAX_QA_PER_RUN = int(os.environ.get("MAX_QA_PER_RUN", "10"))
 # ══════════════════════════════════════════════════════════════════════════════
 # Safe Compounder (separate from MM and directional)
 # ══════════════════════════════════════════════════════════════════════════════
-SC_ENABLED = os.environ.get("SC_ENABLED", "true").lower() in ("true", "1", "yes")
+_SC_ENV = os.environ.get("SC_ENABLED", "true").lower() in ("true", "1", "yes")
+# Weather-only mode forces SC off — Safe Compounder targets non-weather YES<20¢
+# markets and shouldn't trade while we're focused on weather.
+SC_ENABLED = _SC_ENV and not WEATHER_ONLY_MODE
 SC_DRY_RUN = os.environ.get("SC_DRY_RUN", "true").lower() in ("true", "1", "yes")
 
 # ══════════════════════════════════════════════════════════════════════════════

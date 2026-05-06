@@ -623,21 +623,24 @@ def test_skill_bucket_boundaries():
 
 
 def test_fit_skill_curves_math(memdb):
-    """Inject deterministic rows: open_meteo at 12h lead overshoots by
-    +2°F on average, RMSE 2°F."""
+    """Inject deterministic rows: hrrr at 12h lead overshoots by +2°F on
+    average, RMSE 2°F. Was `weather` until 2026-05-05 when that source
+    was dropped from GAUSSIAN_COMBINE_SOURCES (corr 0.99-1.00 with hrrr —
+    same Open-Meteo proxy issue as nbm). hrrr behaves identically for the
+    fit-math properties under test."""
     now = "2026-04-22T00:00:00Z"
     rows = [
-        (now, "weather", "nyc", "2026-04-01", 12, 74.0, 2.0, 72.0),
-        (now, "weather", "nyc", "2026-04-02", 12, 82.0, 2.0, 80.0),
-        (now, "weather", "nyc", "2026-04-03", 12, 76.0, 2.0, 74.0),
+        (now, "hrrr", "nyc", "2026-04-01", 12, 74.0, 2.0, 72.0),
+        (now, "hrrr", "nyc", "2026-04-02", 12, 82.0, 2.0, 80.0),
+        (now, "hrrr", "nyc", "2026-04-03", 12, 76.0, 2.0, 74.0),
         # METAR must be skipped from skill fit.
         (now, "metar", "nyc", "2026-04-01", 0, 72.0, 0.1, 72.0),
     ]
     _insert_backfill_rows(memdb, rows)
 
     fits = bf.fit_skill_curves(memdb)
-    # Only one (source, bucket) pair should emerge: (open_meteo, 6_24).
-    assert [(f.source, f.bucket) for f in fits] == [("weather", "6_24")]
+    # Only one (source, bucket) pair should emerge: (hrrr, 6_24).
+    assert [(f.source, f.bucket) for f in fits] == [("hrrr", "6_24")]
     sf = fits[0]
     assert sf.n == 3
     assert sf.bias_f == pytest.approx(2.0, abs=1e-9)
@@ -1087,8 +1090,10 @@ def test_fit_mos_bias_splits_only_by_source_and_city(memdb):
 
     2026-04-29: ``fit_mos_bias`` started filtering by
     ``GAUSSIAN_COMBINE_SOURCES`` so retired sources don't keep
-    accumulating fits. NBM was retired same day, so this test now
-    uses ``weather`` (Open-Meteo) as the second source — both are in
+    accumulating fits. NBM was retired that day; this test then used
+    ``weather`` as the second source.
+    2026-05-05: ``weather`` also retired (corr 0.99-1.00 with hrrr —
+    same Open-Meteo proxy issue as nbm). Swap to ``ecmwf``: both in
     the live combine, both should produce fits."""
     rows = [
         # hrrr/nyc — bias +2
@@ -1097,17 +1102,17 @@ def test_fit_mos_bias_splits_only_by_source_and_city(memdb):
         # hrrr/miami — bias +3
         ("hrrr", "miami", "2026-01-05", 75.0, 72.0),
         ("hrrr", "miami", "2026-07-05", 78.0, 75.0),
-        # weather/nyc — bias -1
-        ("weather", "nyc", "2026-01-01", 81.0, 82.0),
-        ("weather", "nyc", "2026-07-01", 82.0, 83.0),
+        # ecmwf/nyc — bias -1
+        ("ecmwf", "nyc", "2026-01-01", 81.0, 82.0),
+        ("ecmwf", "nyc", "2026-07-01", 82.0, 83.0),
     ]
     _insert_bias_rows(memdb, rows)
     fits = {(f.source, f.city): f for f in
             bf.fit_mos_bias(memdb, half_life_days=float("inf"))}
     assert fits[("hrrr", "nyc")].bias_f == pytest.approx(2.0)
     assert fits[("hrrr", "miami")].bias_f == pytest.approx(3.0)
-    assert fits[("weather", "nyc")].bias_f == pytest.approx(-1.0)
-    assert ("weather", "miami") not in fits  # No data; not invented.
+    assert fits[("ecmwf", "nyc")].bias_f == pytest.approx(-1.0)
+    assert ("ecmwf", "miami") not in fits  # No data; not invented.
 
 
 def test_fit_mos_bias_ewma_weights_recent_rows_more(memdb):

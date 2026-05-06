@@ -38,6 +38,7 @@ class TestInitDb:
             "kv_cache", "learned_config", "opportunity_log", "decision_log",
             "alpha_backtest", "weather_mm_shadow",
             "fills_ledger",
+            "kalshi_market_snapshots",
         }
         missing = expected - tables
         assert not missing, f"Missing tables: {missing}"
