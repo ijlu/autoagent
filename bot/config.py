@@ -179,6 +179,23 @@ else:
         # Crypto (shadow-eval only via DIRECTIONAL_BLOCKED_FAMILIES)
         "KXBTC", "KXETH",
     )
+
+# Series the market_snapshotter poller persists to kalshi_market_snapshots.
+# Superset of _WEATHER_SERIES — includes city-expansion candidates from
+# reports/SESSION_HANDOFF_CITY_EXPANSION_2026-05-06.md §6 so we accumulate
+# bid/ask + capacity history *before* a city is promoted to live trading.
+# Layer 2 of the city-expansion framework requires ≥14 days of this data
+# per candidate before the per-city scorecard runs.
+#
+# Maintenance: when bot/daemon/series_discovery.py alerts on a new weather
+# series, add it here. Auto-add deferred per existing "alert-only" intent.
+WEATHER_SNAPSHOT_SERIES: tuple[str, ...] = (
+    *_WEATHER_SERIES,
+    # Candidates (handoff §6 recommended order)
+    "KXHIGHPHX", "KXHIGHDFW", "KXHIGHPHL", "KXHIGHDTW",
+    "KXHIGHHOU", "KXHIGHATL",
+    "KXHIGHSEA", "KXHIGHBOS", "KXHIGHSFO", "KXHIGHLAS",
+)
 MM_MIN_SPREAD = int(os.environ.get("MM_MIN_SPREAD_CENTS", "4"))
 MM_HALF_SPREAD = int(os.environ.get("MM_HALF_SPREAD_CENTS", "2"))
 MM_MAX_INVENTORY = int(os.environ.get("MM_MAX_INVENTORY", "50"))

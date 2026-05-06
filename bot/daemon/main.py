@@ -37,6 +37,10 @@ from bot.daemon.cycle_runner import CycleRunner
 from bot.daemon.dispatcher import AsyncEventDispatcher
 from bot.daemon.fills_writer import FillsWriter
 from bot.daemon.forecast_cache import ForecastCache, FORECAST_REFRESH_INTERVAL_S
+from bot.daemon.market_snapshotter_poller import (
+    MarketSnapshotPoller,
+    cleanup_old_snapshots,
+)
 from bot.daemon.metar_poller import METARPoller
 from bot.daemon.poller_base import Poller
 from bot.daemon.requote_triggers import (
@@ -48,7 +52,7 @@ from bot.daemon.series_discovery import run_discovery as run_series_discovery
 from bot.daemon.shadow_integrity import run_shadow_integrity_check
 from bot.daemon.weather_handler import WeatherChangeHandler
 from bot.daemon.weather_quoter import WeatherQuoter
-from bot.db import init_db, kv_cleanup, kv_set
+from bot.db import init_db, kv_cleanup, kv_get, kv_set
 from bot.learning.fills_validator import compare_last_n_days, format_report
 from bot.learning.mm_promotion import (
     match_shadow_fills,
@@ -1200,7 +1204,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     # followed by a redundant time-decay fire at T + 45 s.
     weather_handler.on_fire = time_decay_driver.note_external_fire
 
-    pollers: list[Poller] = [metar_poller]
+    # ── Market snapshotter (city-expansion Layer 2 prereq) ────────────
+    # Standalone poller (not piggybacking the trading scan): the cycle
+    # fetches /markets per series in TRADE_SERIES_ALLOWLIST, which excludes
+    # candidate cities (PHX/SEA/HOU/...). Snapshotter runs on its own 60s
+    # cadence over WEATHER_SNAPSHOT_SERIES so we accumulate bid/ask history
+    # on candidates *before* they're promoted.
+    market_snapshotter = MarketSnapshotPoller(conn=conn)
+
+    pollers: list[Poller] = [metar_poller, market_snapshotter]
 
     # Forecast refresh wrapper: captures a before/after snapshot and feeds
     # the delta to ForecastChangeDriver. Returns number of synthetic
@@ -1433,6 +1445,31 @@ def main(argv: Optional[list[str]] = None) -> int:
         lambda: _run_cross_bracket_lst_refresh(conn),
         interval_s=86400.0,
         initial_delay_s=_seconds_until_utc_hour(9),
+    )
+    # market_snapshots cleanup — wired up but inert by default. Reads
+    # the kv_cache key set by the operator; NULL/missing → no deletion.
+    # Runs at 09:30 UTC (after the LST refresh) so cleanup never overlaps
+    # with morning audit tasks. Storage is "forever" per design until
+    # the operator decides to flip on a TTL.
+    def _run_market_snapshot_cleanup() -> None:
+        ttl = kv_get(conn, "market_snapshots_ttl_days")
+        try:
+            ttl_days = int(ttl) if ttl is not None else None
+        except (TypeError, ValueError):
+            ttl_days = None
+        if ttl_days is None or ttl_days <= 0:
+            return
+        deleted = cleanup_old_snapshots(conn, ttl_days)
+        if deleted:
+            logger.info(
+                "[market_snapshots] cleanup deleted %d rows older than %d days",
+                deleted, ttl_days,
+            )
+    scheduler.register(
+        "market_snapshots_cleanup",
+        _run_market_snapshot_cleanup,
+        interval_s=86400.0,
+        initial_delay_s=_seconds_until_utc_hour(9) + 1800,
     )
 
     # Start pollers on scheduler start, stop them on scheduler stop.
