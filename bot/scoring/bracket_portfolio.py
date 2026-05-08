@@ -117,6 +117,12 @@ def _decide_leg(
     do via real-time METAR, and we shouldn't bet against it without
     a clear directional view.
     """
+    # Trading-time humility cap. Raw p_yes still recorded on
+    # BracketDecision.p_yes by the caller; this cap only governs
+    # downstream edge / conviction / sizing math.
+    from bot.scoring.trading_caps import cap_trading_prob
+    p_yes = cap_trading_prob(p_yes, source="decide_leg")
+
     edge_yes = None
     edge_no = None
     if yes_ask is not None:

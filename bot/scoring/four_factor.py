@@ -359,8 +359,12 @@ def score_four_factors(
     if source_desc is None:
         source_desc = ""
 
-    # Clamp probability inputs to valid range
-    ensemble_prob = _clamp(ensemble_prob)
+    # Clamp probability inputs to valid range. ensemble_prob uses the
+    # trading-time humility cap (model layer remains free to express
+    # extreme probabilities; this is the trading-decision boundary —
+    # see bot/scoring/trading_caps.py).
+    from bot.scoring.trading_caps import cap_trading_prob
+    ensemble_prob = cap_trading_prob(_clamp(ensemble_prob), source="four_factor")
     market_prob = _clamp(market_prob, lo=0.01, hi=0.99)
     n_sources = max(0, n_sources)
 
