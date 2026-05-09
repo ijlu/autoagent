@@ -5047,6 +5047,14 @@ def kelly_contracts(independent_prob, price_cents, balance_cents):
     Fractional Kelly using INDEPENDENT probability estimate (not market price).
     This is the correct way: edge = our_estimate - market_implied.
     """
+    # Trading-time humility cap (defense-in-depth — upstream callers
+    # generally cap before reaching here). NOTE: the existing >=0.98
+    # skip below is stricter than the 0.99 cap and remains in effect
+    # for directional sizing; the cap exists for any future caller
+    # that loosens the skip threshold.
+    from bot.scoring.trading_caps import cap_trading_prob
+    independent_prob = cap_trading_prob(independent_prob, source="kelly")
+
     if independent_prob <= 0.02 or independent_prob >= 0.98 or price_cents <= 0:
         return 0  # extreme or invalid probability — don't trade
     # Market implied prob = price_cents / 100
@@ -5200,8 +5208,12 @@ def score_event_driven(m, disabled_sources=None):
         if "clevfed" not in (disabled_sources or set()):
             clevfed_prob, clevfed_src = get_cleveland_fed_nowcast(ticker, m)
             if clevfed_prob is not None:
-                # Cleveland Fed gives us a probability directly
-                edge = clevfed_prob - yes_ask
+                # Cleveland Fed gives us a probability directly. Cap for
+                # the trading-time edge gate; return raw clevfed_prob in
+                # indep_prob so alpha_log preserves model truth.
+                from bot.scoring.trading_caps import cap_trading_prob
+                clevfed_prob_capped = cap_trading_prob(clevfed_prob, source="clevfed")
+                edge = clevfed_prob_capped - yes_ask
                 if abs(edge) > MIN_EDGE:
                     side = "yes" if edge > 0 else "no"
                     mkt_prob = yes_ask if side == "yes" else (1 - yes_bid)
@@ -5231,7 +5243,11 @@ def score_event_driven(m, disabled_sources=None):
             else:  # below, under
                 indep_prob = 1.0 / (1.0 + math.exp(diff / sigma))
 
-            edge = indep_prob - yes_ask
+            # Cap for trading-time edge gate; return raw indep_prob below
+            # so alpha_log preserves model truth.
+            from bot.scoring.trading_caps import cap_trading_prob
+            indep_prob_capped = cap_trading_prob(indep_prob, source="bls_event")
+            edge = indep_prob_capped - yes_ask
             fee_adj = abs(edge) - ESTIMATED_EXIT_SPREAD - _round_trip_fee_dollars(yes_ask)
 
             if fee_adj > MIN_EDGE * 0.8:  # slightly lower threshold for event-driven (data is strong)
@@ -5367,8 +5383,13 @@ def score_cross_market(m, adaptive_weights=None, calibration_corrections=None,
         # Sources disagree too much — no consensus
         return None
 
+    # Cap for trading-time edge gate; return raw consensus_prob below
+    # so alpha_log preserves model truth.
+    from bot.scoring.trading_caps import cap_trading_prob
+    consensus_prob_capped = cap_trading_prob(consensus_prob, source="cross_market")
+
     # Compare consensus to Kalshi
-    edge = consensus_prob - yes_ask
+    edge = consensus_prob_capped - yes_ask
     round_trip_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(yes_ask)
     fee_adj = abs(edge) - round_trip_cost
 
@@ -5458,8 +5479,13 @@ def score_near_resolution(m, adaptive_weights=None, calibration_corrections=None
 
     ensemble_prob = sum(p * w for p, w, _ in estimates) / total_weight
 
+    # Cap for trading-time edge gate; indep_prob below uses raw
+    # ensemble_prob so alpha_log preserves model truth.
+    from bot.scoring.trading_caps import cap_trading_prob
+    ensemble_prob_capped = cap_trading_prob(ensemble_prob, source="near_resolution")
+
     # Edge calculation
-    edge = ensemble_prob - yes_ask
+    edge = ensemble_prob_capped - yes_ask
     round_trip_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(yes_ask)
     fee_adj = abs(edge) - round_trip_cost
 
@@ -5559,6 +5585,13 @@ def score_market(m, adaptive_weights=None, calibration_corrections=None, categor
         out=_ens_out,
     )
     raw_indep_prob = _ens_out.get("raw_prob", indep_prob)
+
+    # Trading-time humility cap. raw_indep_prob above preserves model
+    # truth for calibration (Platt fit reads it via alpha_log.raw_p_yes);
+    # the capped value flows through edge gates, scoring, and sizing.
+    if indep_prob is not None:
+        from bot.scoring.trading_caps import cap_trading_prob
+        indep_prob = cap_trading_prob(indep_prob, source="info_edge")
 
     # ── Information-edge trading only (ensemble-backed) ──────────────────
     # Market making and liquidity harvest removed — they had no real information edge.

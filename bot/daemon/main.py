@@ -1107,6 +1107,22 @@ def _log_health(pollers: list[Poller], cycle_runner: CycleRunner,
     except Exception as exc:
         logger.warning("[health] wx_snapshots stats unavailable: %s", exc)
 
+    # Trading-time prob cap hits — surfaces how often the [0.01, 0.99]
+    # cap is firing per source. Sudden spikes indicate the model is
+    # regularly bumping the humility ceiling, which would mean Phase 1
+    # σ-inflation has degraded. Counters reset per emit.
+    try:
+        from bot.scoring.trading_caps import get_hit_counts, reset_hit_counts
+        hits = get_hit_counts()
+        if hits:
+            parts = [f"{k}={v}" for k, v in sorted(hits.items())]
+            logger.info("[health] trading_caps " + " ".join(parts))
+        else:
+            logger.info("[health] trading_caps no_hits")
+        reset_hit_counts()
+    except Exception as exc:
+        logger.warning("[health] trading_caps stats unavailable: %s", exc)
+
     # Stage 1 regime σ tier usage — visibility-only when
     # WEATHER_REGIME_SIGMA is off (counter reflects what tier WOULD have
     # been used; live σ is still pooled). When the flag flips on, the
