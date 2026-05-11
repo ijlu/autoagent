@@ -71,6 +71,10 @@ def _production_py_files() -> list[Path]:
         # .claude/worktrees holds duplicate repo copies for sub-agent
         # worktree isolation. Those files are not part of this repo's
         # production code — scanning them duplicates every match.
+        # Check parts RELATIVE to REPO_ROOT so this exclusion targets
+        # nested worktrees only; when REPO_ROOT IS itself a worktree
+        # under .claude/, the absolute path's parts would otherwise
+        # match and silently exclude every file.
         ".claude",
     }
     excluded_files = {
@@ -80,7 +84,7 @@ def _production_py_files() -> list[Path]:
     }
     return [
         p for p in REPO_ROOT.rglob("*.py")
-        if not any(part in excluded_dirs for part in p.parts)
+        if not any(part in excluded_dirs for part in p.relative_to(REPO_ROOT).parts)
         and p.name not in excluded_files
     ]
 
