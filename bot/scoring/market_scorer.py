@@ -287,8 +287,11 @@ def score_event_driven(m: dict, disabled_sources=None):
         if "clevfed" not in (disabled_sources or set()):
             clevfed_prob, clevfed_src = get_cleveland_fed_nowcast(ticker, m)
             if clevfed_prob is not None:
-                # Cleveland Fed gives us a probability directly
-                edge = clevfed_prob - yes_ask
+                # Cap for trading-time edge gate; indep_prob below uses
+                # raw clevfed_prob so alpha_log preserves model truth.
+                from bot.scoring.trading_caps import cap_trading_prob
+                clevfed_prob_capped = cap_trading_prob(clevfed_prob, source="clevfed")
+                edge = clevfed_prob_capped - yes_ask
                 if abs(edge) > MIN_EDGE:
                     side = "yes" if edge > 0 else "no"
                     mkt_prob = yes_ask if side == "yes" else (1 - yes_bid)
@@ -318,7 +321,11 @@ def score_event_driven(m: dict, disabled_sources=None):
             else:  # below, under
                 indep_prob = 1.0 / (1.0 + math.exp(diff / sigma))
 
-            edge = indep_prob - yes_ask
+            # Cap for trading-time edge gate; final_prob below uses raw
+            # indep_prob so alpha_log preserves model truth.
+            from bot.scoring.trading_caps import cap_trading_prob
+            indep_prob_capped = cap_trading_prob(indep_prob, source="bls_event")
+            edge = indep_prob_capped - yes_ask
             fee_adj = abs(edge) - ESTIMATED_EXIT_SPREAD - _round_trip_fee_dollars(yes_ask)
 
             if fee_adj > MIN_EDGE * 0.8:  # slightly lower threshold for event-driven (data is strong)
@@ -409,8 +416,13 @@ def score_cross_market(m: dict, adaptive_weights=None, calibration_corrections=N
         # Sources disagree too much -- no consensus
         return None
 
+    # Cap for trading-time edge gate; indep_prob below uses raw
+    # consensus_prob so alpha_log preserves model truth.
+    from bot.scoring.trading_caps import cap_trading_prob
+    consensus_prob_capped = cap_trading_prob(consensus_prob, source="cross_market")
+
     # Compare consensus to Kalshi
-    edge = consensus_prob - yes_ask
+    edge = consensus_prob_capped - yes_ask
     round_trip_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(yes_ask)
     fee_adj = abs(edge) - round_trip_cost
 
@@ -500,8 +512,14 @@ def score_near_resolution(m: dict, adaptive_weights=None, calibration_correction
 
     ensemble_prob = sum(p * w for p, w, _ in estimates) / total_weight
 
+    # Trading-time humility cap. Returned indep_prob below uses raw
+    # ensemble_prob so opportunity_log / alpha_log record model truth;
+    # only the internal edge gate sees the cap.
+    from bot.scoring.trading_caps import cap_trading_prob
+    ensemble_prob_capped = cap_trading_prob(ensemble_prob, source="near_resolution")
+
     # Edge calculation
-    edge = ensemble_prob - yes_ask
+    edge = ensemble_prob_capped - yes_ask
     round_trip_cost = ESTIMATED_EXIT_SPREAD + _round_trip_fee_dollars(yes_ask)
     fee_adj = abs(edge) - round_trip_cost
 
@@ -602,6 +620,14 @@ def score_market(m: dict, adaptive_weights=None, calibration_corrections=None,
     # Only trade when we have independent data that diverges from market price.
     if indep_prob is None or n_sources == 0:
         return _empty(SKIP_NO_ENSEMBLE)
+
+    # Trading-time humility cap. NOTE: this canonical copy of score_market
+    # does not thread a raw_indep_prob channel — capping here overwrites
+    # indep_prob for both edge math and the returned candidate. The
+    # production cycle uses trade.py's score_market wrapper which preserves
+    # raw_indep_prob via get_independent_estimate's `out=` arg.
+    from bot.scoring.trading_caps import cap_trading_prob
+    indep_prob = cap_trading_prob(indep_prob, source="info_edge")
 
     # Adaptive edge threshold: more sources -> more confidence -> lower threshold
     if n_sources >= 3:

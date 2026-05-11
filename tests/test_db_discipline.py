@@ -47,12 +47,16 @@ def _python_files() -> list[Path]:
         ".venv", ".git", "__pycache__", ".pytest_cache", "node_modules",
         # .claude/worktrees holds duplicate repo copies for sub-agent
         # worktree isolation. Scanning them would double-count every
-        # match against the production tree.
+        # match against the production tree. Check parts RELATIVE to
+        # REPO_ROOT so the exclusion only fires for nested worktrees;
+        # when REPO_ROOT IS itself a worktree under .claude/, the
+        # absolute path's parts would otherwise match and exclude
+        # everything.
         ".claude",
     }
     return [
         p for p in REPO_ROOT.rglob("*.py")
-        if not any(part in excluded_dirs for part in p.parts)
+        if not any(part in excluded_dirs for part in p.relative_to(REPO_ROOT).parts)
     ]
 
 

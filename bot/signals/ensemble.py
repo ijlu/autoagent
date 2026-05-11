@@ -237,13 +237,22 @@ def get_independent_estimate(
     # predict_v2 directly. v2 produces a properly-combined Gaussian estimate
     # with per-city skill σ, MOS bias, group correlation discount, staleness
     # inflation, running-high truncation, and clamp — strictly better than
-    # the v1 family-router probability-space combine for weather. Platt
-    # calibration is intentionally bypassed (v2 doesn't need it; the curve
-    # was fit on v1 outputs and would re-introduce known biases).
+    # the v1 family-router probability-space combine for weather.
+    #
+    # Platt calibration policy (Phase 2 item 2, 2026-05-10): v2 output flows
+    # through apply_calibration_correction iff WEATHER_V2_PLATT_ENABLED.
+    # Default is false — the current persisted curve was fit when the
+    # ensemble was overwhelmingly v1, and applying it to a (presumably
+    # well-calibrated post-Phase-1) v2 output can re-introduce biases the
+    # curve was meant to correct in the OPPOSITE direction. Flip the flag
+    # only after refitting calibration on v2-only data. See
+    # memory/project_layer_separation_model_vs_trading.md for why Platt
+    # belongs here (integration boundary) and not inside predict_v2.
     try:
-        from bot.config import WEATHER_ENSEMBLE_V2
+        from bot.config import WEATHER_ENSEMBLE_V2, WEATHER_V2_PLATT_ENABLED
     except ImportError:
         WEATHER_ENSEMBLE_V2 = False
+        WEATHER_V2_PLATT_ENABLED = False
     ticker_upper = (ticker or "").upper()
     is_weather_ticker = (
         ticker_upper.startswith("KXHIGH")
@@ -268,7 +277,21 @@ def get_independent_estimate(
                     n_contributors = max(1, len(v2_tag.split(":", 1)[1].split("+")))
                 pipeline_track_attempt("weather_ensemble_v2")
                 pipeline_track_result("weather_ensemble_v2", True, 0.0)
-                final = max(0.02, min(0.98, float(v2_prob)))
+                raw_v2 = float(v2_prob)
+                if WEATHER_V2_PLATT_ENABLED and calibration_corrections:
+                    corrected = apply_calibration_correction(
+                        raw_v2, calibration_corrections, ticker=ticker
+                    )
+                    if corrected is not None:
+                        final = max(0.02, min(0.98, float(corrected)))
+                        if abs(final - raw_v2) > 0.001:
+                            print(
+                                f"[calibration] v2 {raw_v2:.3f} -> {final:.3f}"
+                            )
+                    else:
+                        final = max(0.02, min(0.98, raw_v2))
+                else:
+                    final = max(0.02, min(0.98, raw_v2))
                 print(f"[ensemble] weather_v2 → {final:.3f} ({v2_tag})")
                 return final, v2_tag, min(n_contributors, 5)
         except Exception as exc:

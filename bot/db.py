@@ -913,13 +913,19 @@ def db_write_ctx(conn: Optional[sqlite3.Connection] = None) -> Iterator[sqlite3.
 def kv_get(conn: sqlite3.Connection, key: str) -> Any:
     """Read from persistent kv_cache. Returns parsed JSON value or None if expired/missing.
 
-    Lock-free under WAL — readers don't need DB_WRITE_LOCK.
+    Held under DB_WRITE_LOCK. WAL allows lock-free reads across separate
+    *connections*, but the daemon shares one connection across pollers +
+    cycle-runner; concurrent ``conn.execute()`` from multiple threads on a
+    single connection produces intermittent ``SQLITE_MISUSE`` and partial
+    rows. Serializing reads through the same lock that gates writes is the
+    cheap fix (kv reads are microseconds and write throughput is low).
     """
     try:
-        row = conn.execute(
-            "SELECT value, expires_at FROM kv_cache WHERE key=?", (key,)
-        ).fetchone()
-        if row and row[1] > time.time():
+        with DB_WRITE_LOCK:
+            row = conn.execute(
+                "SELECT value, expires_at FROM kv_cache WHERE key=?", (key,)
+            ).fetchone()
+        if row and row[1] is not None and row[1] > time.time():
             return json.loads(row[0])
     except Exception as e:
         print(f"[kv_cache] get({key!r}) failed: {e}")
