@@ -206,10 +206,22 @@ def test_gaussian_returns_none_for_unknown_ticker():
     assert src.get_nws_5min_gaussian("KXBTC-26APR30-T100K", {}) is None
 
 
-def test_gaussian_built_for_miami_uses_kmia():
+def test_gaussian_built_for_miami_uses_kmia(monkeypatch):
     """KXHIGHMIA city = miami → poll station KMIA."""
-    now = datetime.now(timezone.utc)
-    feats = [_feature(now.isoformat().replace("+00:00", "Z"), temp_c=29.0)]
+    # Pin "now" to a post-LST-11 UTC instant so the production code's
+    # LST-hour gate (lst_offset=-5 for Miami) opens regardless of when
+    # the test is run. Without this, the test is wall-clock-dependent
+    # and fails when run before 16:00 UTC.
+    fixed_utc = datetime(2026, 5, 1, 18, 0, tzinfo=timezone.utc)
+
+    class _FixedDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_utc if tz is None else fixed_utc.astimezone(tz)
+
+    monkeypatch.setattr(src, "datetime", _FixedDT)
+
+    feats = [_feature(fixed_utc.isoformat().replace("+00:00", "Z"), temp_c=29.0)]
     resp = _mk_response(200, _feature_collection(*feats))
     with patch("bot.signals.sources.nws_5min.requests.get", return_value=resp):
         g = src.get_nws_5min_gaussian("KXHIGHMIA-26APR30-B83.5", {})
@@ -246,15 +258,25 @@ def test_gaussian_returns_none_when_observations_too_stale():
     assert g is None
 
 
-def test_gaussian_accepts_typical_publication_lag():
+def test_gaussian_accepts_typical_publication_lag(monkeypatch):
     """Regression: NWS publication latency is 5-25 minutes (verified
     live 2026-04-30). Setting `_MAX_OBS_AGE_S` too tight (e.g. 15 min)
     rejected every reading in the lagging-window case. The gate must
     accept readings that are 15-25 min old so we don't lose an entire
     afternoon's signal during NWS publication backlogs.
     """
-    now = datetime.now(timezone.utc)
-    twenty_min_ago = now - timedelta(minutes=20)
+    # Pin "now" past Miami's LST-11 gate so the test isn't wall-clock-
+    # dependent (see test_gaussian_built_for_miami_uses_kmia).
+    fixed_utc = datetime(2026, 5, 1, 18, 0, tzinfo=timezone.utc)
+
+    class _FixedDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_utc if tz is None else fixed_utc.astimezone(tz)
+
+    monkeypatch.setattr(src, "datetime", _FixedDT)
+
+    twenty_min_ago = fixed_utc - timedelta(minutes=20)
     feats = [_feature(
         twenty_min_ago.isoformat().replace("+00:00", "Z"), temp_c=29.0,
     )]
