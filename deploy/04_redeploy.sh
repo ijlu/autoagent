@@ -11,9 +11,25 @@ if [ -z "${1:-}" ]; then
 fi
 
 SERVER="$1"
-BOT_DIR="$HOME/autoagent"
 
-echo "Redeploying code to $SERVER..."
+# Derive BOT_DIR from the invocation cwd's git toplevel, not from a
+# hardcoded $HOME/autoagent. Worktrees ($HOME/autoagent/.claude/worktrees/*)
+# resolve to their own toplevel, so invoking this script from a worktree
+# deploys the worktree's contents instead of silently shipping whatever
+# happened to be in the main checkout.
+#
+# 2026-05-08 incident: a deploy invoked from a worktree silently shipped
+# the main checkout (city-expansion branch + uncommitted WIP) because
+# BOT_DIR was pinned to $HOME/autoagent. The same class of "silent state
+# mismatch" bug as the 2026-05-01 .env overwrite documented below — both
+# are caught by deriving from invocation context, not from process env.
+if ! BOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "ERROR: deploy must be run from inside a git repo (cwd: $PWD)."
+    echo "  cd into the checkout/worktree you want to deploy, then re-run."
+    exit 1
+fi
+
+echo "Redeploying code to $SERVER (from: $BOT_DIR)..."
 
 # Stop any running bot units during deploy (oneshot timer, weather daemon,
 # or the new unified daemon — whichever happens to be live at the moment).
