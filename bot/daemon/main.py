@@ -174,6 +174,18 @@ HOURLY_BACKFILL_TARGET_HOUR_UTC = 6        # 02:00 EDT, 23:00 PDT prior day
 # minimum lead time before we'd act on a discovery is days, not hours.
 SERIES_DISCOVERY_INTERVAL_S = 24 * 3600
 
+# Daily |z| calibration alarm (Phase 2 item 3). Fires Telegram alerts when
+# per-TTE-bucket mean(|z|) drifts above bucket-specific thresholds. The <12h
+# bucket is the primary signal: METAR is supposed to anchor the model in
+# that window, so any |z| drift there indicates a pipeline break, not honest
+# tail. Thresholds documented in
+# memory/project_calibration_alarm_thresholds.md and constants live in
+# bot/learning/calibration_alarm.py:THRESHOLDS.
+CALIBRATION_ALARM_INTERVAL_S = 24 * 3600
+CALIBRATION_ALARM_TARGET_HOUR_UTC = 13  # 09:00 EDT, 06:00 PDT — pre-market
+                                        # start of the US trading day, after
+                                        # overnight METAR backfill completes
+
 
 def _configure_logging() -> None:
     """Log to stdout (captured by systemd's StandardOutput=append).
@@ -391,6 +403,13 @@ def _seconds_until_utc_hour(target_hour: int) -> float:
     if target <= now:
         target += timedelta(days=1)
     return (target - now).total_seconds()
+
+
+def _run_calibration_alarm(conn) -> None:
+    """Daily |z| calibration sweep — fires Telegram for any TTE-bucket
+    threshold breach. See bot/learning/calibration_alarm.py."""
+    from bot.learning.calibration_alarm import run_calibration_alarm
+    run_calibration_alarm(conn)
 
 
 def _run_hourly_backfill(conn) -> None:
@@ -1327,6 +1346,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         # the same wall-clock hour regardless of daemon restarts.
         initial_delay_s=_seconds_until_utc_hour(
             HOURLY_BACKFILL_TARGET_HOUR_UTC
+        ),
+    )
+    scheduler.register(
+        "calibration_alarm",
+        lambda: _run_calibration_alarm(conn),
+        interval_s=CALIBRATION_ALARM_INTERVAL_S,
+        # 13:00 UTC = 09:00 EDT. Runs after the 06:00 UTC hourly_backfill,
+        # so actuals from yesterday's settlements have landed in
+        # weather_metar_hourly_backfill before the |z| sweep reads them.
+        initial_delay_s=_seconds_until_utc_hour(
+            CALIBRATION_ALARM_TARGET_HOUR_UTC
         ),
     )
     scheduler.register(
