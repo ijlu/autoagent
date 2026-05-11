@@ -129,6 +129,24 @@ WEATHER_REGIME_SIGMA = os.environ.get("WEATHER_REGIME_SIGMA", "false").lower() i
 # per-category with ≥200 settled rows per family from the v2 path.
 CALIBRATION_ENABLED = os.environ.get("CALIBRATION_ENABLED", "false").lower() in ("true", "1", "yes")
 
+# Phase 2 item 2 (2026-05-10) — wire predict_v2 output through Platt at the
+# ensemble.py integration boundary, so all sources (v2, family-router,
+# generic ensemble) flow through one uniform calibration step. See
+# memory/project_layer_separation_model_vs_trading.md.
+#
+# Default false: the persisted curve (current state: weather families
+# uniformly A=0.5, B in [-1.13, -0.66]) aggressively shrinks weather
+# predictions toward ~24% — a p=0.85 raw v2 prediction → ~0.43 after
+# Platt. That shrinkage was correct for the overconfident v1 ensemble.
+# Whether it remains appropriate after Phase 1's σ-inflation fix is
+# unverified empirically. Refit calibration on v2-only data before
+# flipping this flag (part of item 1 territory).
+#
+# When false (default), the v2 short-circuit returns raw clamped prob
+# (current behavior, no regression). When true, output flows through
+# apply_calibration_correction respecting CALIBRATION_ENABLED.
+WEATHER_V2_PLATT_ENABLED = os.environ.get("WEATHER_V2_PLATT_ENABLED", "false").lower() in ("true", "1", "yes")
+
 # 2026-05-04: weather-only mode. When true, the scan / score / log paths
 # all skip non-weather families. Effects:
 #   - TRADE_SERIES_ALLOWLIST narrows to KXHIGH* only (no KXFED, KXBTC, etc.)
