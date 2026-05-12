@@ -324,19 +324,28 @@ def _run_cross_bracket_rearm(conn) -> None:
     cross_bracket_shadow.py because re-arming is a daemon-lifecycle
     concern, not a per-cycle decision.
     """
-    from bot.config import CROSS_BRACKET_LIVE
+    from bot.config import CROSS_BRACKET_BLOCKLIST, CROSS_BRACKET_LIVE
     if not CROSS_BRACKET_LIVE:
         logger.info("[cross_bracket_rearm] skipped — CROSS_BRACKET_LIVE=false")
         return
-    families = (
+    all_families = (
         "KXHIGHNY", "KXHIGHMIA", "KXHIGHCHI",
         "KXHIGHLAX", "KXHIGHAUS", "KXHIGHDEN",
     )
-    for fam in families:
-        kv_set(conn, f"cross_bracket_live:{fam}", True, 24 * 3600)
+    armed: list[str] = []
+    blocked: list[str] = []
+    for fam in all_families:
+        if fam in CROSS_BRACKET_BLOCKLIST:
+            # Explicitly write False so any leftover True from a prior
+            # arm decays out instead of waiting on TTL expiry.
+            kv_set(conn, f"cross_bracket_live:{fam}", False, 24 * 3600)
+            blocked.append(fam)
+        else:
+            kv_set(conn, f"cross_bracket_live:{fam}", True, 24 * 3600)
+            armed.append(fam)
     logger.info(
-        "[cross_bracket_rearm] refreshed %d weather families (TTL=24h)",
-        len(families),
+        "[cross_bracket_rearm] armed=%s blocked=%s (TTL=24h)",
+        armed, blocked,
     )
 
 

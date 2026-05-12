@@ -107,6 +107,26 @@ CROSS_BRACKET_LIVE_MIN_EDGE = float(
 CROSS_BRACKET_SLIP_TOLERANCE_CENTS = int(
     os.environ.get("CROSS_BRACKET_SLIP_TOLERANCE_CENTS", "2")
 )
+# Permanent per-family cross-bracket blocklist (env-overridable).
+# Distinct from the kv-based ``cross_bracket_live:<family>`` toggle:
+# the kv path is for canary rollout / temporary pauses, while this
+# blocklist is for families with known structural problems that
+# warrant a hard block until the underlying issue is fixed.
+#
+# 2026-05-12 audit: KXHIGHDEN's combined Gaussian σ is 1.4–4.2°F
+# while actual day-to-day high RMSE was 11–12°F across 5 directional
+# losses (≥3σ events on 40% of days). All 5 KXHIGHDEN directional
+# bets resolved against us. Until σ inflation lands, block here.
+# KXHIGHDEN is already in DIRECTIONAL_BLOCKLIST and MM_BLOCKED_SERIES
+# for the same reason; the cross-bracket blocklist closes the loop.
+_DEFAULT_CROSS_BRACKET_BLOCKLIST = "KXHIGHDEN"
+CROSS_BRACKET_BLOCKLIST: frozenset[str] = frozenset(
+    fam.strip().upper()
+    for fam in os.environ.get(
+        "CROSS_BRACKET_BLOCKLIST", _DEFAULT_CROSS_BRACKET_BLOCKLIST
+    ).split(",")
+    if fam.strip()
+)
 # A6: route WeatherQuoter fair-value through `weather_ensemble_v2.predict_v2` instead
 # of the v1 METAR-only logistic CDF. Shadow-first: flag toggles the FV path, live
 # posting is still gated by WEATHER_MM_LIVE. Falls back to v1 on v2 errors / None.

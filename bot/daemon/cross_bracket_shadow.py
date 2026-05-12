@@ -70,15 +70,23 @@ def _family_from_settlement_key(settlement_key: str) -> str:
 
 
 def _is_family_live(conn, family: str) -> bool:
-    """Per-family live trading kill switch. Both global env AND
-    family-specific kv must be truthy for live trading to fire.
+    """Per-family live trading kill switch. All three gates must pass:
+    (1) global env CROSS_BRACKET_LIVE, (2) family NOT in
+    CROSS_BRACKET_BLOCKLIST, (3) family-specific kv truthy.
 
-    The two-key design is intentional belt-and-suspenders: the global
-    env lets us instantly turn off ALL cross-bracket live trading via
-    a deploy + restart, while the per-family kv lets us canary one
-    family at a time without restarting the daemon.
+    The three-layer design is belt-and-suspenders: the global env lets
+    us instantly turn off ALL cross-bracket live trading via a deploy +
+    restart; the blocklist hard-bans families with known structural
+    problems even if their kv accidentally gets re-armed; the per-family
+    kv lets us canary one family at a time without restarting.
     """
     if not CROSS_BRACKET_LIVE:
+        return False
+    # Hard block — survives an accidental kv re-arm. KXHIGHDEN is
+    # currently the only entry (2026-05-12 audit: σ catastrophically
+    # narrow vs actual day-to-day temperature variance).
+    from bot.config import CROSS_BRACKET_BLOCKLIST
+    if family.upper() in CROSS_BRACKET_BLOCKLIST:
         return False
     from bot.db import kv_get
     try:

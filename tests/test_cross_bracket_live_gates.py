@@ -109,6 +109,37 @@ def test_family_live_kv_dict_form(memdb, monkeypatch):
     assert cb._is_family_live(memdb, "KXHIGHNY") is True
 
 
+def test_family_live_blocklist_overrides_kv(memdb, monkeypatch):
+    """REGRESSION (2026-05-12): CROSS_BRACKET_BLOCKLIST hard-bans a
+    family even if env is true AND kv is truthy. Belt-and-suspenders
+    against a stale ``cross_bracket_rearm`` re-arm or a manual kv
+    override missing the long-term context. KXHIGHDEN is currently the
+    only entry — σ catastrophically narrow vs actual variance.
+    """
+    monkeypatch.setattr(cb, "CROSS_BRACKET_LIVE", True)
+    kv_set(memdb, "cross_bracket_live:KXHIGHDEN", True, ttl_seconds=86400)
+    # Patch the imported blocklist to include KXHIGHDEN — test must not
+    # depend on the default value because future audits may change it.
+    import bot.config as cfg
+    monkeypatch.setattr(cfg, "CROSS_BRACKET_BLOCKLIST", frozenset({"KXHIGHDEN"}))
+    assert cb._is_family_live(memdb, "KXHIGHDEN") is False
+    # Other families still pass when blocked entry is unrelated
+    kv_set(memdb, "cross_bracket_live:KXHIGHNY", True, ttl_seconds=86400)
+    assert cb._is_family_live(memdb, "KXHIGHNY") is True
+
+
+def test_family_live_blocklist_is_case_insensitive(memdb, monkeypatch):
+    """Family name comparison normalizes case — ``kxhighden`` should
+    block the same as ``KXHIGHDEN``. Defensive against any caller
+    that doesn't upper-case before passing the family in.
+    """
+    monkeypatch.setattr(cb, "CROSS_BRACKET_LIVE", True)
+    kv_set(memdb, "cross_bracket_live:kxhighden", True, ttl_seconds=86400)
+    import bot.config as cfg
+    monkeypatch.setattr(cfg, "CROSS_BRACKET_BLOCKLIST", frozenset({"KXHIGHDEN"}))
+    assert cb._is_family_live(memdb, "kxhighden") is False
+
+
 # ── TTE window gate ────────────────────────────────────────────────────
 
 
