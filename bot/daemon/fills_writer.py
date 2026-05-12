@@ -362,6 +362,68 @@ class FillsWriter:
             self._row_count_warned = True
 
     # -----------------------------------------------------------------
+    # Drift alert
+    # -----------------------------------------------------------------
+
+    # How far back to look for a matching posted decision. 10 min
+    # comfortably covers the latency between an api_post call and
+    # Kalshi's /portfolio/fills page advancing — typically seconds
+    # but allows for retry delays. Larger windows risk false alarms
+    # if the bot legitimately posts and later sees a separate Josh
+    # fill on the same ticker.
+    _DRIFT_ALERT_WINDOW_SECONDS = 600
+
+    def _maybe_log_drift_alert(
+        self, ticker: str, side: str, created_time: Optional[str],
+    ) -> None:
+        """Log a loud warning when a fill tags ``manual`` despite a
+        matching bot decision having been posted in the last
+        ``_DRIFT_ALERT_WINDOW_SECONDS`` seconds. This is the canary
+        for Kalshi response-shape drift — same class of bug as the
+        2026-05-03 (count_fp / *_price_dollars) and 2026-05-10
+        (client_order_id removed) field renames. Catching it here
+        means a single broken fill triggers a visible alert in
+        daemon.log instead of silently mis-attributing every fill
+        for days.
+
+        Best-effort: any exception in the lookup is swallowed (a
+        broken alert must not break the writer).
+        """
+        if not created_time:
+            return
+        try:
+            from datetime import datetime
+            fill_ts_unix = datetime.fromisoformat(
+                created_time.replace("Z", "+00:00")
+            ).timestamp()
+            row = self.conn.execute(
+                """SELECT ts_decision, decision_type
+                     FROM alpha_backtest
+                    WHERE ticker = ?
+                      AND side = ?
+                      AND decision_outcome = 'posted'
+                      AND ts_decision_unix BETWEEN ? AND ?
+                    ORDER BY ts_decision_unix DESC LIMIT 1""",
+                (ticker, side,
+                 fill_ts_unix - self._DRIFT_ALERT_WINDOW_SECONDS,
+                 fill_ts_unix + 60),  # accept up to 60s clock skew
+            ).fetchone()
+            if row is None:
+                return
+            decision_ts, decision_type = row
+            logger.warning(
+                "[fills] DRIFT ALERT: ticker=%s side=%s tagged 'manual' "
+                "but %s posted decision exists at %s (within %ds). "
+                "Likely Kalshi response-shape drift — check that fills "
+                "payload includes client_order_id and that posted_orders "
+                "is being written. See 2026-05-12 audit Phase A.",
+                ticker, side, decision_type, decision_ts,
+                self._DRIFT_ALERT_WINDOW_SECONDS,
+            )
+        except Exception as exc:
+            logger.debug("[fills] drift-alert lookup failed: %s", exc)
+
+    # -----------------------------------------------------------------
     # Row construction (pure helper — no I/O)
     # -----------------------------------------------------------------
 
@@ -452,6 +514,15 @@ class FillsWriter:
                 source, client_order_id,
             )
             source = "manual"
+
+        # Drift alert: a ``manual`` fill that lands on a ticker we just
+        # decided to post on is almost certainly bot activity with
+        # broken attribution (Kalshi /portfolio/fills field-drift
+        # pattern that has bitten us twice — count_fp/*_price_dollars
+        # on 2026-05-03, client_order_id on 2026-05-10). Surface this
+        # loudly so the gap doesn't go unnoticed for days again.
+        if source == "manual":
+            self._maybe_log_drift_alert(ticker, side, fill.get("created_time"))
 
         # Parse ISO timestamp → unix. Kalshi sends "2026-04-20T18:23:11.402Z".
         # datetime.fromisoformat handles the "Z" suffix on 3.11+.

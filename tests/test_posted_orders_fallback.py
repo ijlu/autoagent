@@ -237,3 +237,103 @@ def test_fill_with_client_order_id_still_works(conn) -> None:
         ("trade-direct",),
     ).fetchone()[0]
     assert src == "cross_bracket_exit"
+
+
+# ── Drift alert ───────────────────────────────────────────────────────────
+
+
+def _insert_posted_decision(conn, *, ticker, side, ts_decision_unix):
+    """Insert an alpha_backtest decision row simulating a recently-posted
+    cross_bracket_live order on this ticker."""
+    from datetime import datetime, timezone
+    ts_iso = datetime.fromtimestamp(
+        ts_decision_unix, tz=timezone.utc
+    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+    conn.execute(
+        """INSERT INTO alpha_backtest
+        (ts_decision, ts_decision_unix, ticker, family, decision_type,
+         decision_outcome, side, ensemble_p_yes)
+        VALUES (?, ?, ?, 'KXHIGHAUS', 'cross_bracket_live', 'posted',
+                ?, 0.05)""",
+        (ts_iso, ts_decision_unix, ticker, side),
+    )
+
+
+def test_drift_alert_fires_when_manual_fill_follows_posted_decision(
+    conn, caplog,
+) -> None:
+    """REGRESSION (2026-05-12 audit Phase A.4): a fill tagged 'manual'
+    on a ticker where the bot just posted a decision is the
+    fingerprint of Kalshi response-shape drift. The writer must log
+    a loud warning so the next instance of the same bug class
+    surfaces immediately instead of silently mis-attributing fills
+    for days.
+    """
+    import logging
+    from datetime import datetime, timezone
+
+    # Posted decision at fill_ts - 60s
+    fill_ts_unix = datetime.fromisoformat(
+        "2026-05-11T22:58:53.000000+00:00"
+    ).timestamp()
+    _insert_posted_decision(
+        conn, ticker="KXHIGHAUS-26MAY11-B81.5", side="no",
+        ts_decision_unix=fill_ts_unix - 60,
+    )
+    conn.commit()
+
+    writer = FillsWriter(conn)
+    fill = _new_format_fill(
+        trade_id="t-drift", order_id="oid-drift",
+        ticker="KXHIGHAUS-26MAY11-B81.5", side="no",
+    )  # no client_order_id, no posted_orders row → tags as 'manual'
+
+    with caplog.at_level(logging.WARNING, logger="bot.daemon.fills_writer"):
+        writer.ingest_page([fill], live_mode=True)
+
+    assert any("DRIFT ALERT" in rec.message for rec in caplog.records), (
+        "Expected a DRIFT ALERT warning when a manual fill matches a "
+        "recently-posted decision"
+    )
+
+
+def test_drift_alert_silent_for_genuine_external_fill(conn, caplog) -> None:
+    """A manual fill with NO matching posted decision is just an
+    external trade (Josh's UI activity, an old order finally filling,
+    etc.). No alert — would be noise.
+    """
+    import logging
+    writer = FillsWriter(conn)
+    # No alpha_backtest decision inserted.
+    fill = _new_format_fill(
+        trade_id="t-ext", order_id="oid-ext",
+        ticker="KXNBATOTAL-26MAY10-220", side="yes",
+    )
+    with caplog.at_level(logging.WARNING, logger="bot.daemon.fills_writer"):
+        writer.ingest_page([fill], live_mode=False)
+    assert not any("DRIFT ALERT" in rec.message for rec in caplog.records)
+
+
+def test_drift_alert_window_excludes_old_decisions(conn, caplog) -> None:
+    """Only decisions within the last ~10 min count. A 2-hour-old
+    decision matching by ticker is just a coincidence, not drift.
+    """
+    import logging
+    from datetime import datetime
+    fill_ts_unix = datetime.fromisoformat(
+        "2026-05-11T22:58:53+00:00"
+    ).timestamp()
+    _insert_posted_decision(
+        conn, ticker="KXHIGHAUS-26MAY11-B81.5", side="no",
+        ts_decision_unix=fill_ts_unix - 7200,  # 2 hours earlier
+    )
+    conn.commit()
+
+    writer = FillsWriter(conn)
+    fill = _new_format_fill(
+        trade_id="t-old", order_id="oid-old",
+        ticker="KXHIGHAUS-26MAY11-B81.5", side="no",
+    )
+    with caplog.at_level(logging.WARNING, logger="bot.daemon.fills_writer"):
+        writer.ingest_page([fill], live_mode=True)
+    assert not any("DRIFT ALERT" in rec.message for rec in caplog.records)
