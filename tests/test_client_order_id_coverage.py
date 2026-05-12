@@ -4,16 +4,25 @@ with a client_order_id carrying the correct strategy prefix.
 This test is load-bearing for the T3 fills ledger. The ledger's source_tagger
 routes fills by client_order_id prefix:
 
-    mm_wx_     → mm_quote (weather MM)
-    mm_sc_     → safe_compounder
-    mm_exit_   → exit (manage_positions graduated health-score exit)
-    mm_dir_    → directional
+    mm_wx_         → mm_quote (weather MM)
+    mm_sc_         → safe_compounder
+    mm_exit_       → exit (manage_positions graduated health-score exit)
+    mm_dir_        → directional
+    mm_xb_exit_    → cross_bracket_exit
+    mm_xb_         → cross_bracket
 
 Any order posted without a client_order_id arrives at the ledger as `manual`,
 polluting per-strategy P&L attribution. This test fails closed: if anyone adds
 a new `/portfolio/orders` POST without a tag, CI catches it.
 
-Approach: parse trade.py and bot/daemon/weather_quoter.py with ast, find every
+Companion invariant: since 2026-05-10, Kalshi's /portfolio/fills response no
+longer echoes back client_order_id, so fills_writer relies on a (order_id →
+client_order_id) lookup in the ``posted_orders`` table. Every POST site
+listed below must record the post via ``record_posted_order()`` immediately
+after a successful ``api_post``. That coverage is enforced separately by
+``test_posted_orders_fallback.py``.
+
+Approach: parse each FILES_THAT_POST_ORDERS file with ast, find every
 api_post("/portfolio/orders", ...) call, and assert the body dict contains a
 client_order_id key with a string starting in one of the known prefixes.
 """
@@ -34,9 +43,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FILES_THAT_POST_ORDERS = [
     REPO_ROOT / "trade.py",
     REPO_ROOT / "bot" / "daemon" / "weather_quoter.py",
+    REPO_ROOT / "bot" / "daemon" / "cross_bracket_shadow.py",
+    REPO_ROOT / "bot" / "daemon" / "cross_bracket_exit.py",
 ]
 
-ALLOWED_PREFIXES = ("mm_wx_", "mm_sc_", "mm_exit_", "mm_dir_")
+ALLOWED_PREFIXES = (
+    "mm_wx_", "mm_sc_", "mm_exit_", "mm_dir_",
+    "mm_xb_exit_", "mm_xb_",
+)
 
 
 def _iter_order_post_calls(source: str) -> Iterable[tuple[int, ast.Call]]:
@@ -199,6 +213,25 @@ def test_weather_quoter_uses_mm_wx_prefix() -> None:
     src = (REPO_ROOT / "bot" / "daemon" / "weather_quoter.py").read_text()
     assert 'f"mm_wx_{' in src, (
         "weather_quoter must construct client_order_id with 'mm_wx_' prefix"
+    )
+
+
+def test_cross_bracket_files_use_expected_prefixes() -> None:
+    """Pin the cross-bracket prefixes to the source-tagger contract.
+
+    ``mm_xb_exit_`` MUST be a strict prefix-supersession of ``mm_xb_``
+    so that ``default_source_tagger`` checks ``mm_xb_exit_`` first and
+    only falls through to ``cross_bracket`` for entries.
+    """
+    shadow = (REPO_ROOT / "bot" / "daemon" / "cross_bracket_shadow.py").read_text()
+    exit_src = (REPO_ROOT / "bot" / "daemon" / "cross_bracket_exit.py").read_text()
+    assert 'f"mm_xb_{' in shadow, (
+        "cross_bracket_shadow must construct client_order_id with 'mm_xb_' prefix"
+    )
+    assert 'f"mm_xb_exit_{' in exit_src, (
+        "cross_bracket_exit must construct client_order_id with 'mm_xb_exit_' "
+        "prefix so it routes to cross_bracket_exit (not cross_bracket) in the "
+        "fills tagger"
     )
 
 

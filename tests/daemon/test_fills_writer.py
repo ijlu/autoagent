@@ -442,9 +442,10 @@ class TestDualFormatPayloads:
         # 0.9100 dollars = 91 cents
         assert row["yes_price_cents"] == 91
         assert row["is_taker"] == 1
-        # Source tagged from client_order_id `mm_xb_*` → falls through
-        # to the `mm_*` legacy bucket per default_source_tagger.
-        assert row["source"] == "legacy"
+        # Source tagged from client_order_id ``mm_xb_*`` → routes to
+        # ``cross_bracket`` (was ``legacy`` before T3.2 added a
+        # cross-bracket arm to default_source_tagger).
+        assert row["source"] == "cross_bracket"
 
     def test_legacy_cents_int_format_still_parses(self):
         """The original cents-int format must still work after the

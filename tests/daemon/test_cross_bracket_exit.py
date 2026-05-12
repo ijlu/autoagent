@@ -29,6 +29,13 @@ def _pos(side="no", contracts=1, avg_entry=9.0, fee_per=1.0):
     }
 
 
+def _make_conn():
+    """Fresh in-memory DB. post_exit_order writes a posted_orders row
+    after a successful api_post, so the conn must have init_db's tables."""
+    from bot.db import init_db
+    return init_db(":memory:")
+
+
 class TestEvaluateExit:
     def test_no_book_returns_none(self):
         assert cbe.evaluate_exit(_pos(), None) is None
@@ -91,6 +98,7 @@ class TestSyntheticSellDirection:
 
         monkeypatch.setattr(cbe, "api_post", fake_post)
         cbe.post_exit_order(
+            _make_conn(),
             _pos(side="no", contracts=1, avg_entry=9),
             {
                 "exit_price_cents": 60,
@@ -107,7 +115,9 @@ class TestSyntheticSellDirection:
         assert body["yes_price"] == 40
         assert body["count"] == 1
         assert body["action"] == "buy"
-        assert body["client_order_id"].startswith("mm_xbexit_")
+        # mm_xb_exit_ prefix (with underscore) so the fills tagger
+        # routes to ``cross_bracket_exit`` distinct from ``cross_bracket``.
+        assert body["client_order_id"].startswith("mm_xb_exit_")
 
     def test_yes_position_buys_no_at_inverse_price(self, monkeypatch):
         captured = {}
@@ -117,6 +127,7 @@ class TestSyntheticSellDirection:
             or {"order": {"order_id": "x"}},
         )
         cbe.post_exit_order(
+            _make_conn(),
             _pos(side="yes", contracts=2, avg_entry=15),
             {
                 "exit_price_cents": 80,
@@ -143,6 +154,7 @@ class TestSyntheticSellDirection:
         monkeypatch.setattr(cbe, "api_post", fake_post)
         # exit_price_cents=100 → opposite = 0 → invalid → no post
         result = cbe.post_exit_order(
+            _make_conn(),
             _pos(),
             {
                 "exit_price_cents": 100,
@@ -161,7 +173,13 @@ class TestSyntheticSellDirection:
 
 
 class TestClientOrderId:
-    def test_uses_mm_xbexit_prefix(self, monkeypatch):
+    def test_uses_mm_xb_exit_prefix(self, monkeypatch):
+        """``mm_xb_exit_`` (with underscore) routes to ``cross_bracket_exit``
+        in default_source_tagger. The previous ``mm_xbexit_`` (no
+        underscore) was ambiguous with ``mm_xb_*`` and would have
+        collapsed exits into the ``cross_bracket`` bucket once the
+        T3.1 tagger learned to distinguish them.
+        """
         captured = {}
         monkeypatch.setattr(
             cbe, "api_post",
@@ -169,6 +187,7 @@ class TestClientOrderId:
             or {"order": {"order_id": "x"}},
         )
         cbe.post_exit_order(
+            _make_conn(),
             _pos(),
             {
                 "exit_price_cents": 50,
@@ -180,7 +199,7 @@ class TestClientOrderId:
             },
         )
         coid = captured["body"]["client_order_id"]
-        assert coid.startswith("mm_xbexit_")
+        assert coid.startswith("mm_xb_exit_")
         # Must not contain periods (Kalshi rejects per CLAUDE.md regression list)
         assert "." not in coid
         assert len(coid) <= 64

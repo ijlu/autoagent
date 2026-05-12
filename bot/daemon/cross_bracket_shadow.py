@@ -622,6 +622,25 @@ def _post_live_order(
     order_id = order.get("order_id")
     if not order_id:
         return False, f"no_order_id:{resp.get('error') or resp}"
+
+    # Record (order_id, client_order_id) for fill-attribution recovery.
+    # Kalshi's /portfolio/fills response no longer echoes client_order_id
+    # (2026-05-10+ format drift) — without this row, the corresponding
+    # fill would tag as ``manual`` and the strategy lose attribution.
+    # See bot/daemon/fills_writer.record_posted_order docstring.
+    from bot.daemon.fills_writer import record_posted_order
+    record_posted_order(
+        conn,
+        order_id=order_id,
+        client_order_id=body["client_order_id"],
+        ticker=decision.ticker,
+        side=side,
+        action="buy",
+        count=safe_count,
+        price_cents=limit_price,
+        source_hint="cross_bracket",
+        live_mode=True,
+    )
     return True, order_id
 
 
