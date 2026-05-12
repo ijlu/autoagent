@@ -70,15 +70,23 @@ def _family_from_settlement_key(settlement_key: str) -> str:
 
 
 def _is_family_live(conn, family: str) -> bool:
-    """Per-family live trading kill switch. Both global env AND
-    family-specific kv must be truthy for live trading to fire.
+    """Per-family live trading kill switch. All three gates must pass:
+    (1) global env CROSS_BRACKET_LIVE, (2) family NOT in
+    CROSS_BRACKET_BLOCKLIST, (3) family-specific kv truthy.
 
-    The two-key design is intentional belt-and-suspenders: the global
-    env lets us instantly turn off ALL cross-bracket live trading via
-    a deploy + restart, while the per-family kv lets us canary one
-    family at a time without restarting the daemon.
+    The three-layer design is belt-and-suspenders: the global env lets
+    us instantly turn off ALL cross-bracket live trading via a deploy +
+    restart; the blocklist hard-bans families with known structural
+    problems even if their kv accidentally gets re-armed; the per-family
+    kv lets us canary one family at a time without restarting.
     """
     if not CROSS_BRACKET_LIVE:
+        return False
+    # Hard block — survives an accidental kv re-arm. KXHIGHDEN is
+    # currently the only entry (2026-05-12 audit: σ catastrophically
+    # narrow vs actual day-to-day temperature variance).
+    from bot.config import CROSS_BRACKET_BLOCKLIST
+    if family.upper() in CROSS_BRACKET_BLOCKLIST:
         return False
     from bot.db import kv_get
     try:
@@ -359,14 +367,30 @@ def _score_one_settlement(group: list[dict]) -> list:
     if combined is None:
         return []
 
-    # Enforce σ floor (matches predict_v2 step 4d).
-    sigma = max(combined.sigma_f, _COMBINED_SIGMA_FLOOR_F)
+    # Two-tier σ floor:
+    #   1) Global physical floor ``_COMBINED_SIGMA_FLOOR_F`` (1.0°F) —
+    #      matches predict_v2 step 4d.
+    #   2) Per-family empirical RMSE floor — sourced from the
+    #      2026-05-12 audit's residuals analysis. The post-peak fast-
+    #      path tightens σ to ~1°F but actual day-to-day RMSE is
+    #      1.3–2.4°F for most cities (6.5°F for Denver, hard-blocked).
+    #      Inflating to the empirical floor tightens the conviction
+    #      gate so cross_bracket fires only when the model genuinely
+    #      disagrees with the market BEYOND the model's empirical
+    #      precision. See tools/sigma_residuals.py.
+    from bot.config import CROSS_BRACKET_FAMILY_SIGMA_FLOORS
+    family = _family_from_settlement_key(ticker)
+    family_floor = CROSS_BRACKET_FAMILY_SIGMA_FLOORS.get(
+        family, _COMBINED_SIGMA_FLOOR_F,
+    )
+    effective_floor = max(_COMBINED_SIGMA_FLOOR_F, family_floor)
+    sigma = max(combined.sigma_f, effective_floor)
 
     return score_market_portfolio(
         group,
         combined_mu=combined.mean_f,
         combined_sigma=sigma,
-        sigma_floor=_COMBINED_SIGMA_FLOOR_F,
+        sigma_floor=effective_floor,
     )
 
 
@@ -622,6 +646,25 @@ def _post_live_order(
     order_id = order.get("order_id")
     if not order_id:
         return False, f"no_order_id:{resp.get('error') or resp}"
+
+    # Record (order_id, client_order_id) for fill-attribution recovery.
+    # Kalshi's /portfolio/fills response no longer echoes client_order_id
+    # (2026-05-10+ format drift) — without this row, the corresponding
+    # fill would tag as ``manual`` and the strategy lose attribution.
+    # See bot/daemon/fills_writer.record_posted_order docstring.
+    from bot.daemon.fills_writer import record_posted_order
+    record_posted_order(
+        conn,
+        order_id=order_id,
+        client_order_id=body["client_order_id"],
+        ticker=decision.ticker,
+        side=side,
+        action="buy",
+        count=safe_count,
+        price_cents=limit_price,
+        source_hint="cross_bracket",
+        live_mode=True,
+    )
     return True, order_id
 
 

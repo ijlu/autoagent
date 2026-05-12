@@ -188,6 +188,50 @@ def apply_trade(
 # Settlement P&L
 # ---------------------------------------------------------------------------
 
+def settlement_revenue_cents(
+    yes_count: float,
+    no_count: float,
+    market_result: str,
+) -> int:
+    """Compute settlement payout in cents from contracts held + outcome.
+
+    The canonical formula for binary Kalshi contracts:
+      - Each YES contract pays $1.00 if ``market_result == 'yes'``, else $0
+      - Each NO contract pays $1.00 if ``market_result == 'no'``, else $0
+      - Hedged positions (both yes_count and no_count > 0) pay out the
+        winning side's full count regardless of which side won.
+
+    Why this exists separately from Kalshi's ``revenue`` field:
+    the ``/portfolio/settlements`` endpoint has been intermittently
+    returning ``revenue=0`` for valid winning settlements since at
+    least 2026-04-12 (verified in production data), and as of
+    2026-05-12 it returns 0 for every settlement. Deriving locally
+    from ``{yes,no}_count_fp`` + ``market_result`` is robust against
+    that drift. Same field-drift class as the 2026-05-03 dual-format
+    fix (count_fp / *_price_dollars) and the 2026-05-12 client_order_id
+    fix — Kalshi reshapes one field at a time; we mirror the math
+    locally so the bot never trusts a single API field for money.
+
+    Args:
+        yes_count: YES contracts held at settlement (Kalshi sends as
+            string-fixed-point like ``"3.00"``; caller is responsible
+            for ``float()`` conversion).
+        no_count: NO contracts held at settlement.
+        market_result: ``'yes'``, ``'no'``, or empty/unknown.
+
+    Returns:
+        Payout in cents (always >= 0). Returns 0 for unknown results
+        so the caller's ``profit = revenue - cost - fees`` math is
+        still meaningful (it just reports a full loss, which is the
+        safe assumption when the API didn't tell us the outcome).
+    """
+    if market_result == "yes":
+        return round(yes_count * 100)
+    if market_result == "no":
+        return round(no_count * 100)
+    return 0
+
+
 def settlement_pnl(
     net: int,
     avg_entry: float,

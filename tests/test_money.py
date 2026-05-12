@@ -9,10 +9,21 @@ Known bug history:
   - BUG #2 (2026-04-10): record_settlements() missing fee_cost subtraction.
   - BUG #3 (2026-04-10): settlement won = revenue > 0 instead of profit > 0.
   - BUG #4 (2026-04-10): mm_liquidate_expiring() zeroed inventory before settlement.
+  - BUG #5 (2026-05-12): record_settlements() trusted Kalshi's ``revenue`` field,
+    which has returned 0 for valid winning settlements since 2026-04-12. This
+    made every hedged cross-bracket position (1 YES + 1 NO) show as a ~$0.90
+    loss instead of a ~$0.10 win, because the $1.00 payout never landed in the
+    revenue field. Fix: derive revenue locally from {yes,no}_count_fp × winning-
+    side payout via settlement_revenue_cents.
 """
 
 import pytest
-from bot.core.money import apply_trade, settlement_pnl, estimate_round_trip_cost
+from bot.core.money import (
+    apply_trade,
+    estimate_round_trip_cost,
+    settlement_pnl,
+    settlement_revenue_cents,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -181,6 +192,116 @@ class TestSettlementPnl:
     def test_unknown_result(self):
         pnl = settlement_pnl(10, 50, "unknown", fee_cents=5)
         assert pnl == -5  # just fees
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# settlement_revenue_cents() — Kalshi-revenue-field-drift recovery (BUG #5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSettlementRevenueCents:
+    """Pin the canonical revenue formula. Kalshi's /portfolio/settlements
+    endpoint has been returning ``revenue=0`` even for valid winning
+    settlements (verified live 2026-05-12 + historical settlements DB).
+    The bot must derive revenue locally to avoid silently reporting all
+    hedged winners as ~$0.90 losses.
+    """
+
+    def test_pure_yes_winner(self):
+        """Held 10 YES, market settled YES → payout = 10 × $1 = 1000¢."""
+        assert settlement_revenue_cents(10, 0, "yes") == 1000
+
+    def test_pure_yes_loser(self):
+        """Held 10 YES, market settled NO → 0¢."""
+        assert settlement_revenue_cents(10, 0, "no") == 0
+
+    def test_pure_no_winner(self):
+        """Held 5 NO, market settled NO → 500¢."""
+        assert settlement_revenue_cents(0, 5, "no") == 500
+
+    def test_pure_no_loser(self):
+        """Held 5 NO, market settled YES → 0¢."""
+        assert settlement_revenue_cents(0, 5, "yes") == 0
+
+    def test_balanced_hedge_yes_outcome(self):
+        """REGRESSION (BUG #5): Hedged 1 YES + 1 NO, settles YES → 100¢
+        (the YES leg). Pre-fix, ``revenue=0`` from Kalshi made this look
+        like a 0-payout total loss, costing ~$1.00 per hedged ticker.
+        13 cross-bracket positions on 2026-05-04 → -12 were mis-reported
+        as such; cross-bracket strategy's reported -$13.39 P&L was
+        actually closer to -$3.35 once the hedge math was honest.
+        """
+        assert settlement_revenue_cents(1, 1, "yes") == 100
+
+    def test_balanced_hedge_no_outcome(self):
+        """Same hedge, settles NO → 100¢ (the NO leg)."""
+        assert settlement_revenue_cents(1, 1, "no") == 100
+
+    def test_balanced_hedge_payout_is_outcome_invariant(self):
+        """The hedge guarantee: payout is the same regardless of which
+        side wins, because exactly one side wins fully. The bot uses
+        this to lock in spread when it has paper profit on a NO.
+        """
+        yes_outcome = settlement_revenue_cents(3, 3, "yes")
+        no_outcome = settlement_revenue_cents(3, 3, "no")
+        assert yes_outcome == no_outcome == 300
+
+    def test_asymmetric_hedge(self):
+        """Held 1 YES + 2 NO, settles YES → 100¢ (1×100).
+        Held 1 YES + 2 NO, settles NO  → 200¢ (2×100).
+        Different total payout, but each side's contribution is its own
+        count × $1 on win."""
+        assert settlement_revenue_cents(1, 2, "yes") == 100
+        assert settlement_revenue_cents(1, 2, "no") == 200
+
+    def test_no_contracts_held(self):
+        """No position at settlement → 0¢ (shouldn't happen if the
+        settlement is even being recorded, but safe default)."""
+        assert settlement_revenue_cents(0, 0, "yes") == 0
+        assert settlement_revenue_cents(0, 0, "no") == 0
+
+    def test_unknown_market_result(self):
+        """Empty / unknown market_result → 0¢. Conservative: report a
+        full loss when the API hasn't told us the outcome. Caller's
+        downstream profit math will then show ``profit = -cost - fees``,
+        which is the safe assumption."""
+        assert settlement_revenue_cents(10, 0, "") == 0
+        assert settlement_revenue_cents(10, 0, "unknown") == 0
+
+    def test_fractional_counts_round_to_nearest_cent(self):
+        """Kalshi reports counts as fixed-point strings (``"3.00"``);
+        callers pass float() of those. round() handles edge cases like
+        ``2.9999...`` from float conversion of ``"3.00"`` cleanly.
+        Same defensive rounding as the dual-format parser fix."""
+        assert settlement_revenue_cents(2.9999999, 0, "yes") == 300
+        assert settlement_revenue_cents(0, 1.0000001, "no") == 100
+
+    def test_record_settlements_call_pattern(self):
+        """Models the exact call shape from trade.py:record_settlements.
+        If this test breaks, that call site needs a matching change."""
+        # Hedged winner — the case that motivated the fix
+        kalshi_payload = {
+            "yes_count_fp": "1.00",
+            "no_count_fp": "1.00",
+            "market_result": "yes",
+            "revenue": 0,  # this is the lie Kalshi tells us
+            "yes_total_cost_dollars": "0.12",
+            "no_total_cost_dollars": "0.75",
+            "fee_cost": "0.03",
+        }
+        yes_count = float(kalshi_payload["yes_count_fp"])
+        no_count = float(kalshi_payload["no_count_fp"])
+        result = kalshi_payload["market_result"]
+        revenue = settlement_revenue_cents(yes_count, no_count, result)
+        assert revenue == 100  # not 0 (which is what Kalshi reported)
+
+        # Full profit math the way record_settlements computes it
+        yes_cost = float(kalshi_payload["yes_total_cost_dollars"]) * 100
+        no_cost = float(kalshi_payload["no_total_cost_dollars"]) * 100
+        total_cost = round(yes_cost + no_cost)  # 87
+        fee_cents = round(float(kalshi_payload["fee_cost"]) * 100)  # 3
+        profit = revenue - total_cost - fee_cents  # 100 - 87 - 3
+        assert profit == 10
+        assert profit > 0, "hedged position with hedge LOCKED IN positive P&L"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

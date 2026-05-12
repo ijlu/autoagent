@@ -287,14 +287,19 @@ def has_pending_exit(ticker: str) -> bool:
     orders = resp.get("orders", [])
     for order in orders:
         coid = (order.get("client_order_id") or "")
-        if coid.startswith("mm_xbexit_"):
+        # Accept both prefixes: legacy ``mm_xbexit_`` (pre-2026-05-12)
+        # and current ``mm_xb_exit_``. Any resting exit order tagged
+        # with either should block a new exit on the same ticker.
+        if coid.startswith("mm_xb_exit_") or coid.startswith("mm_xbexit_"):
             return True
     return False
 
 
 # ── Order placement ───────────────────────────────────────────────────────────
 
-def post_exit_order(position: dict, exit_spec: dict) -> Optional[dict]:
+def post_exit_order(
+    conn, position: dict, exit_spec: dict,
+) -> Optional[dict]:
     """Place a synthetic-sell limit order to exit the position.
 
     Synthetic sell: to close a NO position, BUY YES at (100 - exit_price_cents)
@@ -320,9 +325,12 @@ def post_exit_order(position: dict, exit_spec: dict) -> Optional[dict]:
         )
         return None
 
-    # client_order_id: mm_xbexit_ prefix + safe ticker + unix_ms
+    # client_order_id: ``mm_xb_exit_`` prefix matches fills_writer's
+    # default_source_tagger which routes to ``cross_bracket_exit``.
+    # The earlier ``mm_xbexit_`` form was ambiguous with ``mm_xb_*``
+    # (cross_bracket entries) under the tagger's prefix tree.
     safe_ticker = ticker.replace(".", "_")
-    coid = f"mm_xbexit_{safe_ticker}_{int(time.time() * 1000)}"
+    coid = f"mm_xb_exit_{safe_ticker}_{int(time.time() * 1000)}"
     if len(coid) > 64:
         coid = coid[:64]
 
@@ -341,6 +349,24 @@ def post_exit_order(position: dict, exit_spec: dict) -> Optional[dict]:
         logger.warning("[cb_exit] post failed %s: %s", ticker, exc)
         return None
     order_id = (resp or {}).get("order", {}).get("order_id")
+    if order_id:
+        # Record (order_id, client_order_id) so fills_writer can
+        # recover attribution when Kalshi's /portfolio/fills response
+        # omits client_order_id (2026-05-10+ format drift). See
+        # bot.daemon.fills_writer.record_posted_order.
+        from bot.daemon.fills_writer import record_posted_order
+        record_posted_order(
+            conn,
+            order_id=order_id,
+            client_order_id=coid,
+            ticker=ticker,
+            side=opposite_side,
+            action="buy",
+            count=contracts,
+            price_cents=opposite_price,
+            source_hint="cross_bracket_exit",
+            live_mode=True,
+        )
     logger.info(
         "[cb_exit] EXIT %s %s %d contracts: synthetic-sell as %s @ %d¢ "
         "(implied %s sell @ %d¢, realized=+%.1f¢/ct = %.0f%% of max), "
@@ -427,7 +453,7 @@ def run_exit_check(conn) -> dict:
             )
             continue
 
-        result = post_exit_order(pos, exit_spec)
+        result = post_exit_order(conn, pos, exit_spec)
         if result is None:
             stats["exits_failed"] += 1
         else:

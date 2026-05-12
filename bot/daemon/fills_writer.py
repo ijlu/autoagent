@@ -53,6 +53,7 @@ __all__ = [
     "default_source_tagger",
     "ALLOWED_SOURCES",
     "ROW_COUNT_WARNING_THRESHOLD",
+    "record_posted_order",
 ]
 
 
@@ -71,16 +72,18 @@ ROW_COUNT_WARNING_THRESHOLD = 2_000_000
 # written to fills_ledger.source must be one of these. The writer fails
 # closed if a classifier returns something else.
 ALLOWED_SOURCES: frozenset[str] = frozenset({
-    "mm_quote",        # weather MM two-sided quote (mm_wx_ prefix)
-    "safe_compounder", # safe-compounder entry (mm_sc_ prefix)
-    "exit",            # manage_positions synthetic-sell exit (mm_exit_ prefix)
-    "directional",     # directional buy (mm_dir_ prefix)
-    "legacy",          # bot-placed but from pre-T3 code paths (mm_* with
-                       # no recognized sub-prefix) — should decay to zero
-                       # rows over time as legacy orders settle out
-    "manual",          # external / human-placed (empty or missing
-                       # client_order_id) — always present because Josh
-                       # can place orders via the Kalshi UI
+    "mm_quote",            # weather MM two-sided quote (mm_wx_ prefix)
+    "safe_compounder",     # safe-compounder entry (mm_sc_ prefix)
+    "exit",                # manage_positions synthetic-sell exit (mm_exit_ prefix)
+    "directional",         # directional buy (mm_dir_ prefix)
+    "cross_bracket",       # cross-bracket arb entry (mm_xb_ prefix, not mm_xb_exit_)
+    "cross_bracket_exit",  # cross-bracket arb hedge exit (mm_xb_exit_ prefix)
+    "legacy",              # bot-placed but from pre-T3 code paths (mm_* with
+                           # no recognized sub-prefix) — should decay to zero
+                           # rows over time as legacy orders settle out
+    "manual",              # external / human-placed (empty or missing
+                           # client_order_id) — always present because Josh
+                           # can place orders via the Kalshi UI
 })
 
 
@@ -97,12 +100,14 @@ def default_source_tagger(client_order_id: Optional[str]) -> str:
     The prefix table is the T3.1 contract with every order-posting code
     path:
 
-        mm_wx_     → mm_quote
-        mm_sc_     → safe_compounder
-        mm_exit_   → exit
-        mm_dir_    → directional
-        other mm_* → legacy       (should be empty in steady state)
-        else       → manual       (external, not placed by this bot)
+        mm_wx_         → mm_quote
+        mm_sc_         → safe_compounder
+        mm_exit_       → exit
+        mm_dir_        → directional
+        mm_xb_exit_    → cross_bracket_exit
+        mm_xb_         → cross_bracket
+        other mm_*     → legacy   (should be empty in steady state)
+        else           → manual   (external, not placed by this bot)
 
     If a new order-posting path is added, it MUST use one of the above
     prefixes. The structural invariant test in
@@ -113,7 +118,9 @@ def default_source_tagger(client_order_id: Optional[str]) -> str:
     if not client_order_id:
         return "manual"
     # Sub-prefix matches come first — the plain "mm_" fallback only
-    # fires when nothing more specific matched.
+    # fires when nothing more specific matched. ``mm_xb_exit_`` must be
+    # checked before ``mm_xb_`` because the latter is a prefix of the
+    # former.
     if client_order_id.startswith("mm_wx_"):
         return "mm_quote"
     if client_order_id.startswith("mm_sc_"):
@@ -122,9 +129,86 @@ def default_source_tagger(client_order_id: Optional[str]) -> str:
         return "exit"
     if client_order_id.startswith("mm_dir_"):
         return "directional"
+    if client_order_id.startswith("mm_xb_exit_"):
+        return "cross_bracket_exit"
+    if client_order_id.startswith("mm_xb_"):
+        return "cross_bracket"
     if client_order_id.startswith("mm_"):
         return "legacy"
     return "manual"
+
+
+# ---------------------------------------------------------------------------
+# Posted-orders ledger (Kalshi format-drift recovery)
+# ---------------------------------------------------------------------------
+#
+# As of ~2026-05-10 Kalshi's /portfolio/fills response stopped echoing
+# back ``client_order_id``. Confirmed live: the only identity fields in
+# a fill payload are ``trade_id``, ``fill_id``, ``order_id``, ``ticker``.
+# Without ``client_order_id``, ``default_source_tagger`` cannot route
+# the fill to a strategy bucket — every fill silently becomes ``manual``,
+# breaking every downstream attribution (weather_mm_shadow back-fill,
+# mm_promotion graduation, backtest strategy slices).
+#
+# Recovery: every ``/portfolio/orders`` POST records its own
+# ``(order_id, client_order_id, source_hint)`` here at post time.
+# ``FillsWriter.ingest_page`` falls back to a lookup by ``order_id``
+# when ``client_order_id`` is absent from the Kalshi payload.
+#
+# Companion to the 2026-05-03 dual-format parser fix in this same file.
+
+def record_posted_order(
+    conn: sqlite3.Connection,
+    *,
+    order_id: str,
+    client_order_id: str,
+    ticker: str,
+    side: str,
+    action: str,
+    count: int,
+    price_cents: int,
+    source_hint: str,
+    live_mode: bool,
+) -> None:
+    """Record a successfully posted order for later fill attribution.
+
+    Called by every ``/portfolio/orders`` POST site immediately after
+    ``api_post`` returns a non-empty ``order_id``. Must succeed without
+    raising — a write failure here would silently restart the
+    attribution bug for the affected order. Logs and swallows on error.
+
+    Idempotent via ``INSERT OR IGNORE``: a duplicate post on the same
+    ``order_id`` (e.g., retry path) is a no-op.
+
+    Holds ``DB_WRITE_LOCK`` via ``db_write_ctx`` per the daemon's
+    write-discipline invariant (CLAUDE.md regression watchlist #14).
+    """
+    if not order_id or not client_order_id:
+        # Both are required for attribution recovery; refusing to write
+        # a partial row prevents a silently-broken lookup.
+        logger.warning(
+            "[posted_orders] refusing to record partial row: "
+            "order_id=%r client_order_id=%r ticker=%s",
+            order_id, client_order_id, ticker,
+        )
+        return
+    try:
+        with db_write_ctx(conn):
+            conn.execute(
+                """INSERT OR IGNORE INTO posted_orders
+                   (order_id, client_order_id, ticker, side, action,
+                    count, price_cents, posted_ts_unix, live_mode,
+                    source_hint)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (order_id, client_order_id, ticker, side, action,
+                 int(count), int(price_cents), time.time(),
+                 1 if live_mode else 0, source_hint),
+            )
+    except Exception as exc:
+        logger.warning(
+            "[posted_orders] insert failed for order_id=%s ticker=%s: %s",
+            order_id, ticker, exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +362,68 @@ class FillsWriter:
             self._row_count_warned = True
 
     # -----------------------------------------------------------------
+    # Drift alert
+    # -----------------------------------------------------------------
+
+    # How far back to look for a matching posted decision. 10 min
+    # comfortably covers the latency between an api_post call and
+    # Kalshi's /portfolio/fills page advancing — typically seconds
+    # but allows for retry delays. Larger windows risk false alarms
+    # if the bot legitimately posts and later sees a separate Josh
+    # fill on the same ticker.
+    _DRIFT_ALERT_WINDOW_SECONDS = 600
+
+    def _maybe_log_drift_alert(
+        self, ticker: str, side: str, created_time: Optional[str],
+    ) -> None:
+        """Log a loud warning when a fill tags ``manual`` despite a
+        matching bot decision having been posted in the last
+        ``_DRIFT_ALERT_WINDOW_SECONDS`` seconds. This is the canary
+        for Kalshi response-shape drift — same class of bug as the
+        2026-05-03 (count_fp / *_price_dollars) and 2026-05-10
+        (client_order_id removed) field renames. Catching it here
+        means a single broken fill triggers a visible alert in
+        daemon.log instead of silently mis-attributing every fill
+        for days.
+
+        Best-effort: any exception in the lookup is swallowed (a
+        broken alert must not break the writer).
+        """
+        if not created_time:
+            return
+        try:
+            from datetime import datetime
+            fill_ts_unix = datetime.fromisoformat(
+                created_time.replace("Z", "+00:00")
+            ).timestamp()
+            row = self.conn.execute(
+                """SELECT ts_decision, decision_type
+                     FROM alpha_backtest
+                    WHERE ticker = ?
+                      AND side = ?
+                      AND decision_outcome = 'posted'
+                      AND ts_decision_unix BETWEEN ? AND ?
+                    ORDER BY ts_decision_unix DESC LIMIT 1""",
+                (ticker, side,
+                 fill_ts_unix - self._DRIFT_ALERT_WINDOW_SECONDS,
+                 fill_ts_unix + 60),  # accept up to 60s clock skew
+            ).fetchone()
+            if row is None:
+                return
+            decision_ts, decision_type = row
+            logger.warning(
+                "[fills] DRIFT ALERT: ticker=%s side=%s tagged 'manual' "
+                "but %s posted decision exists at %s (within %ds). "
+                "Likely Kalshi response-shape drift — check that fills "
+                "payload includes client_order_id and that posted_orders "
+                "is being written. See 2026-05-12 audit Phase A.",
+                ticker, side, decision_type, decision_ts,
+                self._DRIFT_ALERT_WINDOW_SECONDS,
+            )
+        except Exception as exc:
+            logger.debug("[fills] drift-alert lookup failed: %s", exc)
+
+    # -----------------------------------------------------------------
     # Row construction (pure helper — no I/O)
     # -----------------------------------------------------------------
 
@@ -336,6 +482,28 @@ class FillsWriter:
         series, _is_bracket = _get_series_prefix(ticker)
         family = family_from_ticker(ticker)
         client_order_id = fill.get("client_order_id")
+        # Kalshi format drift (2026-05-10+): /portfolio/fills no longer
+        # echoes back client_order_id. Recover via order_id → posted_orders
+        # lookup, which every /portfolio/orders POST site populates at
+        # post time. Falls through to ``manual`` only for genuinely
+        # external (Josh-placed via Kalshi UI) fills.
+        if not client_order_id and order_id:
+            try:
+                row = self.conn.execute(
+                    "SELECT client_order_id FROM posted_orders "
+                    "WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()
+                if row and row[0]:
+                    client_order_id = row[0]
+            except sqlite3.Error as exc:
+                # Treat as a soft failure — better to tag manual than
+                # to crash the fills sync. The warning surfaces drift
+                # in the recovery path.
+                logger.warning(
+                    "[fills] posted_orders lookup failed for "
+                    "order_id=%s: %s", order_id, exc,
+                )
         source = self.source_tagger(client_order_id)
         if source not in ALLOWED_SOURCES:
             # source_tagger contract violation — fail closed. Logging
@@ -346,6 +514,15 @@ class FillsWriter:
                 source, client_order_id,
             )
             source = "manual"
+
+        # Drift alert: a ``manual`` fill that lands on a ticker we just
+        # decided to post on is almost certainly bot activity with
+        # broken attribution (Kalshi /portfolio/fills field-drift
+        # pattern that has bitten us twice — count_fp/*_price_dollars
+        # on 2026-05-03, client_order_id on 2026-05-10). Surface this
+        # loudly so the gap doesn't go unnoticed for days again.
+        if source == "manual":
+            self._maybe_log_drift_alert(ticker, side, fill.get("created_time"))
 
         # Parse ISO timestamp → unix. Kalshi sends "2026-04-20T18:23:11.402Z".
         # datetime.fromisoformat handles the "Z" suffix on 3.11+.

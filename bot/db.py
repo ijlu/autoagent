@@ -604,6 +604,40 @@ def init_db(db_path: Optional[str] = None) -> sqlite3.Connection:
         "ON fills_ledger(family, fill_ts_unix)"
     )
 
+    # ── Posted-orders ledger (Kalshi format-drift recovery) ──
+    # As of ~2026-05-10 Kalshi's /portfolio/fills response stopped
+    # including ``client_order_id``. Without it, fills_writer cannot
+    # tag fills by strategy (every fill tags as ``manual``), which
+    # silently breaks every downstream attribution: weather_mm_shadow
+    # back-fill, mm_promotion graduation, backtest strategy slices.
+    # Recovery path: every /portfolio/orders POST writes a row here,
+    # and fills_writer falls back to (order_id → client_order_id)
+    # lookup when the Kalshi payload omits it.
+    #
+    # First instance of the same pattern (count_fp / *_price_dollars)
+    # was the 2026-05-03 fix (commit 6a39dd7); this is the second.
+    # See CLAUDE.md regression watchlist entry on Kalshi field drift.
+    conn.execute("""CREATE TABLE IF NOT EXISTS posted_orders (
+        order_id        TEXT    PRIMARY KEY,
+        client_order_id TEXT    NOT NULL,
+        ticker          TEXT    NOT NULL,
+        side            TEXT    NOT NULL,
+        action          TEXT    NOT NULL,
+        count           INTEGER NOT NULL,
+        price_cents     INTEGER NOT NULL,
+        posted_ts_unix  REAL    NOT NULL,
+        live_mode       INTEGER NOT NULL,
+        source_hint     TEXT    NOT NULL
+    )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_posted_orders_ts "
+        "ON posted_orders(posted_ts_unix)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_posted_orders_coid "
+        "ON posted_orders(client_order_id)"
+    )
+
     # ── Discovered series (alert-only registry) ──
     # Daily `series_discovery` task lists `/events?status=open`, filters to
     # routable prefixes (weather + macro), and inserts any series_ticker not
