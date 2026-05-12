@@ -100,6 +100,62 @@ class TestRowsToStats:
         assert stats.n == 0
         assert stats.edge_beat == 0.0
 
+    def test_brier_flips_on_no_side(self, conn):
+        """Regression — alpha_backtest.won_yes stores "did our trade win",
+        NOT literal YES. For side='no' rows, the Brier must use
+        ``1 - won_yes`` to recover the YES outcome. Without the flip,
+        every NO-side Brier is computed against the inverted target
+        (the original ``shadow_promotion.py:148`` bug that drove every
+        MM promotion decision pre-fix). ~99% of weather rows are
+        side='no', so this matters in production.
+
+        Two paired rows that encode the **same calibration**:
+          - side='yes', won_yes=1 → bet YES, YES settled → literal_yes=1
+          - side='no',  won_yes=0 → bet NO,  YES settled → literal_yes=1
+        Both with p_yes=0.7 must produce the same Brier (0.7-1)^2 = 0.09.
+        """
+        from bot.learning.shadow_promotion import _fetch_settled_rows
+
+        ts = time.time() - 7 * 86400
+        # Row 1: side='yes', won_yes=1 (YES bet won, literal YES happened)
+        conn.execute(
+            "INSERT INTO alpha_backtest "
+            "(ts_decision, ts_decision_unix, ticker, family, decision_type, "
+            " decision_outcome, side, price_cents, ensemble_p_yes, "
+            " market_prob_yes, ts_settle_unix, won_yes, realized_pnl_cents) "
+            "VALUES (?, ?, ?, ?, 'directional_shadow', 'shadow_only', "
+            " 'yes', 50, 0.7, 0.5, ?, 1, 50)",
+            ("2026-04-17T00:00:00Z", ts, "KXHIGHNY-26APR17-Y", "KXHIGHNY",
+             ts + 3600),
+        )
+        # Row 2: side='no', won_yes=0 (NO bet lost, literal YES happened)
+        conn.execute(
+            "INSERT INTO alpha_backtest "
+            "(ts_decision, ts_decision_unix, ticker, family, decision_type, "
+            " decision_outcome, side, price_cents, ensemble_p_yes, "
+            " market_prob_yes, ts_settle_unix, won_yes, realized_pnl_cents) "
+            "VALUES (?, ?, ?, ?, 'directional_shadow', 'shadow_only', "
+            " 'no', 30, 0.7, 0.5, ?, 0, -30)",
+            ("2026-04-17T00:00:00Z", ts + 1, "KXHIGHNY-26APR17-N", "KXHIGHNY",
+             ts + 3601),
+        )
+        conn.commit()
+
+        rows = _fetch_settled_rows(
+            conn, "KXHIGHNY", outcomes=("shadow_only",),
+        )
+        stats = _rows_to_stats(rows)
+        assert stats.n == 2
+        # Both rows: p_yes=0.7, literal_yes=1 → Brier = (0.7-1)^2 = 0.09
+        assert stats.brier == pytest.approx(0.09, abs=1e-6), (
+            f"Brier {stats.brier} ≠ 0.09 — NO-side row must flip won_yes "
+            f"to recover literal_yes. Without flip, NO row would contribute "
+            f"(0.7-0)^2=0.49 and aggregate would be 0.29 (the pre-fix bug)."
+        )
+        # Baseline (market 0.5, literal_yes=1): (0.5-1)^2 = 0.25
+        assert stats.baseline_brier == pytest.approx(0.25, abs=1e-6)
+        assert stats.edge_beat == pytest.approx(0.16, abs=1e-6)
+
 
 # ── evaluate_promotion ─────────────────────────────────────────────────────
 class TestEvaluatePromotion:

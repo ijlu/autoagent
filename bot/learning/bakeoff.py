@@ -11,8 +11,11 @@ strategy actually converts signal edge into realized P&L?" by computing,
 per (strategy, family) slice:
 
   * **n_settled** — how many decisions closed with known outcomes
-  * **brier_ensemble** — mean (ensemble_p_yes - won_yes)^2
-  * **brier_market**  — mean (market_prob_yes - won_yes)^2 (market-mid slice)
+  * **brier_ensemble** — mean (ensemble_p_yes - literal_yes)^2, where
+        ``literal_yes`` recovers the canonical YES outcome from the
+        side-aware ``won_yes`` column (``CASE WHEN side='yes' THEN won_yes
+        ELSE 1 - won_yes END``). See alpha_log.py convention note.
+  * **brier_market**  — mean (market_prob_yes - literal_yes)^2 (market-mid slice)
   * **brier_beat**    — ``brier_market - brier_ensemble`` (positive is good)
   * **implied_pnl_cents_sum** — sum of decision-time expected P&L:
         for ``shadow_only`` / ``posted`` rows with price_cents filled, this
@@ -144,12 +147,19 @@ def compute_bakeoff(
         implied_sum, realized_sum = 0, 0
         n_with_market, n_with_realized = 0, 0
         for (_dt, _fam, side, price_c, contracts, ens_p, mkt_p, won, realized) in bucket:
-            if ens_p is not None and won is not None:
-                brier_ens.append(_brier(ens_p, won))
+            # Recover literal-YES outcome. ``won_yes`` in alpha_backtest is
+            # "did our (side-aware) trade win", not literal YES — flip for
+            # NO-side rows. See alpha_log.py convention note.
+            if won is not None:
+                literal_yes = bool(won) if side == "yes" else (not bool(won))
+            else:
+                literal_yes = None
+            if ens_p is not None and literal_yes is not None:
+                brier_ens.append(_brier(ens_p, literal_yes))
             if mkt_p is not None:
                 n_with_market += 1
-                if won is not None:
-                    brier_mkt.append(_brier(mkt_p, won))
+                if literal_yes is not None:
+                    brier_mkt.append(_brier(mkt_p, literal_yes))
             ip = _row_implied_pnl_cents(side, price_c, contracts, mkt_p)
             if ip is not None:
                 implied_sum += ip

@@ -100,6 +100,41 @@ def test_compute_bakeoff_basic_rollup(conn):
     assert r.realization_ratio == pytest.approx(1.0)
 
 
+def test_brier_flips_on_no_side(conn):
+    """Regression — ``alpha_backtest.won_yes`` stores "did our (side-aware)
+    trade win", NOT literal YES. NO-side Brier must flip ``won_yes`` to
+    recover the literal-YES outcome before squaring. Pre-fix bug:
+    ``bot/learning/bakeoff.py:148`` computed ``(ens_p - won_yes)^2``
+    directly, so every NO-side weather row (~99% of weather data) had its
+    Brier squared against the inverted target. Same convention note in
+    alpha_log.py and ``tools/validate_cross_bracket.py``.
+
+    Two paired rows that encode the **same calibration**:
+      - side='yes', ens_p=0.7, YES settles → literal_yes=1 → (0.7-1)^2 = 0.09
+      - side='no',  ens_p=0.7, YES settles → literal_yes=1 → must also = 0.09
+    Without the flip, the NO row contributes (0.7-0)^2 = 0.49 (won_yes=0
+    because NO bet lost), aggregate Brier=0.29 instead of 0.09.
+    """
+    _log(conn, ticker="KXHIGHNY-26APR20-YES", strategy="directional_shadow",
+         side="yes", price=50, contracts=1, ens_p=0.70,
+         market=_tight_market(), settle_result="yes")
+    _log(conn, ticker="KXHIGHNY-26APR20-NO", strategy="directional_shadow",
+         side="no", price=30, contracts=1, ens_p=0.70,
+         market=_tight_market(), settle_result="yes")  # NO bet loses
+
+    out = compute_bakeoff(conn, strategies=("directional_shadow",))
+    assert len(out) == 1
+    r = out[0]
+    assert r.n_settled == 2
+    # Both rows: ens_p=0.70, literal_yes=1 → Brier = (0.7-1)^2 = 0.09 for each.
+    assert r.brier_ensemble == pytest.approx(0.09, abs=1e-6), (
+        f"Brier {r.brier_ensemble} ≠ 0.09 — NO-side row must flip won_yes "
+        f"to recover literal_yes."
+    )
+    # Market 0.50 vs literal_yes=1 → (0.5-1)^2 = 0.25 for each.
+    assert r.brier_market == pytest.approx(0.25, abs=1e-6)
+
+
 def test_clean_slice_filter_excludes_wide_mid(conn):
     """Wide-spread rows resolve to 'wide_mid' and are excluded by default."""
     _log(conn, ticker="KXHIGHNY-26APR20-T75", strategy="mm_quote",

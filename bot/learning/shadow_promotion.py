@@ -119,8 +119,15 @@ class FamilyStats:
     max_single_loss_dollars: float
 
 
-def _brier(our_p_yes: float, won_yes: bool) -> float:
-    return (float(our_p_yes) - (1.0 if won_yes else 0.0)) ** 2
+def _brier(our_p_yes: float, literal_yes: bool) -> float:
+    """Brier score against the canonical literal-YES outcome.
+
+    Callers MUST pass literal_yes (did the YES outcome settle), NOT the
+    raw ``alpha_backtest.won_yes`` column which stores "did our (side-aware)
+    trade win" and is flipped for NO-side rows. See alpha_log.py convention
+    note at fill_settlement and ``tools/validate_cross_bracket.py``.
+    """
+    return (float(our_p_yes) - (1.0 if literal_yes else 0.0)) ** 2
 
 
 def _market_baseline_p_yes(market_prob_yes: Optional[float]) -> float:
@@ -145,9 +152,16 @@ def _rows_to_stats(rows: list[sqlite3.Row]) -> FamilyStats:
     max_loss_cents = 0
     for r in rows:
         p = float(r["ensemble_p_yes"])
-        won_yes = bool(r["won_yes"])
-        brier_sum += _brier(p, won_yes)
-        base_sum += _brier(_market_baseline_p_yes(r["market_prob_yes"]), won_yes)
+        # Recover literal-YES outcome from the side-aware won_yes column.
+        # See alpha_log.py convention note: won_yes==1 means "our trade won",
+        # which equals literal-YES only for side='yes' rows. ~99% of weather
+        # rows are side='no', so failing to flip here would invert every
+        # Brier on weather (the original bug).
+        side = r["side"]
+        won_yes_stored = bool(r["won_yes"])
+        literal_yes = won_yes_stored if side == "yes" else (not won_yes_stored)
+        brier_sum += _brier(p, literal_yes)
+        base_sum += _brier(_market_baseline_p_yes(r["market_prob_yes"]), literal_yes)
         pnl = int(r["realized_pnl_cents"] or 0)
         pnl_cents += pnl
         if pnl < max_loss_cents:  # track most-negative single-trade P&L
@@ -190,7 +204,7 @@ def _fetch_settled_rows(
     cursor.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in outcomes)
     sql = (
-        "SELECT ensemble_p_yes, market_prob_yes, won_yes, "
+        "SELECT ensemble_p_yes, market_prob_yes, won_yes, side, "
         "       realized_pnl_cents, ts_decision_unix "
         "FROM alpha_backtest "
         "WHERE family = ? "
