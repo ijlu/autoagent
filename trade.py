@@ -3648,7 +3648,6 @@ def record_settlements(conn):
                     continue
 
             # Parse settlement data from Kalshi API
-            revenue = int(s.get("revenue", 0))
             result = s.get("market_result", "")  # "yes" or "no"
             yes_count = float(s.get("yes_count_fp", 0))
             no_count = float(s.get("no_count_fp", 0))
@@ -3662,6 +3661,18 @@ def record_settlements(conn):
             # 28.9999... from "0.29" which int() truncates to 28. Matches the
             # "Fixed-point parsing" known-bug pattern (CLAUDE.md §5).
             total_cost = round(yes_cost + no_cost)
+
+            # Revenue: compute locally from contracts × $1 on the winning
+            # side, NOT from Kalshi's ``revenue`` field. The field returns 0
+            # for valid winning settlements since at least 2026-04-12 (audit
+            # 2026-05-12 confirmed every recent hedged + winning settlement
+            # reads as ``revenue=0``, causing record_settlements to compute
+            # a 100¢ phantom loss per hedged ticker). Same field-drift
+            # pattern as 2026-05-03 (count_fp / *_price_dollars) and
+            # 2026-05-12 (client_order_id removed from /portfolio/fills).
+            # See bot.core.money.settlement_revenue_cents.
+            from bot.core.money import settlement_revenue_cents
+            revenue = settlement_revenue_cents(yes_count, no_count, result)
 
             # Profit = revenue - cost - fees (V5: was missing fee subtraction)
             profit = revenue - total_cost - round(fee_cents)
