@@ -367,14 +367,30 @@ def _score_one_settlement(group: list[dict]) -> list:
     if combined is None:
         return []
 
-    # Enforce σ floor (matches predict_v2 step 4d).
-    sigma = max(combined.sigma_f, _COMBINED_SIGMA_FLOOR_F)
+    # Two-tier σ floor:
+    #   1) Global physical floor ``_COMBINED_SIGMA_FLOOR_F`` (1.0°F) —
+    #      matches predict_v2 step 4d.
+    #   2) Per-family empirical RMSE floor — sourced from the
+    #      2026-05-12 audit's residuals analysis. The post-peak fast-
+    #      path tightens σ to ~1°F but actual day-to-day RMSE is
+    #      1.3–2.4°F for most cities (6.5°F for Denver, hard-blocked).
+    #      Inflating to the empirical floor tightens the conviction
+    #      gate so cross_bracket fires only when the model genuinely
+    #      disagrees with the market BEYOND the model's empirical
+    #      precision. See tools/sigma_residuals.py.
+    from bot.config import CROSS_BRACKET_FAMILY_SIGMA_FLOORS
+    family = _family_from_settlement_key(ticker)
+    family_floor = CROSS_BRACKET_FAMILY_SIGMA_FLOORS.get(
+        family, _COMBINED_SIGMA_FLOOR_F,
+    )
+    effective_floor = max(_COMBINED_SIGMA_FLOOR_F, family_floor)
+    sigma = max(combined.sigma_f, effective_floor)
 
     return score_market_portfolio(
         group,
         combined_mu=combined.mean_f,
         combined_sigma=sigma,
-        sigma_floor=_COMBINED_SIGMA_FLOOR_F,
+        sigma_floor=effective_floor,
     )
 
 

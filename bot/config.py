@@ -127,6 +127,52 @@ CROSS_BRACKET_BLOCKLIST: frozenset[str] = frozenset(
     ).split(",")
     if fam.strip()
 )
+# Per-family σ floor used at cross-bracket scoring time. Sourced from
+# the 2026-05-12 audit's RMS-of-residuals analysis
+# (tools/sigma_residuals.py): the combined-Gaussian σ post-peak
+# collapses to ~1°F (the physical floor) but empirical actual-vs-
+# predicted RMSE across each family was wider:
+#
+#     LAX 1.34 °F   MIA 1.73 °F   NY 1.86 °F
+#     AUS 1.95 °F   CHI 2.39 °F   DEN 6.55 °F (blocked)
+#
+# Setting σ floor = empirical RMSE (rounded up) makes ``p_yes`` for
+# bracket-center brackets ~match the empirical hit rate. Without
+# this, the model assigns near-0% to any bracket >1°F from μ and
+# cross_bracket fires aggressive NO bets that systematically lose
+# (Phase B finding: 0/29 directional NO bets resolved against us).
+#
+# Override per family via env: ``CROSS_BRACKET_SIGMA_FLOOR_KXHIGHNY=2.5``.
+# Default to 1.0°F (the existing physical floor) for any family not
+# in the table.
+_DEFAULT_FAMILY_SIGMA_FLOORS = {
+    "KXHIGHLAX": 1.5,
+    "KXHIGHMIA": 2.0,
+    "KXHIGHNY":  2.0,
+    "KXHIGHAUS": 2.0,
+    "KXHIGHCHI": 2.5,
+    # KXHIGHDEN is hard-blocked above; floor would need to be 6.5
+    # to be calibrated. Keep at default and rely on blocklist.
+}
+
+
+def _resolve_family_sigma_floor(family: str) -> float:
+    env_key = f"CROSS_BRACKET_SIGMA_FLOOR_{family.upper()}"
+    if env_key in os.environ:
+        try:
+            return float(os.environ[env_key])
+        except ValueError:
+            pass
+    return _DEFAULT_FAMILY_SIGMA_FLOORS.get(family.upper(), 1.0)
+
+
+CROSS_BRACKET_FAMILY_SIGMA_FLOORS: dict[str, float] = {
+    fam: _resolve_family_sigma_floor(fam)
+    for fam in (
+        "KXHIGHLAX", "KXHIGHMIA", "KXHIGHNY",
+        "KXHIGHAUS", "KXHIGHCHI", "KXHIGHDEN",
+    )
+}
 # A6: route WeatherQuoter fair-value through `weather_ensemble_v2.predict_v2` instead
 # of the v1 METAR-only logistic CDF. Shadow-first: flag toggles the FV path, live
 # posting is still gated by WEATHER_MM_LIVE. Falls back to v1 on v2 errors / None.
