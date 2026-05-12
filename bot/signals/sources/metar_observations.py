@@ -577,6 +577,15 @@ def get_metar_gaussian(ticker: str, market_data: dict) -> GaussianForecast | Non
             "regime_sigma_f": _PAST_PEAK_SIGMA_F,
             "pooled_sigma_f": None,
         }
+        # F.4 shadow: stash the running-high-only alt. In the past-peak
+        # branch μ already IS running_high, so live and alt agree on μ
+        # — but σ differs (past-peak 0.3°F vs alt's diurnal/fallback).
+        # Logging both makes the σ comparison visible.
+        _fit_for_alt = _get_diurnal_fit(station, lst_hour_now)
+        _stash_running_high_only_alt(
+            station, running_high, lst_hour_now,
+            diurnal_rmse=_fit_for_alt[2] if _fit_for_alt is not None else None,
+        )
         # Skip the rest of the σ/μ resolution — past-peak short-circuits
         # the diurnal fit and the blended-mu paths.
         lst_offset = lst_offset_for_station(station)
@@ -649,6 +658,27 @@ def get_metar_gaussian(ticker: str, market_data: dict) -> GaussianForecast | Non
             ).timestamp()
         except (TypeError, ValueError):
             issued_at_unix = None
+
+    # F.4 shadow: stash the alt (μ=running_high, σ=diurnal_rmse or
+    # fallback). When WEATHER_METAR_USE_RUNNING_HIGH_ONLY is on, also
+    # swap the live values to the alt — that's the post-validation
+    # cutover path. Default: stash for shadow comparison only; live
+    # path keeps the NWP-blended expected_eventual_high it already
+    # computed above.
+    # ``fit`` was set above at the diurnal-fit lookup; reuse rather
+    # than re-call. ``None`` if no fit was available for this hour.
+    diurnal_rmse_for_alt = fit[2] if fit is not None else None
+    _stash_running_high_only_alt(
+        station, running_high, lst_hour_now, diurnal_rmse=diurnal_rmse_for_alt,
+    )
+    from bot.config import WEATHER_METAR_USE_RUNNING_HIGH_ONLY
+    if WEATHER_METAR_USE_RUNNING_HIGH_ONLY:
+        expected_eventual_high = running_high
+        sigma_f = (
+            diurnal_rmse_for_alt
+            if diurnal_rmse_for_alt is not None and diurnal_rmse_for_alt > 0
+            else _RUNNING_HIGH_ONLY_FALLBACK_SIGMA_F
+        )
 
     return GaussianForecast(
         mean_f=expected_eventual_high,
@@ -873,6 +903,67 @@ def _sigma_for_hours(
 # pops the entry by station immediately after the predict cycle, so even
 # if two cycles race the value in flight the dict can't grow unbounded.
 _RESIDUAL_TIER_META: dict[str, dict] = {}
+
+
+# ── 2026-05-12 F.4: shadow side-channel for running-high-only μ ──
+#
+# Audit hypothesis: ``get_metar_gaussian`` blends the NWP-derived
+# ``forecast_high`` into ``expected_eventual_high`` even when running
+# observations are already meaningful. On days when NWP misses (cold
+# fronts, late heat domes), the blended μ carries a +5–15°F bias into
+# the post-peak fast-path, which then collapses σ to 1.0°F and traps
+# cross_bracket into confident wrong-bracket bets (5/5 KXHIGHDEN
+# directional losses on 2026-05-06, +12°F NWP error).
+#
+# Alternative path: μ = running_high (the observed daytime maximum
+# so far), σ = diurnal RMSE or a conservative fallback. This is what
+# WeatherQuoter and cross_bracket would have used if NWP weren't in
+# the channel at all.
+#
+# Shipped behavior here is shadow-only: we always compute the alt μ
+# alongside the live μ, stash it via the side-channel, and the
+# snapshot writer emits a parallel ``metar_running_only`` row in
+# weather_forecast_snapshots. After ~1 week of shadow data, compare
+# alt-μ vs live-μ against settled outcomes; flip the live path via
+# WEATHER_METAR_USE_RUNNING_HIGH_ONLY=true once the alt is shown to
+# be better-calibrated.
+_ALT_MU_RUNNING_HIGH: dict[str, dict] = {}
+
+# Fallback σ when no diurnal fit is available for the station/hour.
+# 2.0°F is wider than the existing past-peak clamp (0.3°F) and the
+# post-peak fast-path floor (1.0°F) — the deliberate choice is "claim
+# less precision when only the running max grounds μ."
+_RUNNING_HIGH_ONLY_FALLBACK_SIGMA_F: float = 2.0
+
+
+def _stash_running_high_only_alt(
+    station: str, running_high: float, lst_hour: int, diurnal_rmse: Optional[float],
+) -> None:
+    """Record the alternative (μ=running_high, σ=diurnal_rmse_or_fallback)
+    Gaussian for shadow comparison. The snapshot writer consumes this
+    via :func:`get_alt_mu_running_high` and emits a parallel
+    ``metar_running_only`` row.
+
+    Pure side-channel — does NOT change the live Gaussian unless the
+    ``WEATHER_METAR_USE_RUNNING_HIGH_ONLY`` flag flips on (read elsewhere).
+    """
+    sigma = (
+        diurnal_rmse if diurnal_rmse is not None and diurnal_rmse > 0
+        else _RUNNING_HIGH_ONLY_FALLBACK_SIGMA_F
+    )
+    _ALT_MU_RUNNING_HIGH[station] = {
+        "mu_f": float(running_high),
+        "sigma_f": float(sigma),
+        "lst_hour": int(lst_hour),
+    }
+
+
+def get_alt_mu_running_high(station: str) -> Optional[dict]:
+    """Pop the stashed alt-μ for a station. Returns None if nothing
+    was stashed this cycle (e.g., METAR call failed before reaching
+    the stash point). Pop semantics prevent stale reads.
+    """
+    return _ALT_MU_RUNNING_HIGH.pop(station, None)
 
 # Health counters for the daemon's _log_health emit. Track per-tier
 # resolution counts so we can see whether regime cells are firing in

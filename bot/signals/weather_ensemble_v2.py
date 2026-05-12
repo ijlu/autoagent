@@ -1426,16 +1426,23 @@ def _snapshot_rows(
     # Resolve station from the ticker so we can fetch the regime
     # telemetry side-channel for the METAR row (if any).
     metar_meta: Optional[dict] = None
+    # F.4 shadow: also pop the alt μ=running_high side-channel. Emitted
+    # below as a parallel ``metar_running_only`` snapshot row for
+    # offline calibration comparison against the live ``metar`` row.
+    alt_running_only: Optional[dict] = None
     try:
         from bot.daemon.stations import station_for_ticker
         from bot.signals.sources.metar_observations import (
+            get_alt_mu_running_high,
             get_residual_tier_meta,
         )
         ws = station_for_ticker(ticker)
         if ws is not None:
             metar_meta = get_residual_tier_meta(ws.icao)
+            alt_running_only = get_alt_mu_running_high(ws.icao)
     except Exception:
         metar_meta = None
+        alt_running_only = None
 
     def _meta_cols(source_name: str):
         # Only the METAR row carries the regime telemetry; other sources
@@ -1466,6 +1473,21 @@ def _snapshot_rows(
             afd_bias, None,               # mean_f slot repurposed as bias_f
             None,
             None, None, None, None,       # regime cols NULL for non-METAR
+        ))
+    # F.4 shadow: alt μ=running_high (no NWP contamination) for
+    # offline comparison vs the live ``metar`` row above. Always
+    # emitted when the stash is present, regardless of whether the
+    # live path is using it. The flag-gated live cutover comes later.
+    if alt_running_only is not None:
+        rows.append((
+            now_iso, series, ticker, "metar_running_only",
+            None,
+            alt_running_only["mu_f"], alt_running_only["sigma_f"],
+            # horizon_hours not tracked on the alt — use the combined
+            # value so the row's columns are non-NULL where downstream
+            # readers expect them.
+            int(round(combined.horizon_hours)),
+            None, None, None, None,
         ))
     rows.append((
         now_iso, series, ticker, "combined_v2",

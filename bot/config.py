@@ -186,6 +186,19 @@ WEATHER_ENSEMBLE_V2 = os.environ.get("WEATHER_ENSEMBLE_V2", "false").lower() in 
 # promotion gate needs without changing live behavior.
 WEATHER_REGIME_SIGMA = os.environ.get("WEATHER_REGIME_SIGMA", "false").lower() in ("true", "1", "yes")
 
+# 2026-05-12 F.4: shadow-first toggle for the running-high-only μ path
+# in metar_observations.get_metar_gaussian. When false (default), the
+# live Gaussian is unchanged but a parallel ``metar_running_only`` row
+# is emitted to weather_forecast_snapshots for offline comparison
+# against the live ``metar`` row. When true, the live Gaussian uses
+# μ = running_high directly (NWP-contamination removed from the METAR
+# source channel). Flip to true only after shadow data shows the alt
+# is better-calibrated; this single flag changes the bot's weather
+# decision math everywhere combine_gaussian runs.
+WEATHER_METAR_USE_RUNNING_HIGH_ONLY = os.environ.get(
+    "WEATHER_METAR_USE_RUNNING_HIGH_ONLY", "false"
+).lower() in ("true", "1", "yes")
+
 # Platt calibration application gate. Default false (2026-04-27 audit):
 # the persisted Platt curve was fit overwhelmingly on weather rows from the
 # broken v1 ensemble path (8509/8815 rows = 96.5%) and degenerated into a
