@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -255,6 +256,10 @@ _SOURCE_SIGMA_CEILING_F: float = 2.0
 # source dominating. Caps any one source's precision contribution at
 # 1/2.25 = 0.44.
 _LEARNED_SIGMA_FLOOR_F: float = 1.5
+
+# Source getter timing visibility for the event-driven WeatherQuoter path.
+# Logged only on slow calls so normal hot-cache requotes stay quiet.
+_SOURCE_GETTER_SLOW_MS: float = 1000.0
 
 
 def _staleness_inflation_factor(
@@ -1004,11 +1009,20 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
 
     out: list[GaussianForecast] = []
     for name, fn in getters:
+        if not _source_state_allows_prefetch(name, city_key):
+            continue
+        t0 = time.monotonic()
         try:
             g = fn(ticker, market_data)
         except Exception as e:
             print(f"[weather_ensemble_v2] {name} raised {type(e).__name__}: {e}")
             continue
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        if elapsed_ms >= _SOURCE_GETTER_SLOW_MS:
+            print(
+                f"[weather_ensemble_v2] source_timing {name} "
+                f"{ticker} {elapsed_ms:.0f}ms"
+            )
         if g is None:
             continue
         if is_excluded_for_city(name, city_key):
@@ -1058,9 +1072,10 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
         # to cap their weight while on trial. Active sources unchanged.
         # Shadow / demoted sources are filtered out at the next step.
         g = _apply_state_machine_inflation(g, city_key)
-        # D (state-machine filter): drop sources whose state excludes
-        # them from the combine (shadow, demoted). Snapshots still
-        # record them upstream of this filter.
+        # D (state-machine filter): defensive drop for sources whose state
+        # excludes them from the combine (shadow, demoted). The normal path
+        # skips these before fetching so demoted network sources do not add
+        # cold-cache latency to event-driven quotes.
         if not _is_state_machine_active(g, city_key):
             continue
         out.append(g)
@@ -1072,6 +1087,28 @@ def _collect_gaussians(ticker: str, market_data: dict) -> list[GaussianForecast]
 # are how `_collect_gaussians` consults it per-cycle. Both functions
 # fail-safe on any error (default: include the source) — a transient DB
 # read failure should not silently zero out the combine.
+
+
+def _source_state_allows_prefetch(
+    source_name: str, city_key: Optional[str],
+) -> bool:
+    """True when the source is eligible enough to justify running its getter.
+
+    Shadow/demoted states are excluded from the live combine, so fetching
+    their network-backed forecasts only adds quote latency. Unknown state or
+    any DB read failure remains fail-open: include the source so observability
+    issues cannot silently empty the ensemble.
+    """
+    try:
+        from bot.db import get_connection
+        from bot.learning.source_state_machine import (
+            get_source_state, is_source_in_combine,
+        )
+        conn = get_connection()
+        state = get_source_state(conn, source_name, city_key or "pooled")
+        return is_source_in_combine(state)
+    except Exception:
+        return True
 
 
 def _apply_state_machine_inflation(

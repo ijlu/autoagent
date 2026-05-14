@@ -29,6 +29,13 @@ from bot.signals import weather_ensemble_v2 as v2
 from bot.signals.weather_forecast import GaussianForecast
 
 
+@pytest.fixture(autouse=True)
+def _allow_all_source_prefetch(monkeypatch):
+    monkeypatch.setattr(
+        v2, "_source_state_allows_prefetch", lambda _source, _city: True
+    )
+
+
 def _gauss(name, mu=70.0, sigma=2.0, hours=24):
     return GaussianForecast(
         mean_f=mu, sigma_f=sigma, horizon_hours=hours,
