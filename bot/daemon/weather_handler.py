@@ -147,6 +147,7 @@ class WeatherChangeHandler:
             "markets_shadowed": 0,
             "markets_quoted": 0,
             "markets_skipped": 0,
+            "live_forecast_missing_skips": 0,
             "synthetic_enqueued": 0,
             "synthetic_rejected_no_state": 0,
             "synthetic_rejected_cooldown": 0,
@@ -218,15 +219,22 @@ class WeatherChangeHandler:
             )
             return
 
+        series_live, mult = self._series_live_state(change.series)
+
         forecast_high = self.forecast_cache.get(change.station)
         if forecast_high is None:
+            if series_live:
+                self.stats["live_forecast_missing_skips"] += 1
+                logger.warning(
+                    "[wx-handler] live fail-closed for %s/%s: no forecast",
+                    change.series, change.station,
+                )
+                return
             forecast_high = change.running_high_f + FORECAST_FALLBACK_DELTA_F
             logger.warning(
                 "[wx-handler] no forecast for %s; fallback %.0f°F",
                 change.station, forecast_high,
             )
-
-        series_live, mult = self._series_live_state(change.series)
 
         logger.info(
             "[wx-handler] %s %s  %s°F→%.0f°F  high=%.0f  fc=%.0f  "
