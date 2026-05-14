@@ -574,9 +574,19 @@ class WeatherQuoter:
             )
 
         # -- Compute fair value --
-        fair_value_cents = self._compute_fair_value(
+        fair_value_cents = self._compute_live_fair_value(
             market, running_high_f, forecast_high_f, hours_left,
         )
+        if fair_value_cents is None:
+            return RequoteResult(
+                ticker=ticker,
+                fair_value_cents=0,
+                orders_posted=0,
+                orders_cancelled=0,
+                skipped=True,
+                skip_reason="v2_fair_value_unavailable",
+                latency_ms=_ms_since(t0),
+            )
 
         # Skip extreme fair values (no reliable edge at the rails)
         if fair_value_cents <= 2 or fair_value_cents >= 98:
@@ -842,7 +852,8 @@ class WeatherQuoter:
         """Call ``weather_ensemble_v2.predict_v2`` and convert prob→cents.
 
         Returns ``None`` on any error (module import, source fetch failure,
-        unparseable market, extreme prob) so the caller can fall back to v1.
+        unparseable market, extreme prob) so the caller can decide whether
+        to fall back to v1 or fail closed.
         Clamped to [2, 98] — same bounds the v1 path enforces.
         """
         try:
@@ -860,10 +871,37 @@ class WeatherQuoter:
             return cents
         except Exception as exc:
             logger.warning(
-                "[wx-quoter] v2 FV failed for %s, falling back to v1: %s",
+                "[wx-quoter] v2 FV failed for %s: %s",
                 market.ticker, exc,
             )
             return None
+
+    def _compute_live_fair_value(
+        self,
+        market: WeatherMarket,
+        running_high_f: float,
+        forecast_high_f: float,
+        hours_left: float,
+    ) -> Optional[int]:
+        """Compute live fair value; fail closed if an attempted v2 read fails."""
+        if WEATHER_ENSEMBLE_V2 and market.raw:
+            v2_cents = self._compute_fair_value_v2(market)
+            if v2_cents is not None:
+                return v2_cents
+            logger.warning(
+                "[wx-quoter] live fail-closed for %s: v2 fair value unavailable",
+                market.ticker,
+            )
+            try:
+                self._v2_fail_closed_count = getattr(
+                    self, "_v2_fail_closed_count", 0
+                ) + 1
+            except Exception:
+                pass
+            return None
+        return self._compute_fair_value(
+            market, running_high_f, forecast_high_f, hours_left,
+        )
 
     def _compute_fair_value(
         self,

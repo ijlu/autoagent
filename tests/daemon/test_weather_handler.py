@@ -62,6 +62,7 @@ def quoter():
 def fcache():
     c = ForecastCache()
     c.set("KJFK", 78.0)
+    c.set("KMIA", 88.0)
     return c
 
 
@@ -177,6 +178,23 @@ class TestForecastFallback:
         assert kwargs["forecast_high_f"] == pytest.approx(
             71.0 + FORECAST_FALLBACK_DELTA_F
         )
+
+    def test_live_missing_forecast_fail_closes_before_requote(self, quoter):
+        c = init_db(":memory:")
+        set_mm_live_state(c, "KXHIGHMIA", LiveState.LIVE_FULL)
+        empty = ForecastCache()
+        h = WeatherChangeHandler(
+            quoter=quoter, forecast_cache=empty, live=True, conn=c,
+        )
+
+        h([_make_change(series="KXHIGHMIA", station="KMIA", running_high=84.0)])
+
+        quoter.requote_city.assert_not_called()
+        quoter.shadow_requote_city.assert_not_called()
+        assert h.stats["live_forecast_missing_skips"] == 1
+        assert h.stats["requotes_dispatched"] == 0
+        assert "KXHIGHMIA" not in h._last_requote
+        c.close()
 
 
 class TestCooldown:

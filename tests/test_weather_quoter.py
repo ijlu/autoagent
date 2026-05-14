@@ -370,6 +370,74 @@ class TestEnsembleV2FairValueBranch:
         # got a valid cents FV rather than an exception.
         assert 2 <= fv <= 98
 
+    def test_live_requote_v2_none_fail_closes_before_orders(
+        self, mock_conn, monkeypatch,
+    ):
+        monkeypatch.setattr("bot.daemon.weather_quoter.WEATHER_ENSEMBLE_V2", True)
+        quoter = WeatherQuoter(mock_conn)
+        market = _make_threshold_market(threshold=75.0, is_above=True)
+        market.raw = {"ticker": market.ticker, "floor_strike": 75}
+
+        def fake_predict(ticker, market_data):
+            return None, None
+
+        monkeypatch.setattr("bot.signals.weather_ensemble_v2.predict_v2", fake_predict)
+        cancel = MagicMock(return_value=0)
+        post = MagicMock(return_value=(2, "bid-oid", "ask-oid", 40, 60))
+        monkeypatch.setattr(quoter, "_cancel_stale_orders", cancel)
+        monkeypatch.setattr(quoter, "_post_quotes", post)
+
+        result = quoter._requote_single(
+            market=market,
+            station="KJFK",
+            running_high_f=72.0,
+            forecast_high_f=76.0,
+            hours_left=6.0,
+            trajectory_f_per_hr=0.0,
+            smart_gates=None,
+        )
+
+        assert result.skipped is True
+        assert result.skip_reason == "v2_fair_value_unavailable"
+        assert result.orders_posted == 0
+        assert result.orders_cancelled == 0
+        cancel.assert_not_called()
+        post.assert_not_called()
+
+    def test_live_requote_v2_exception_fail_closes_before_orders(
+        self, mock_conn, monkeypatch,
+    ):
+        monkeypatch.setattr("bot.daemon.weather_quoter.WEATHER_ENSEMBLE_V2", True)
+        quoter = WeatherQuoter(mock_conn)
+        market = _make_threshold_market(threshold=75.0, is_above=True)
+        market.raw = {"ticker": market.ticker, "floor_strike": 75}
+
+        def fake_predict(ticker, market_data):
+            raise RuntimeError("simulated v2 failure")
+
+        monkeypatch.setattr("bot.signals.weather_ensemble_v2.predict_v2", fake_predict)
+        cancel = MagicMock(return_value=0)
+        post = MagicMock(return_value=(2, "bid-oid", "ask-oid", 40, 60))
+        monkeypatch.setattr(quoter, "_cancel_stale_orders", cancel)
+        monkeypatch.setattr(quoter, "_post_quotes", post)
+
+        result = quoter._requote_single(
+            market=market,
+            station="KJFK",
+            running_high_f=72.0,
+            forecast_high_f=76.0,
+            hours_left=6.0,
+            trajectory_f_per_hr=0.0,
+            smart_gates=None,
+        )
+
+        assert result.skipped is True
+        assert result.skip_reason == "v2_fair_value_unavailable"
+        assert result.orders_posted == 0
+        assert result.orders_cancelled == 0
+        cancel.assert_not_called()
+        post.assert_not_called()
+
     def test_v2_prob_clamped_into_2_98_cents(self, mock_conn, monkeypatch):
         monkeypatch.setattr("bot.daemon.weather_quoter.WEATHER_ENSEMBLE_V2", True)
         quoter = WeatherQuoter(mock_conn)
