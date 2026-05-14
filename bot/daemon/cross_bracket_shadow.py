@@ -195,7 +195,7 @@ def _safe_client_order_id(settlement_key: str, leg_idx: int) -> str:
     return f"mm_xb_{safe_key}_{leg_idx}_{int(time.time() * 1000)}"
 
 
-def _fetch_existing_positions() -> dict[str, int]:
+def _fetch_existing_positions() -> Optional[dict[str, int]]:
     """Snapshot current Kalshi positions as {ticker: signed_position_qty}.
 
     Positive = net YES holding, negative = net NO holding, zero = no
@@ -203,20 +203,18 @@ def _fetch_existing_positions() -> dict[str, int]:
     bracket we already own (the strategy logs decisions every 5 min
     and would otherwise post repeatedly each cycle the edge persists).
 
-    Returns empty dict on fetch failure; the caller treats unknown
-    positions as zero, so a fetch failure produces normal posting
-    behavior — fail-open. We accept that risk because the alternative
-    (fail-closed = no posting) silently breaks the strategy.
+    Returns None on fetch failure so the live path can fail closed instead
+    of assuming unknown exposure is zero.
     """
     from bot.api import api_get
     try:
         resp = api_get("/portfolio/positions?limit=200")
     except Exception as exc:
         logger.warning(
-            "[cross_bracket_live] positions fetch failed: %s — proceeding "
-            "without position-cap protection (fail-open)", exc,
+            "[cross_bracket_live] positions fetch failed: %s — live posting "
+            "will fail closed for this cycle", exc,
         )
-        return {}
+        return None
     out: dict[str, int] = {}
     positions = resp.get("market_positions") or resp.get("positions") or []
     for pos in positions:
@@ -255,6 +253,7 @@ def run_cross_bracket_shadow(conn) -> dict:
         "live_skipped_leg_cap": 0,
         "live_skipped_family_off": 0,
         "live_skipped_already_holding": 0,
+        "live_skipped_positions_unavailable": 0,
     }
 
     try:
@@ -698,6 +697,7 @@ def _process_decisions(
 
     # Cap legs per portfolio (live-mode only — shadow logs everything).
     non_skip = [d for d in decisions if d.action != "skip"]
+    kept_live_leg_ids: Optional[set[int]] = None
     if family_live and in_tte_window and in_lst_window and \
             len(non_skip) > CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO:
         # Sort by edge desc and take top N. We compute a single edge
@@ -710,8 +710,8 @@ def _process_decisions(
             return 0.0
         non_skip_sorted = sorted(non_skip, key=_leg_edge, reverse=True)
         kept = set(id(x) for x in non_skip_sorted[:CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO])
-        # Demote the rest to "skip" for live purposes; they'll still
-        # log as shadow rows.
+        kept_live_leg_ids = kept
+        # Mark the rest as live-ineligible; they'll still log as shadow rows.
         for d in non_skip:
             if id(d) not in kept:
                 stats["live_skipped_leg_cap"] += 1
@@ -764,6 +764,17 @@ def _process_decisions(
                 f"{CROSS_BRACKET_LIVE_MIN_EDGE:.3f}"
             )
             stats["live_skipped_edge"] += 1
+        elif kept_live_leg_ids is not None and id(d) not in kept_live_leg_ids:
+            leg_can_go_live = False
+            live_skip_reason = (
+                f"leg_cap_{CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO}"
+            )
+        elif existing_positions is None:
+            leg_can_go_live = False
+            live_skip_reason = "positions_unavailable"
+            stats["live_skipped_positions_unavailable"] = (
+                stats.get("live_skipped_positions_unavailable", 0) + 1
+            )
 
         contracts = min(
             CROSS_BRACKET_MAX_CONTRACTS_PER_LEG,

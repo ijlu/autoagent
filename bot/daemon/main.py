@@ -314,11 +314,12 @@ def _run_cross_bracket_exit(conn) -> None:
 
 
 def _run_cross_bracket_rearm(conn) -> None:
-    """Refresh per-family ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h
-    so the strategy keeps firing across daily restarts. Gated by global
-    ``CROSS_BRACKET_LIVE`` — when that's off this is a no-op so we don't
-    silently re-arm after an operator turns the strategy off at the
-    global level.
+    """Refresh already-armed ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h.
+
+    Gated by global ``CROSS_BRACKET_LIVE`` — when that's off this is a no-op
+    so we don't silently re-arm after an operator turns the strategy off at
+    the global level. Missing/false family keys stay off; this task preserves
+    canaries, it does not create them.
 
     Idempotent (kv_set is INSERT OR REPLACE). Lives here rather than in
     cross_bracket_shadow.py because re-arming is a daemon-lifecycle
@@ -332,20 +333,32 @@ def _run_cross_bracket_rearm(conn) -> None:
         "KXHIGHNY", "KXHIGHMIA", "KXHIGHCHI",
         "KXHIGHLAX", "KXHIGHAUS", "KXHIGHDEN",
     )
-    armed: list[str] = []
+    refreshed: list[str] = []
+    unarmed: list[str] = []
     blocked: list[str] = []
     for fam in all_families:
+        key = f"cross_bracket_live:{fam}"
         if fam in CROSS_BRACKET_BLOCKLIST:
             # Explicitly write False so any leftover True from a prior
             # arm decays out instead of waiting on TTL expiry.
-            kv_set(conn, f"cross_bracket_live:{fam}", False, 24 * 3600)
+            kv_set(conn, key, False, 24 * 3600)
             blocked.append(fam)
+            continue
+
+        val = kv_get(conn, key)
+        is_armed = (
+            val is True
+            or (isinstance(val, dict) and val.get("enabled") is True)
+            or (isinstance(val, str) and val.lower() in ("true", "1", "yes"))
+        )
+        if is_armed:
+            kv_set(conn, key, True, 24 * 3600)
+            refreshed.append(fam)
         else:
-            kv_set(conn, f"cross_bracket_live:{fam}", True, 24 * 3600)
-            armed.append(fam)
+            unarmed.append(fam)
     logger.info(
-        "[cross_bracket_rearm] armed=%s blocked=%s (TTL=24h)",
-        armed, blocked,
+        "[cross_bracket_rearm] refreshed=%s unarmed=%s blocked=%s (TTL=24h)",
+        refreshed, unarmed, blocked,
     )
 
 

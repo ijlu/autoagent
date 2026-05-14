@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import pytest
 
-from bot.db import init_db, kv_set
+from bot.db import init_db, kv_get, kv_set
 from bot.daemon import cross_bracket_shadow as cb
 
 
@@ -58,6 +58,21 @@ class _FakeDecision:
         self.market_yes_ask = 42
         self.market_yes_mid = 36.0
         self.skip_reason = None
+
+
+def _live_stats():
+    return {
+        "live_orders_posted": 0,
+        "live_orders_failed": 0,
+        "live_skipped_tte": 0,
+        "live_skipped_edge": 0,
+        "live_skipped_exposure_cap": 0,
+        "live_skipped_leg_cap": 0,
+        "live_skipped_family_off": 0,
+        "live_skipped_lst": 0,
+        "live_skipped_already_holding": 0,
+        "live_skipped_positions_unavailable": 0,
+    }
 
 
 # ── Family-live kv switch ──────────────────────────────────────────────
@@ -138,6 +153,24 @@ def test_family_live_blocklist_is_case_insensitive(memdb, monkeypatch):
     import bot.config as cfg
     monkeypatch.setattr(cfg, "CROSS_BRACKET_BLOCKLIST", frozenset({"KXHIGHDEN"}))
     assert cb._is_family_live(memdb, "kxhighden") is False
+
+
+def test_cross_bracket_rearm_does_not_auto_arm_unset_families(memdb, monkeypatch):
+    """Rearm may refresh active canaries, not create new ones."""
+    from bot.daemon import main as daemon_main
+    import bot.config as cfg
+
+    monkeypatch.setattr(cfg, "CROSS_BRACKET_LIVE", True)
+    monkeypatch.setattr(cfg, "CROSS_BRACKET_BLOCKLIST", frozenset({"KXHIGHDEN"}))
+    kv_set(memdb, "cross_bracket_live:KXHIGHNY", True, ttl_seconds=60)
+    kv_set(memdb, "cross_bracket_live:KXHIGHMIA", False, ttl_seconds=60)
+
+    daemon_main._run_cross_bracket_rearm(memdb)
+
+    assert kv_get(memdb, "cross_bracket_live:KXHIGHNY") is True
+    assert kv_get(memdb, "cross_bracket_live:KXHIGHMIA") is False
+    assert kv_get(memdb, "cross_bracket_live:KXHIGHCHI") is None
+    assert kv_get(memdb, "cross_bracket_live:KXHIGHDEN") is False
 
 
 # ── Family σ floor (D.1 — empirical RMSE inflation) ────────────────────
@@ -364,6 +397,65 @@ def test_process_decisions_with_live_on_but_out_of_window(memdb, monkeypatch):
     assert (stats["live_skipped_tte"] + stats["live_skipped_lst"]) >= 1, (
         "Expected one of (tte, lst) skip buckets to fire"
     )
+
+
+def test_process_decisions_enforces_live_leg_cap(memdb, monkeypatch):
+    """Only top-edge legs inside the per-portfolio cap may post live."""
+    monkeypatch.setattr(cb, "CROSS_BRACKET_LIVE", True)
+    monkeypatch.setattr(cb, "CROSS_BRACKET_MAX_LEGS_PER_PORTFOLIO", 2)
+    monkeypatch.setattr(cb, "_is_live_eligible_window", lambda key: (True, 5.0))
+    monkeypatch.setattr(cb, "_is_in_lst_gate", lambda key: (True, "lst_ok"))
+    kv_set(memdb, "cross_bracket_live:KXHIGHNY", True, ttl_seconds=86400)
+
+    decisions = [
+        _FakeDecision(ticker="KXHIGHNY-26APR30-B60", edge_yes=0.12),
+        _FakeDecision(ticker="KXHIGHNY-26APR30-B62", edge_yes=0.31),
+        _FakeDecision(ticker="KXHIGHNY-26APR30-B64", edge_yes=0.21),
+    ]
+    group = [{"ticker": d.ticker, "yes_bid": 30, "yes_ask": 42} for d in decisions]
+    posted = []
+
+    def fake_post(conn, settlement_key, leg_idx, decision, contracts):
+        posted.append(decision.ticker)
+        return True, f"ord-{leg_idx}"
+
+    monkeypatch.setattr(cb, "_post_live_order", fake_post)
+    stats = _live_stats()
+
+    cb._process_decisions(
+        memdb, "KXHIGHNY-26APR30", group, decisions, stats,
+        existing_positions={},
+    )
+
+    assert posted == [
+        "KXHIGHNY-26APR30-B62",
+        "KXHIGHNY-26APR30-B64",
+    ]
+    assert stats["live_orders_posted"] == 2
+    assert stats["live_skipped_leg_cap"] == 1
+
+
+def test_process_decisions_fail_closes_when_positions_unknown(memdb, monkeypatch):
+    """Live cross-bracket must not assume zero exposure on position failures."""
+    monkeypatch.setattr(cb, "CROSS_BRACKET_LIVE", True)
+    monkeypatch.setattr(cb, "_is_live_eligible_window", lambda key: (True, 5.0))
+    monkeypatch.setattr(cb, "_is_in_lst_gate", lambda key: (True, "lst_ok"))
+    kv_set(memdb, "cross_bracket_live:KXHIGHNY", True, ttl_seconds=86400)
+
+    decision = _FakeDecision(ticker="KXHIGHNY-26APR30-B62", edge_yes=0.31)
+    stats = _live_stats()
+
+    with patch("bot.daemon.cross_bracket_shadow._post_live_order",
+               side_effect=AssertionError("must not post without positions")):
+        cb._process_decisions(
+            memdb, "KXHIGHNY-26APR30",
+            [{"ticker": decision.ticker, "yes_bid": 30, "yes_ask": 42}],
+            [decision], stats,
+            existing_positions=None,
+        )
+
+    assert stats["live_orders_posted"] == 0
+    assert stats["live_skipped_positions_unavailable"] == 1
 
 
 # ── Layer 1+2: slippage protection in _post_live_order ────────────────
