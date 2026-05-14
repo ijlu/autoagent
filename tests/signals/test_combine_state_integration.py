@@ -13,6 +13,7 @@ producing weighted-wrong combines that take days to surface in Brier.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
@@ -47,6 +48,31 @@ def _market_data():
             "title": "high temp NYC",
             "yes_sub_title": "75 or above",
             "close_time": "2030-04-30T23:59:59Z"}
+
+
+_GETTER_PATCHES = {
+    "hrrr": "bot.signals.sources.hrrr.get_hrrr_gaussian",
+    "nws_point": "bot.signals.sources.nws_point.get_nws_point_gaussian",
+    "icon": "bot.signals.sources.icon.get_icon_gaussian",
+    "ukmo": "bot.signals.sources.ukmo.get_ukmo_gaussian",
+    "gem": "bot.signals.sources.gem.get_gem_gaussian",
+    "metno": "bot.signals.sources.metno.get_metno_gaussian",
+    "ecmwf": "bot.signals.sources.ecmwf.get_ecmwf_gaussian",
+    "metar": "bot.signals.sources.metar_observations.get_metar_gaussian",
+    "nws_5min": "bot.signals.sources.nws_5min.get_nws_5min_gaussian",
+    "nws_5min_diurnal": (
+        "bot.signals.sources.nws_5min_diurnal.get_nws_5min_diurnal_gaussian"
+    ),
+}
+
+
+def _patch_getters(stack: ExitStack, **returns):
+    mocks = {}
+    for name, target in _GETTER_PATCHES.items():
+        mocks[name] = stack.enter_context(
+            patch(target, return_value=returns.get(name))
+        )
+    return mocks
 
 
 # ── State filtering ─────────────────────────────────────────────────────
@@ -96,6 +122,41 @@ class TestStateFilter:
                    return_value=None):
             out = v2._collect_gaussians("KXHIGHNY-26APR30-T75", _market_data())
         assert all(g.source_name != "hrrr" for g in out)
+
+    def test_demoted_source_not_fetched(self, db):
+        upsert_state(db, source="hrrr", city="pooled",
+                     state=SourceState.DEMOTED)
+        with ExitStack() as stack:
+            mocks = _patch_getters(
+                stack, hrrr=_g("hrrr", 70.0, 1.5, hours=20.0),
+            )
+            out = v2._collect_gaussians("KXHIGHNY-26APR30-T75", _market_data())
+        assert out == []
+        mocks["hrrr"].assert_not_called()
+
+    def test_state_lookup_failure_fetches_source(self, db):
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("bot.db.get_connection", side_effect=RuntimeError("db down"))
+            )
+            mocks = _patch_getters(
+                stack, hrrr=_g("hrrr", 70.0, 1.5, hours=20.0),
+            )
+            out = v2._collect_gaussians("KXHIGHNY-26APR30-T75", _market_data())
+        mocks["hrrr"].assert_called_once()
+        assert any(g.source_name == "hrrr" for g in out)
+
+    def test_slow_source_getter_logs_timing(self, db, monkeypatch, capsys):
+        monkeypatch.setattr(v2, "_SOURCE_GETTER_SLOW_MS", 0.0)
+        with ExitStack() as stack:
+            _patch_getters(
+                stack, hrrr=_g("hrrr", 70.0, 1.5, hours=20.0),
+            )
+            v2._collect_gaussians("KXHIGHNY-26APR30-T75", _market_data())
+        assert (
+            "source_timing hrrr KXHIGHNY-26APR30-T75"
+            in capsys.readouterr().out
+        )
 
 
 class TestProbationaryInflation:
