@@ -40,6 +40,7 @@ from bot.config import (
 )
 from bot.daemon.locks import DB_WRITE_LOCK
 from bot.daemon.stations import STATIONS
+from bot.daemon.fills_writer import record_posted_order
 from bot.db import db_write_ctx
 
 logger = logging.getLogger(__name__)
@@ -573,9 +574,19 @@ class WeatherQuoter:
             )
 
         # -- Compute fair value --
-        fair_value_cents = self._compute_fair_value(
+        fair_value_cents = self._compute_live_fair_value(
             market, running_high_f, forecast_high_f, hours_left,
         )
+        if fair_value_cents is None:
+            return RequoteResult(
+                ticker=ticker,
+                fair_value_cents=0,
+                orders_posted=0,
+                orders_cancelled=0,
+                skipped=True,
+                skip_reason="v2_fair_value_unavailable",
+                latency_ms=_ms_since(t0),
+            )
 
         # Skip extreme fair values (no reliable edge at the rails)
         if fair_value_cents <= 2 or fair_value_cents >= 98:
@@ -841,7 +852,8 @@ class WeatherQuoter:
         """Call ``weather_ensemble_v2.predict_v2`` and convert prob→cents.
 
         Returns ``None`` on any error (module import, source fetch failure,
-        unparseable market, extreme prob) so the caller can fall back to v1.
+        unparseable market, extreme prob) so the caller can decide whether
+        to fall back to v1 or fail closed.
         Clamped to [2, 98] — same bounds the v1 path enforces.
         """
         try:
@@ -859,10 +871,37 @@ class WeatherQuoter:
             return cents
         except Exception as exc:
             logger.warning(
-                "[wx-quoter] v2 FV failed for %s, falling back to v1: %s",
+                "[wx-quoter] v2 FV failed for %s: %s",
                 market.ticker, exc,
             )
             return None
+
+    def _compute_live_fair_value(
+        self,
+        market: WeatherMarket,
+        running_high_f: float,
+        forecast_high_f: float,
+        hours_left: float,
+    ) -> Optional[int]:
+        """Compute live fair value; fail closed if an attempted v2 read fails."""
+        if WEATHER_ENSEMBLE_V2 and market.raw:
+            v2_cents = self._compute_fair_value_v2(market)
+            if v2_cents is not None:
+                return v2_cents
+            logger.warning(
+                "[wx-quoter] live fail-closed for %s: v2 fair value unavailable",
+                market.ticker,
+            )
+            try:
+                self._v2_fail_closed_count = getattr(
+                    self, "_v2_fail_closed_count", 0
+                ) + 1
+            except Exception:
+                pass
+            return None
+        return self._compute_fair_value(
+            market, running_high_f, forecast_high_f, hours_left,
+        )
 
     def _compute_fair_value(
         self,
@@ -953,8 +992,30 @@ class WeatherQuoter:
     # Order cancellation
     # ------------------------------------------------------------------
 
+    def _weather_client_order_id(self, order: dict) -> str:
+        """Return the weather-MM client id for a resting order, if known."""
+        client_id = order.get("client_order_id") or ""
+        if client_id:
+            return str(client_id)
+
+        order_id = order.get("order_id") or ""
+        if not order_id:
+            return ""
+        try:
+            row = self.conn.execute(
+                "SELECT client_order_id FROM posted_orders WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "[wx-quoter] posted_orders lookup failed for order_id=%s: %s",
+                order_id, exc,
+            )
+            return ""
+        return str(row[0]) if row and row[0] else ""
+
     def _cancel_stale_orders(self, ticker: str) -> int:
-        """Cancel all resting orders for a ticker. Returns count cancelled."""
+        """Cancel weather-MM-owned resting orders for a ticker."""
         cancelled = 0
         try:
             resp = api_get(f"/portfolio/orders?ticker={ticker}&status=resting")
@@ -966,6 +1027,9 @@ class WeatherQuoter:
         for order in orders:
             order_id = order.get("order_id", "")
             if not order_id:
+                continue
+            client_id = self._weather_client_order_id(order)
+            if not client_id.startswith("mm_wx_"):
                 continue
             try:
                 api_delete(f"/portfolio/orders/{order_id}")
@@ -1056,6 +1120,18 @@ class WeatherQuoter:
                     if oid:
                         orders_posted += 1
                         bid_oid = oid
+                        record_posted_order(
+                            self.conn,
+                            order_id=oid,
+                            client_order_id=client_id,
+                            ticker=ticker,
+                            side="yes",
+                            action="buy",
+                            count=order_size,
+                            price_cents=bid,
+                            source_hint="mm_quote",
+                            live_mode=True,
+                        )
                         logger.info("[wx-quoter] BID %s YES x%d @ %dc  oid=%s", ticker, order_size, bid, oid)
                     else:
                         logger.warning("[wx-quoter] BID %s: API returned empty order_id", ticker)
@@ -1089,6 +1165,18 @@ class WeatherQuoter:
                     if oid:
                         orders_posted += 1
                         ask_oid = oid
+                        record_posted_order(
+                            self.conn,
+                            order_id=oid,
+                            client_order_id=client_id,
+                            ticker=ticker,
+                            side="no",
+                            action="buy",
+                            count=order_size,
+                            price_cents=no_price,
+                            source_hint="mm_quote",
+                            live_mode=True,
+                        )
                         logger.info("[wx-quoter] ASK %s NO x%d @ %dc  oid=%s", ticker, order_size, no_price, oid)
                     else:
                         logger.warning("[wx-quoter] ASK %s: API returned empty order_id", ticker)

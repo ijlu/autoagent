@@ -314,11 +314,12 @@ def _run_cross_bracket_exit(conn) -> None:
 
 
 def _run_cross_bracket_rearm(conn) -> None:
-    """Refresh per-family ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h
-    so the strategy keeps firing across daily restarts. Gated by global
-    ``CROSS_BRACKET_LIVE`` — when that's off this is a no-op so we don't
-    silently re-arm after an operator turns the strategy off at the
-    global level.
+    """Refresh already-armed ``cross_bracket_live:<FAMILY>`` kv keys to TTL=24h.
+
+    Gated by global ``CROSS_BRACKET_LIVE`` — when that's off this is a no-op
+    so we don't silently re-arm after an operator turns the strategy off at
+    the global level. Missing/false family keys stay off; this task preserves
+    canaries, it does not create them.
 
     Idempotent (kv_set is INSERT OR REPLACE). Lives here rather than in
     cross_bracket_shadow.py because re-arming is a daemon-lifecycle
@@ -332,20 +333,32 @@ def _run_cross_bracket_rearm(conn) -> None:
         "KXHIGHNY", "KXHIGHMIA", "KXHIGHCHI",
         "KXHIGHLAX", "KXHIGHAUS", "KXHIGHDEN",
     )
-    armed: list[str] = []
+    refreshed: list[str] = []
+    unarmed: list[str] = []
     blocked: list[str] = []
     for fam in all_families:
+        key = f"cross_bracket_live:{fam}"
         if fam in CROSS_BRACKET_BLOCKLIST:
             # Explicitly write False so any leftover True from a prior
             # arm decays out instead of waiting on TTL expiry.
-            kv_set(conn, f"cross_bracket_live:{fam}", False, 24 * 3600)
+            kv_set(conn, key, False, 24 * 3600)
             blocked.append(fam)
+            continue
+
+        val = kv_get(conn, key)
+        is_armed = (
+            val is True
+            or (isinstance(val, dict) and val.get("enabled") is True)
+            or (isinstance(val, str) and val.lower() in ("true", "1", "yes"))
+        )
+        if is_armed:
+            kv_set(conn, key, True, 24 * 3600)
+            refreshed.append(fam)
         else:
-            kv_set(conn, f"cross_bracket_live:{fam}", True, 24 * 3600)
-            armed.append(fam)
+            unarmed.append(fam)
     logger.info(
-        "[cross_bracket_rearm] armed=%s blocked=%s (TTL=24h)",
-        armed, blocked,
+        "[cross_bracket_rearm] refreshed=%s unarmed=%s blocked=%s (TTL=24h)",
+        refreshed, unarmed, blocked,
     )
 
 
@@ -1048,14 +1061,27 @@ def _log_health(pollers: list[Poller], cycle_runner: CycleRunner,
         logger.info(
             "[health] wx_handler mode=%s seen=%d throttled=%d dispatched=%d "
             "shadowed=%d quoted=%d skipped=%d synth=%d synth_reject=%d "
-            "errors=%d",
+            "live_fc_missing_skips=%d errors=%d",
             "LIVE" if weather_handler.live else "SHADOW",
             s["changes_seen"], s["changes_throttled"], s["requotes_dispatched"],
             s["markets_shadowed"], s["markets_quoted"], s["markets_skipped"],
             s.get("synthetic_enqueued", 0),
             s.get("synthetic_rejected_no_state", 0)
                 + s.get("synthetic_rejected_cooldown", 0),
+            s.get("live_forecast_missing_skips", 0),
             s["errors"],
+        )
+        quoter = getattr(weather_handler, "quoter", None)
+        v2_fail_closed = 0
+        if quoter is not None:
+            raw_v2_fail_closed = getattr(quoter, "_v2_fail_closed_count", 0)
+            if type(raw_v2_fail_closed) is int:
+                v2_fail_closed = max(0, raw_v2_fail_closed)
+                quoter._v2_fail_closed_count = 0
+        log_fn = logger.warning if v2_fail_closed else logger.info
+        log_fn(
+            "[health] wx_live_fail_closed v2_fv_unavailable=%d",
+            v2_fail_closed,
         )
     if time_decay_driver is not None:
         td = time_decay_driver.stats

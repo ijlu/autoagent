@@ -370,6 +370,74 @@ class TestEnsembleV2FairValueBranch:
         # got a valid cents FV rather than an exception.
         assert 2 <= fv <= 98
 
+    def test_live_requote_v2_none_fail_closes_before_orders(
+        self, mock_conn, monkeypatch,
+    ):
+        monkeypatch.setattr("bot.daemon.weather_quoter.WEATHER_ENSEMBLE_V2", True)
+        quoter = WeatherQuoter(mock_conn)
+        market = _make_threshold_market(threshold=75.0, is_above=True)
+        market.raw = {"ticker": market.ticker, "floor_strike": 75}
+
+        def fake_predict(ticker, market_data):
+            return None, None
+
+        monkeypatch.setattr("bot.signals.weather_ensemble_v2.predict_v2", fake_predict)
+        cancel = MagicMock(return_value=0)
+        post = MagicMock(return_value=(2, "bid-oid", "ask-oid", 40, 60))
+        monkeypatch.setattr(quoter, "_cancel_stale_orders", cancel)
+        monkeypatch.setattr(quoter, "_post_quotes", post)
+
+        result = quoter._requote_single(
+            market=market,
+            station="KJFK",
+            running_high_f=72.0,
+            forecast_high_f=76.0,
+            hours_left=6.0,
+            trajectory_f_per_hr=0.0,
+            smart_gates=None,
+        )
+
+        assert result.skipped is True
+        assert result.skip_reason == "v2_fair_value_unavailable"
+        assert result.orders_posted == 0
+        assert result.orders_cancelled == 0
+        cancel.assert_not_called()
+        post.assert_not_called()
+
+    def test_live_requote_v2_exception_fail_closes_before_orders(
+        self, mock_conn, monkeypatch,
+    ):
+        monkeypatch.setattr("bot.daemon.weather_quoter.WEATHER_ENSEMBLE_V2", True)
+        quoter = WeatherQuoter(mock_conn)
+        market = _make_threshold_market(threshold=75.0, is_above=True)
+        market.raw = {"ticker": market.ticker, "floor_strike": 75}
+
+        def fake_predict(ticker, market_data):
+            raise RuntimeError("simulated v2 failure")
+
+        monkeypatch.setattr("bot.signals.weather_ensemble_v2.predict_v2", fake_predict)
+        cancel = MagicMock(return_value=0)
+        post = MagicMock(return_value=(2, "bid-oid", "ask-oid", 40, 60))
+        monkeypatch.setattr(quoter, "_cancel_stale_orders", cancel)
+        monkeypatch.setattr(quoter, "_post_quotes", post)
+
+        result = quoter._requote_single(
+            market=market,
+            station="KJFK",
+            running_high_f=72.0,
+            forecast_high_f=76.0,
+            hours_left=6.0,
+            trajectory_f_per_hr=0.0,
+            smart_gates=None,
+        )
+
+        assert result.skipped is True
+        assert result.skip_reason == "v2_fair_value_unavailable"
+        assert result.orders_posted == 0
+        assert result.orders_cancelled == 0
+        cancel.assert_not_called()
+        post.assert_not_called()
+
     def test_v2_prob_clamped_into_2_98_cents(self, mock_conn, monkeypatch):
         monkeypatch.setattr("bot.daemon.weather_quoter.WEATHER_ENSEMBLE_V2", True)
         quoter = WeatherQuoter(mock_conn)
@@ -536,6 +604,44 @@ class TestPostQuotesDryRun:
     @patch("bot.daemon.weather_quoter.MM_MAX_INVENTORY", 50)
     @patch("bot.daemon.weather_quoter.MM_SKEW_PER_10", 2)
     @patch("bot.daemon.weather_quoter.api_post")
+    def test_live_mode_records_posted_orders(self, mock_api_post, mock_conn):
+        """Successful live weather quotes must be recoverable by fills_writer."""
+        mock_api_post.side_effect = [
+            {"order": {"order_id": "bid-oid"}},
+            {"order": {"order_id": "ask-oid"}},
+        ]
+        quoter = WeatherQuoter(mock_conn)
+        n, bid_oid, ask_oid, _, _ = quoter._post_quotes(
+            "KXHIGHNY-T75", fair_value_cents=50, half_spread=8,
+            inventory=0,
+        )
+
+        assert n == 2
+        assert bid_oid == "bid-oid"
+        assert ask_oid == "ask-oid"
+        rows = mock_conn.execute(
+            "SELECT order_id, client_order_id, ticker, side, action, count, "
+            "price_cents, live_mode, source_hint FROM posted_orders "
+            "ORDER BY order_id"
+        ).fetchall()
+        assert len(rows) == 2
+        by_side = {row[3]: row for row in rows}
+        assert by_side["yes"][0] == "bid-oid"
+        assert by_side["yes"][1].startswith("mm_wx_KXHIGHNY-T75_")
+        assert by_side["yes"][2:] == (
+            "KXHIGHNY-T75", "yes", "buy", 10, 42, 1, "mm_quote",
+        )
+        assert by_side["no"][0] == "ask-oid"
+        assert by_side["no"][1].startswith("mm_wx_KXHIGHNY-T75_")
+        assert by_side["no"][2:] == (
+            "KXHIGHNY-T75", "no", "buy", 10, 42, 1, "mm_quote",
+        )
+
+    @patch("bot.daemon.weather_quoter.MM_DRY_RUN", False)
+    @patch("bot.daemon.weather_quoter.MM_ORDER_SIZE", 10)
+    @patch("bot.daemon.weather_quoter.MM_MAX_INVENTORY", 50)
+    @patch("bot.daemon.weather_quoter.MM_SKEW_PER_10", 2)
+    @patch("bot.daemon.weather_quoter.api_post")
     def test_client_order_id_no_periods(self, mock_api_post, mock_conn):
         """client_order_id must not contain periods (Kalshi rejects them)."""
         mock_api_post.return_value = {"order": {"order_id": "abc123"}}
@@ -589,22 +695,20 @@ class TestCancelStaleOrders:
 
     @patch("bot.daemon.weather_quoter.api_delete")
     @patch("bot.daemon.weather_quoter.api_get")
-    def test_cancels_all_resting_orders(self, mock_get, mock_delete, mock_conn):
-        """Should cancel every resting order for the ticker."""
+    def test_cancels_only_weather_mm_resting_orders(self, mock_get, mock_delete, mock_conn):
+        """Should cancel only weather-MM-owned resting orders for the ticker."""
         mock_get.return_value = {
             "orders": [
-                {"order_id": "order_1"},
-                {"order_id": "order_2"},
-                {"order_id": "order_3"},
+                {"order_id": "weather_1", "client_order_id": "mm_wx_KXHIGHNY-T75_1"},
+                {"order_id": "manual_1", "client_order_id": ""},
+                {"order_id": "dir_1", "client_order_id": "mm_dir_KXHIGHNY-T75_1"},
+                {"order_id": "unknown_1"},
             ]
         }
         quoter = WeatherQuoter(mock_conn)
         n = quoter._cancel_stale_orders("KXHIGHNY-T75")
-        assert n == 3
-        assert mock_delete.call_count == 3
-        mock_delete.assert_any_call("/portfolio/orders/order_1")
-        mock_delete.assert_any_call("/portfolio/orders/order_2")
-        mock_delete.assert_any_call("/portfolio/orders/order_3")
+        assert n == 1
+        mock_delete.assert_called_once_with("/portfolio/orders/weather_1")
 
     @patch("bot.daemon.weather_quoter.api_delete")
     @patch("bot.daemon.weather_quoter.api_get")
@@ -632,8 +736,8 @@ class TestCancelStaleOrders:
         """If one cancel fails, others should still proceed."""
         mock_get.return_value = {
             "orders": [
-                {"order_id": "order_1"},
-                {"order_id": "order_2"},
+                {"order_id": "order_1", "client_order_id": "mm_wx_KXHIGHNY-T75_1"},
+                {"order_id": "order_2", "client_order_id": "mm_wx_KXHIGHNY-T75_2"},
             ]
         }
         mock_delete.side_effect = [None, Exception("cancel failed")]
@@ -840,7 +944,10 @@ class TestRequoteCity:
             if "series_ticker" in path:
                 return self._mock_markets_response()
             elif "status=resting" in path:
-                return {"orders": [{"order_id": f"old_order_{call_count[0]}"}]}
+                return {"orders": [{
+                    "order_id": f"old_order_{call_count[0]}",
+                    "client_order_id": f"mm_wx_KXHIGHNY_{call_count[0]}",
+                }]}
             return {"orders": []}
 
         mock_api_get.side_effect = side_effect
