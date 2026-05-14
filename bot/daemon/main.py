@@ -1061,14 +1061,27 @@ def _log_health(pollers: list[Poller], cycle_runner: CycleRunner,
         logger.info(
             "[health] wx_handler mode=%s seen=%d throttled=%d dispatched=%d "
             "shadowed=%d quoted=%d skipped=%d synth=%d synth_reject=%d "
-            "errors=%d",
+            "live_fc_missing_skips=%d errors=%d",
             "LIVE" if weather_handler.live else "SHADOW",
             s["changes_seen"], s["changes_throttled"], s["requotes_dispatched"],
             s["markets_shadowed"], s["markets_quoted"], s["markets_skipped"],
             s.get("synthetic_enqueued", 0),
             s.get("synthetic_rejected_no_state", 0)
                 + s.get("synthetic_rejected_cooldown", 0),
+            s.get("live_forecast_missing_skips", 0),
             s["errors"],
+        )
+        quoter = getattr(weather_handler, "quoter", None)
+        v2_fail_closed = 0
+        if quoter is not None:
+            raw_v2_fail_closed = getattr(quoter, "_v2_fail_closed_count", 0)
+            if type(raw_v2_fail_closed) is int:
+                v2_fail_closed = max(0, raw_v2_fail_closed)
+                quoter._v2_fail_closed_count = 0
+        log_fn = logger.warning if v2_fail_closed else logger.info
+        log_fn(
+            "[health] wx_live_fail_closed v2_fv_unavailable=%d",
+            v2_fail_closed,
         )
     if time_decay_driver is not None:
         td = time_decay_driver.stats
